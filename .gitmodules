@@ -1,0 +1,12 @@
+[submodule "backend"]
+	path = backend
+	url = https://github.com/Thomas-Hoang-04/notiguide-be.git
+[submodule "web"]
+	path = web
+	url = https://github.com/Thomas-Hoang-04/notiguide-admin.git
+[submodule "client-web"]
+	path = client-web
+	url = https://github.com/Thomas-Hoang-04/notiguide-client.git
+[submodule "receiver"]
+	path = receiver
+	url = https://github.com/Thomas-Hoang-04/notiguide-device.git

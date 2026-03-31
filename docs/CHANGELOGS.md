@@ -1,5 +1,36 @@
 # Changelogs
 
+## 2026-04-01 — Backend Compose Redis Healthcheck
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/compose.yaml` | MODIFIED | Added a Redis `healthcheck` using authenticated `redis-cli ping` and wired the backend service to wait for `service_healthy` instead of an empty `depends_on` stub |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the backend Compose Redis healthcheck change |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-03-31 — Firebase Push Flow Hardening
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/core/firebase/FirebaseConfig.kt` | MODIFIED | Tightened Firebase bootstrapping so the config only activates when `firebase.credentials-path` has a real value, and trimmed the configured path before opening credentials |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/exception/HttpException.kt` | MODIFIED | Added a dedicated service-unavailable exception so optional integrations can fail explicitly instead of falling through as generic errors |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/controller/QueuePublicController.kt` | MODIFIED | Changed FCM token registration to return an explicit 503 when Firebase push is unavailable instead of silently accepting a no-op request |
+| `backend/src/main/resources/application-prod.yaml` | MODIFIED | Restored the empty-default Firebase credentials placeholder so production can leave Firebase disabled without breaking config resolution |
+| `client-web/src/lib/firebase.ts` | MODIFIED | Added an explicit Firebase messaging config guard that requires the full web-push config before initializing the client SDK |
+| `client-web/src/hooks/use-push-notification.ts` | MODIFIED | Hid the notification flow when Firebase web-push config is incomplete, switched service-worker setup to wait for `navigator.serviceWorker.ready`, and kept backend push failures as silent fallback to polling |
+| `client-web/src/components/queue/notification-prompt.tsx` | MODIFIED | Kept the notification prompt limited to permission states only so backend push failures stay invisible to end users |
+| `client-web/public/firebase-messaging-sw.js` | MODIFIED | Made the service worker ignore incomplete Firebase config safely and update locale independently of first-time Firebase initialization |
+| `client-web/src/messages/en.json` | MODIFIED | Left notification copy focused on permission UX only; no backend-failure message is shown to end users |
+| `client-web/src/messages/vi.json` | MODIFIED | Left notification copy focused on permission UX only; no backend-failure message is shown to end users |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the Firebase push flow hardening changes |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
 ## 2026-03-31 — Admin Web Lint Pass And UI-Safe Cleanup
 
 ### Files Changed

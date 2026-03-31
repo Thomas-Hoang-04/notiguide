@@ -1,5 +1,352 @@
 # Changelogs
 
+## 2026-03-31 — Admin Web Lint Pass And UI-Safe Cleanup
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/app/[locale]/dashboard/page.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/app/[locale]/dashboard/queue/page.tsx` | MODIFIED | Applied Biome import ordering and formatting cleanup during the lint pass |
+| `web/src/app/[locale]/dashboard/settings/security/page.tsx` | MODIFIED | Fixed hook dependency lint issues, replaced array-index skeleton keys with stable keys, and applied Biome formatting cleanup without changing the rendered security settings flow |
+| `web/src/app/[locale]/dashboard/settings/service-types/page.tsx` | MODIFIED | Removed the forbidden non-null assertion by capturing the guarded store ID before toggle and dialog actions |
+| `web/src/app/[locale]/dashboard/settings/store/page.tsx` | MODIFIED | Removed unused settings state, normalized no-show action handling, and applied Biome formatting cleanup while preserving the settings UI flow |
+| `web/src/app/globals.css` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/components/ui/button.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/components/ui/calendar.tsx` | MODIFIED | Applied Biome import ordering and formatting cleanup during the lint pass |
+| `web/src/components/ui/kbd.tsx` | MODIFIED | Converted the React import to a type-only import and applied Biome import ordering cleanup |
+| `web/src/components/ui/popover.tsx` | MODIFIED | Converted the React import to a type-only import and applied Biome formatting cleanup |
+| `web/src/features/admin/assign-store-dialog.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/features/admin/create-admin-dialog.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/features/analytics/analytics-overview.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/features/analytics/date-range-picker.tsx` | MODIFIED | Restructured date-range effect dependencies to satisfy lint while preserving the existing popover/calendar interaction |
+| `web/src/features/analytics/hourly-heatmap.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/features/analytics/outcome-chart.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/features/analytics/overview-throughput-chart.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/features/analytics/peak-hours-chart.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/features/analytics/period-stats.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/features/analytics/realtime-stats.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/features/analytics/store-analytics.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/features/analytics/store-ranking-table.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/features/analytics/store-wait-chart.tsx` | MODIFIED | Removed the non-null assertion in chart data shaping and applied formatter cleanup without changing the chart output |
+| `web/src/features/analytics/throughput-chart.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/features/analytics/wait-distribution-chart.tsx` | MODIFIED | Replaced a nullable boolean expression with an optional-chain boolean and applied formatter cleanup without changing the chart UI |
+| `web/src/features/queue/api.ts` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/features/queue/serving-display.tsx` | MODIFIED | Applied Biome formatting cleanup while preserving the serving action UI |
+| `web/src/features/store/service-types-table.tsx` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/lib/api.ts` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `web/src/lib/user-agent.ts` | MODIFIED | Applied Biome formatting cleanup during the lint pass |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the admin-web lint pass and UI-safe cleanup |
+
+### Verification
+- Ran `yarn lint` in `web/` and confirmed it passed.
+- Core UI-sensitive flows were kept structurally intact: the service types page still guards on `storeId`, the store settings page still renders the same sections and save actions, the security settings page still loads sessions/history and supports revoke/load-more, and the analytics date-range picker still resets draft state only when the popover opens.
+
+## 2026-03-31 — Client-Web Lint Formatting Fix
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `client-web/next.config.ts` | MODIFIED | Normalized `allowedDevOrigins` quoting to match Biome formatting rules |
+| `client-web/src/app/[locale]/store/[storeId]/page.tsx` | MODIFIED | Collapsed terminal-status boolean return formatting without changing ticket gating behavior |
+| `client-web/src/app/[locale]/store/[storeId]/ticket/[ticketId]/page.tsx` | MODIFIED | Applied Biome-preferred line wrapping in the ticket status page while preserving the existing terminal-state and redirect flow |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the client-web lint formatting fix |
+
+### Verification
+- `cd client-web && yarn lint`
+
+## 2026-03-31 — Admin Web Store Form Type Narrowing Fix
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/store/store-form-dialog.tsx` | MODIFIED | Replaced overly narrow literal inference in the create-store defaults with explicit boolean/string/no-show union types and adapted Base UI switch/select handlers so WebStorm and TypeScript stop flagging the form controls |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the store form TypeScript fix |
+
+### Verification
+- One pre-change compiler pass was used only to locate the exact diagnostics; no post-implementation build/lint/test commands were run per repository instruction.
+
+## 2026-03-31 — Admin Web Serving Countdown Type Fix
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/queue/serving-display.tsx` | MODIFIED | Captured the non-null `calledAt` timestamp once inside the grace countdown effect so the nested timer callback no longer passes a nullable value into the overloaded `Date` constructor |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the serving countdown TypeScript fix |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-03-31 — Ticket Outcome Copy Tone Refresh
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `client-web/src/messages/en.json` | MODIFIED | Softened terminal ticket descriptions so the supporting copy reads more naturally while the title carries the explicit state |
+| `client-web/src/messages/vi.json` | MODIFIED | Softened terminal ticket descriptions in Vietnamese to feel more human and less robotic |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the ticket outcome copy tone refresh |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-03-31 — Ticket Terminal Status Retention
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/core/redis/RedisTTLPolicy.kt` | MODIFIED | Added a dedicated terminal-ticket TTL so completed/cancelled/skipped tickets remain queryable for a while after leaving the queue |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/repository/RedisTicketRepository.kt` | MODIFIED | Changed served/cancelled/skipped transitions from immediate Redis deletion to status updates with terminal TTL retention |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged terminal ticket retention for the client ticket page outcome fix |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-03-31 — Client-Web Ticket Outcome Copy
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `client-web/src/app/[locale]/store/[storeId]/ticket/[ticketId]/page.tsx` | MODIFIED | Updated the terminal-state card to show explicit completed/cancelled/skipped/expired titles instead of only a generic outcome message |
+| `client-web/src/messages/en.json` | MODIFIED | Added clearer English terminal-state copy for the ticket page |
+| `client-web/src/messages/vi.json` | MODIFIED | Added clearer Vietnamese terminal-state copy for the ticket page |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the ticket outcome copy update |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-03-31 — Client-Web Ticket Flow Safeguards
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `client-web/src/hooks/use-vibration.ts` | MODIFIED | Added explicit continuous vibration start/stop control so the device keeps buzzing while a ticket is being called, then stops cleanly on dismiss/unmount/state change |
+| `client-web/src/app/[locale]/store/[storeId]/page.tsx` | MODIFIED | Removed the re-enqueue path when an active ticket already exists and blocked issuing another ticket until the existing one is resolved |
+| `client-web/src/app/[locale]/store/[storeId]/ticket/[ticketId]/page.tsx` | MODIFIED | Preserved ticket/status snapshots so served, cancelled, skipped, and expired tickets render a visible terminal-state card instead of falling back to a loading skeleton |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the client-web ticket flow safeguards |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-03-31 — Store Public ID: Fix Empty String Override
+
+### Fix
+- **`Store.publicId` default prevented DB-generated values** (`Store.kt`) — the entity field `val publicId: String = ""` caused R2DBC to include `public_id = ''` in every INSERT, overriding PostgreSQL's `DEFAULT generate_store_public_id()`. Changed to `val publicId: String? = null` so R2DBC omits the column on INSERT, letting the database function generate the 8-char alphanumeric ID. Reads are unaffected — `toDto()` uses `publicId!!` since the column is `NOT NULL` in the schema.
+
+### Notes
+- Stores created before this fix may have `public_id = ''` in the database. Run `UPDATE store SET public_id = generate_store_public_id() WHERE public_id = '';` to backfill.
+
+---
+
+## 2026-03-30 — Store Public ID (public_id alias)
+
+### Feature
+- **Public store identifier** — stores now have an 8-char mixed-case alphanumeric `public_id` auto-generated by PostgreSQL (`generate_store_public_id()` function using `gen_random_bytes(6)` → base64 → strip non-alphanumeric). Internal UUIDs are never exposed in public-facing URLs.
+
+### Backend
+| File | Action | Summary |
+|---|---|---|
+| `schema.sql` | MODIFIED | Added `generate_store_public_id()` PL/pgSQL function, `public_id VARCHAR(8) NOT NULL UNIQUE` column with DEFAULT, and `idx_store_public_id` index |
+| `Store.kt` | MODIFIED | Added `@Column("public_id") val publicId` field |
+| `StoreDto.kt` | MODIFIED | Added `val publicId: String` field |
+| `StoreRepository.kt` | MODIFIED | Added `findByPublicId(publicId: String): Store?` query |
+| `StoreService.kt` | MODIFIED | Added `getStoreByPublicId()` method with fallback to UUID lookup for backward compatibility |
+| `QueuePublicController.kt` | MODIFIED | Rewritten: `@RequestMapping("/api/queue/public/{publicId}")`, all endpoints resolve internal UUID via `storeService.getStoreByPublicId(publicId)` |
+| `StorePublicInfoResponse.kt` | MODIFIED | Changed `val id: UUID` → `val publicId: String` |
+| `TicketDto.kt` | MODIFIED | Changed `IssueTicketResponse.storeId: UUID` → `String` |
+
+### Client-Web
+| File | Action | Summary |
+|---|---|---|
+| `types/store.ts` | MODIFIED | Changed `id: string` → `publicId: string` in `StorePublicInfoResponse` |
+
+### Admin Web
+| File | Action | Summary |
+|---|---|---|
+| `types/store.ts` | MODIFIED | Added `publicId: string` to `StoreDto` |
+| `store-management-table.tsx` | MODIFIED | Added `publicId` column (monospace pill, visible at `l:` breakpoint) |
+| `en.json` / `vi.json` | MODIFIED | Added `stores.columnId` translation |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+---
+
+## 2026-03-30 — Client-Web Mock Removal
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `client-web/src/app/[locale]/layout.tsx` | MODIFIED | Removed the client-web mock bootstrap from the locale layout so the app always uses the real backend |
+| `client-web/src/__mocks__/data.ts` | DELETED | Removed in-memory mock store and ticket seed data from client-web |
+| `client-web/src/__mocks__/handlers.ts` | DELETED | Removed the client-web fetch-interception mock handlers |
+| `client-web/src/__mocks__/mock-init.tsx` | DELETED | Removed the client-web API mock bootstrap component |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the client-web mock removal |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction not to attempt post-implementation builds in this flow.
+
+## 2026-03-30 — Public Store URL Compatibility
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/store/service/StoreService.kt` | MODIFIED | Public store lookup now falls back to `store.id` UUID when a `public_id` match is not found, preserving older store links while keeping `public_id` as the canonical public identifier |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/controller/QueuePublicController.kt` | MODIFIED | Join-queue responses now return the canonical `store.publicId` instead of echoing the raw path parameter |
+| `client-web/src/features/queue/hooks.ts` | MODIFIED | Ticket state/storage now use the canonical store identifier returned by the public API after joining |
+| `client-web/src/app/[locale]/store/[storeId]/page.tsx` | MODIFIED | Store landing page now redirects legacy UUID-based public URLs to the canonical `/store/{publicId}` route |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the public store URL compatibility fix |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction not to attempt post-implementation builds in this flow.
+
+## 2026-03-30 — Client Web Mock Gating
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `client-web/src/__mocks__/mock-init.tsx` | MODIFIED | Changed API mock interception from always-on to opt-in via `NEXT_PUBLIC_ENABLE_API_MOCKS=true` so real public store requests reach the backend by default |
+| `client-web/src/app/[locale]/layout.tsx` | MODIFIED | Removed stale always-on mock comment and kept mock bootstrap as a normal component now controlled by environment flag |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the client-web mock gating fix |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction not to attempt post-implementation builds in this flow.
+
+## 2026-03-30 — Analytics Seed Data Rewrite
+
+### Data
+- **Rewrote `analytics.sql`** — complete rewrite of the demo analytics seed data:
+  - **Includes today** (`day_offset` 0–30 instead of 1–30); today's volume is scaled by the fraction of operating hours elapsed so far.
+  - **Weekend variance** — Saturday at 72%, Sunday at 58% of base traffic instead of flat ¼ reduction.
+  - **Day-to-day fluctuation** — ±20% per day via `hashtext` pseudo-random, replacing rigid modulo patterns.
+  - **Realistic hourly distribution** — weighted bell curve around two peak hours per store (30%/25% near peaks, 20% fill, 15% shoulder, 10% early/late) instead of uniform spread.
+  - **Load-correlated waits** — wait times increase 50–80% during peak hours, decrease 25% on weekends.
+  - **Per-ticket variance** — ±30% on wait times, ±25% on service times via hash instead of fixed modulo offsets.
+  - **Store-specific profiles** — distinct open/close hours, base volumes, and service characteristics per store (café: fast service; clinic: slow service, high cancellation; Phúc Long: balanced).
+  - **Idempotent** — DELETEs existing rows for the 3 seeded stores before inserting.
+  - **Future-safe** — `WHERE time <= now()` filters out events that haven't happened yet today.
+
+---
+
+## 2026-03-30 — Analytics Page Bug Fixes
+
+### Fix
+- **Default period `TODAY` → `WEEK`** (`analytics-overview.tsx`, `store-analytics.tsx`) — both the overview and per-store analytics pages defaulted to `"TODAY"`, which returned empty data arrays from the backend (no events for the current day). Changed default to `"WEEK"` to match the dashboard, which hardcodes `"WEEK"`.
+- **Stat cards showing "Đang tải..." after load** (`realtime-stats.tsx`, `period-stats.tsx`) — `StatCard` used a single `fallback` string (`tCommon("loading")`) for both the in-flight and null-after-error states. Removed the `fallback` prop; `StatCard` now always renders `"—"` when `value` is `null`/`undefined`. The `period-stats.tsx` `StatCard` was updated to accept explicit `loading`/`loadingText` props so the loading state still shows "Đang tải..." while the null-data state shows `"—"`. Removed the now-unused `tCommon` import from `realtime-stats.tsx`.
+- **`SummaryCards` showed "no data" while loading** (`summary-cards.tsx`) — the `if (loading || !summary)` guard returned the "Chưa có dữ liệu" card for both loading and error states. Split into `if (loading) return null` first, then the "no data" card only when `summary` is genuinely absent after load.
+
+---
+
+## 2026-03-30 — IPv6 Loopback Normalization
+
+### Fix
+- **IPv6 loopback → IPv4** (`AuthController.kt`, `RateLimitFilter.kt`) — `remoteAddress.hostAddress` returns `0:0:0:0:0:0:0:1` for localhost connections on dual-stack systems. Both `extractClientIp` methods now normalize `0:0:0:0:0:0:0:1` and `::1` to `127.0.0.1` so that login history, sessions, and rate-limit keys show a human-readable IPv4 address.
+
+---
+
+## 2026-03-30 — Logout Confirmation Dialog
+
+### UI
+- **Shared logout confirmation** (`web/src/components/layout/logout-confirm-dialog.tsx`, `web/src/components/layout/sidebar.tsx`, `web/src/components/layout/topbar.tsx`) — wrapped the existing sidebar and topbar logout actions with the app's `AlertDialog` pattern, added a confirm step before clearing the session, and disabled the dialog actions while logout is in flight.
+
+### i18n
+- Added `navigation.logoutConfirmTitle` (EN: "Log out?", VI: "Đăng xuất?")
+- Added `navigation.logoutConfirmDescription` (EN: "You will need to sign in again to access the dashboard.", VI: "Bạn sẽ cần đăng nhập lại để truy cập bảng điều khiển.")
+
+### Intentional scope
+- **No new settings action** — kept logout in the existing layout controls only; no separate logout button was added to Settings > Account.
+
+---
+
+## 2026-03-30 — Admin Role Enum Filter Fix
+
+### Fix
+- **Admin role filters** (`backend/src/main/kotlin/com/thomas/notiguide/domain/admin/repository/AdminRepository.kt`, `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/service/AdminService.kt`) — fixed paginated admin listing queries to bind `AdminRole` directly and cast query parameters to PostgreSQL `admin_role` (`CAST(:role AS admin_role)`) instead of comparing the enum column against `varchar`. This resolves `operator does not exist: admin_role = character varying` when filtering admins by role.
+
+### Audit
+- **Enum-backed manual SQL review** — reviewed the other PostgreSQL enum-backed custom SQL path and left it unchanged: `AnalyticsEventRepository.insert()` already casts `:eventType` to `analytics_event_type`, so it does not share the same failure mode. No other manual enum filters were found in `backend/src/main/kotlin`.
+
+---
+
+## 2026-03-30 — Service Type Management UI
+
+### Feature
+- **Service Types settings tab** (`settings/layout.tsx`) — added a new "Service Types" tab (`/dashboard/settings/service-types`) to the settings navigation, visible only to non-SuperAdmin admins (same visibility rule as the existing Store tab). Uses `ListOrdered` icon.
+- **Service types page** (`settings/service-types/page.tsx`) — container page that fetches the store's service types via `listServiceTypes(storeId)`, renders the table, and wires up create/edit/delete/toggle dialogs. Guards on `!storeId` (returns null for SuperAdmins). Toggle active/inactive is handled optimistically via direct API call + local state update.
+- **ServiceTypesTable** (`features/store/service-types-table.tsx`) — glass-card table listing service type name, prefix, status (Switch + Badge), and action buttons (edit, delete). Skeleton loading (3 rows), empty state with CTA. Switch toggles `isActive` inline without opening a dialog.
+- **ServiceTypeFormDialog** (`features/store/service-type-form-dialog.tsx`) — create/edit Dialog with name (max 100) and prefix (max 5, auto-uppercased) fields. Validates client-side, maps 409 to inline prefix error, maps `err.details` to field-level errors, falls back to toast for other errors.
+- **DeleteServiceTypeDialog** (`features/store/delete-service-type-dialog.tsx`) — AlertDialog with destructive action. Maps 409 ("last active service type") to inline conflict message; other errors go to toast.
+
+### i18n
+- Added `settings.serviceTypesTab` (EN: "Service Types", VI: "Loại dịch vụ")
+- Added `stores.serviceTypeInactive` (EN: "Inactive", VI: "Tạm ngưng")
+- Added `stores.deleteServiceTypeConflict` (EN: "Cannot delete the last active service type", VI: "Không thể xóa loại dịch vụ hoạt động cuối cùng")
+- Added `stores.serviceTypePrefixTaken` (EN: "This prefix is already in use", VI: "Tiền tố này đã được sử dụng")
+- Added `stores.serviceTypeActions` (EN: "Actions", VI: "Thao tác")
+
+---
+
+## 2026-03-30 — MQTTS Support
+
+### Enhancement
+- **MQTTS (TLS) support** (`MqttConfig.kt`) — when the broker URL starts with `ssl://`, the connection options now attach the JVM's default `SSLSocketFactory` (trusts all CA-signed certificates). No custom keystores or truststores required. Set `MQTT_BROKER=ssl://host:8883` to enable.
+
+### Fix
+- **MQTT bean ordering race condition** (`MqttConfig.kt`, `MqttClientManager.kt`, `MqttPublisher.kt`, `QueueEventBroadcaster.kt`) — `MqttClientManager` and `MqttPublisher` used `@Component` + `@ConditionalOnBean` which is unreliable because component scan order is non-deterministic. Moved both to `@Bean` methods inside `MqttConfig` so all MQTT beans are created together in the same `@Configuration` class. `QueueEventBroadcaster` now uses `ObjectProvider<MqttClientManager>` + `SmartInitializingSingleton` for deferred lookup after all singletons are ready.
+- **Analytics route clash** (`AnalyticsController.kt`) — `/api/analytics/overview/throughput` was matched by `/{storeId}/throughput` (binding `storeId = "overview"` → UUID parse error). Moved all `/overview/*` routes above `/{storeId}/*` routes so Spring matches literal paths first.
+- **Missing `/api/analytics/overview/throughput` endpoint** (`AnalyticsController.kt`, `AnalyticsQueryService.kt`, `AnalyticsEventRepository.kt`) — frontend called this endpoint but it didn't exist. Added aggregate daily throughput query across all stores, service method, and controller endpoint (super-admin only).
+- **Browser native login dialog** (`SecurityConfig.kt`) — Spring Security's default `ServerAuthenticationEntryPoint` sent a `WWW-Authenticate` header on 401, triggering the browser's native basic auth popup. Added custom entry point that returns plain JSON `{"status":401,"error":"Unauthorized"}` without the header.
+- **Username casing preserved** (`AdminService.kt`, `AdminAuthService.kt`, `AuthController.kt`, `AdminRepository.kt`, `schema.sql`, `account/page.tsx`) — usernames were forced to lowercase on create/update/login. Removed all `.lowercase()` / `.toLowerCase()` normalization. Uniqueness is now enforced case-insensitively via `LOWER()` in repository queries and a `CREATE UNIQUE INDEX idx_admin_username_lower ON admin(LOWER(username))` index. Users can now set mixed-case usernames (e.g. `Thomas`) and change casing freely.
+
+---
+
+## 2026-03-30 — Mock Purge, Store Form Polish, Seed Data
+
+### Cleanup
+- **Mock system removed** — deleted `web/src/__mocks__/` directory (data.ts, handlers.ts, mock-init.tsx) and removed `MockInit` import + component from `web/src/app/[locale]/layout.tsx`. The app now requires the real backend.
+- **SQL seed file** (`backend/src/main/resources/db/seed.sql`) — new seed script with 4 stores, store_settings, 7 service types, and 7 days of analytics events for manual testing. Admin accounts excluded (create via API).
+
+### Fixes
+- **`maxRequeues` validation** (`CreateStoreRequest.kt`) — changed `@Min(0)` to `@Min(1)` to match frontend validation (0 requeues is nonsensical for the REQUEUE action)
+- **Mock callNext paused bug** (`handlers.ts`, now deleted) — mock handler incorrectly blocked callNext when queue was paused; the real backend only blocks issueTicket
+
+### UI
+- **Store creation dialog** (`store-form-dialog.tsx`) — widened from `max-w-2xl` to `max-w-3xl`, increased form/padding spacing, widened number inputs and selects from `max-w-xs` to `max-w-sm`
+
+---
+
+## 2026-03-30 — Store Creation Initial Queue Config
+
+### Feature
+- **Create-store API extended** (`backend/src/main/kotlin/com/thomas/notiguide/domain/store/request/CreateStoreRequest.kt`, `backend/src/main/kotlin/com/thomas/notiguide/domain/store/service/StoreService.kt`) — store creation now accepts initial `allowJumpCall` / `allowNoShow` flags plus initial `store_settings` values (`maxQueueSize`, `gracePeriodSec`, `noShowAction`, `maxRequeues`, `requeueOffset`, `alertThreshold`) and persists them in one create flow
+- **Create-store dialog upgraded** (`web/src/features/store/store-form-dialog.tsx`) — super admins can now configure queue behavior, queue limits, and no-show handling during store creation, following the same toggle-driven behavior as the Store Settings page
+- **Mock flow aligned with backend** (`web/src/__mocks__/handlers.ts`, `web/src/__mocks__/data.ts`, `web/src/types/store.ts`) — mock store creation now respects the initial queue config payload, seeds store settings, and auto-creates the default `General` service type so mock mode matches backend behavior more closely
+- **Validation copy added** (`web/src/messages/en.json`, `web/src/messages/vi.json`) — added bilingual numeric range validation messages used by the create-store form
+- **Intentional skip** — `Default Counter ID` from the Store Settings page was not added to store creation because it is stored in browser `localStorage` per admin/device rather than on the store itself
+
+---
+
+## 2026-03-29 — Warning Surface Color Sync
+
+### UI fixes
+- **Queue paused banner** (`web/src/app/[locale]/dashboard/queue/page.tsx`) — aligned the paused-state warning block with the brighter yellow warning treatment already used elsewhere, including warmer secondary copy in dark mode
+- **Warning styling follow-up** (`web/src/app/globals.css`, `web/src/components/ui/badge.tsx`) — removed the shared warning utility/variant abstraction after it caused warning surfaces to fall back to neutral styling; warning classes are now applied directly at each usage site
+- **Affected warning sections updated** (`web/src/app/[locale]/(auth)/login/page.tsx`, `web/src/features/queue/store-selector.tsx`, `web/src/features/admin/admin-directory-table.tsx`, `web/src/features/store/store-admins-dialog.tsx`, `web/src/app/[locale]/dashboard/settings/account/page.tsx`) — migrated older muted warning banners/badges to the new shared styles
+- **Audit note** — warning charts, toast icons, and action handlers were reviewed but left unchanged because they already use the shared warning color token rather than the outdated surface classes
+
+---
+
+## 2026-03-29 — Optional No-Show Handling Toggle
+
+### Feature
+- **New**: `allow_no_show` boolean column on `store` table (default `FALSE`) — mirrors the `allow_jump_call` pattern
+- **Backend**: Added `allowNoShow` to `Store` entity, `StoreDto`, `UpdateStoreRequest`, and `StoreService.updateStore()`
+- **Frontend types**: Added `allowNoShow` to `StoreDto` and `UpdateStoreRequest` interfaces
+- **Settings page**: Added "Enable no-show handling" toggle in the Queue Behavior card (same pattern as "Allow jump-call"). The entire No-Show Handling settings card is now hidden when the toggle is off.
+- **Queue page**: Fetches `allowNoShow` from store and passes it to `ServingDisplay`
+- **Serving display**: Grace countdown timer and "No-show" button only render when `allowNoShow` is enabled AND `gracePeriodSec > 0`
+- **Translations**: Added `allowNoShowLabel` and `allowNoShowCaption` keys in both EN and VI
+
+---
+
 ## 2026-03-27 — Overview Dashboard Charts
 
 ### Implementation (from `docs/planned/Overview Dashboard Charts Plan.md`)
@@ -3826,6 +4173,17 @@ Root cause: `ReactiveRedisTemplate<String, Any>` forced type gymnastics with `St
 | `docs/Backend Audit.md` | MODIFIED | Marked findings #1, #2, #4, #5, #6, #7, #8, #9, #10, #18 as ✅ FIXED; added accepted-limitation note to #5 |
 
 ---
+
+## 2026-03-30 — Schema pgcrypto Dependency
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/resources/db/schema.sql` | MODIFIED | Added explicit `pgcrypto` extension creation before schema objects that use `gen_random_bytes()` and `gen_random_uuid()` |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the schema extension dependency fix |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction not to attempt post-implementation builds in this flow.
 
 ## 2026-03-11 — Audit of P0/P1 Fixes
 

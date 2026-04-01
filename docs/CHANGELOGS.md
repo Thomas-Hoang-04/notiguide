@@ -1,5 +1,42 @@
 # Changelogs
 
+## 2026-04-01 — Firebase Loader Simplification
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/core/firebase/FirebaseConfig.kt` | MODIFIED | Removed the plain-path fallback and kept Firebase credential loading aligned with Spring `ResourceLoader`, since dev uses `classpath:` and deploy config now uses explicit `file:` URIs |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the Firebase loader simplification |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-01 — Firebase Credentials Path Fallback
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/core/firebase/FirebaseConfig.kt` | MODIFIED | Added plain filesystem path fallback for Firebase credentials so `classpath:...`, `file:...`, and bare paths like `/app/config/firebase-spring.json` all resolve correctly |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the Firebase credentials path fallback change |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-01 — Exclude Backend Secrets From Packaged Resources
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/build.gradle.kts` | MODIFIED | Excluded `firebase/**` and `rsa/**` from `bootJar` packaging so private keys and Firebase credentials are not copied into packaged backend artifacts while local dev resources still work |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/firebase/FirebaseConfig.kt` | MODIFIED | Switched Firebase credential loading to Spring `ResourceLoader` so external `file:` paths and classpath resources are both supported consistently |
+| `backend/src/main/resources/application-dev.yaml` | MODIFIED | Kept dev secret paths overrideable while preserving classpath defaults for local development, even though packaged jars now exclude those files |
+| `backend/compose.yaml` | MODIFIED | Updated backend secret env vars to explicit external `file:` URIs inside the container so production keeps loading mounted credentials rather than bundled resources |
+| `backend/.dockerignore` | MODIFIED | Excluded `src/main/resources/firebase` and `src/main/resources/rsa` from Docker build context so secret files are not sent during image builds |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the packaged-secret exclusion changes |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
 ## 2026-04-01 — Backend Compose Registry Override
 
 ### Files Changed

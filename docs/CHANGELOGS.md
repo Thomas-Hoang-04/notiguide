@@ -1,5 +1,28 @@
 # Changelogs
 
+## 2026-04-01 — MQTT Broker Env Compatibility Fix
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/resources/application.yaml` | MODIFIED | Made `mqtt.broker` accept both `MQTT_BROKER` and `MQTT_BROKER_URL` so existing deployment env files continue to resolve the broker URI correctly |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/mqtt/MqttConfig.kt` | MODIFIED | Switched MQTT bean activation to a non-blank broker check so the MQTT client is not created when the broker URI is empty |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the MQTT broker env compatibility fix |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-02 — Backend Nginx Site Config
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/nginx/api.lienlac.sinhvien.online.conf` | ADDED | Added a VPS-ready Nginx reverse proxy config for the Notiguide backend with HTTP-to-HTTPS redirect, TLS termination, and SSE-safe proxy settings for the admin queue events endpoint |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the backend Nginx site config addition |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
 ## 2026-04-01 — Firebase Loader Simplification
 
 ### Files Changed

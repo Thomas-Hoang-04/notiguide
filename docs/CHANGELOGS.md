@@ -1,5 +1,62 @@
 # Changelogs
 
+## 2026-04-02 — Client-Web Standalone PM2 Deployment
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `client-web/next.config.ts` | MODIFIED | Enabled Next.js standalone output so the client web app can be built locally and shipped as a smaller deployment bundle |
+| `client-web/ecosystem.config.cjs` | MODIFIED | Switched PM2 to run the generated standalone server from `.next/standalone` and changed the production port to `2304` |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the client-web standalone PM2 deployment change |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-02 — Backend Compose CORS Origin Pass-Through
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/compose.yaml` | MODIFIED | Passed `APP_CORS_ALLOWED_ORIGINS` into the backend container with the existing production origins as fallback so deployments can allow the real admin frontend origin for credentialed cookie auth without blanking CORS defaults |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the backend Compose CORS origin pass-through change |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-01 — Frontend Standalone PM2 Deployment
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/next.config.ts` | MODIFIED | Enabled Next.js standalone output so the frontend can be built locally and shipped as a smaller deployment bundle |
+| `web/ecosystem.config.cjs` | MODIFIED | Switched PM2 to run the generated standalone server from `.next/standalone` and changed the production port to `2312` |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the frontend standalone PM2 deployment change |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-01 — Analytics Store Comparison Tooltip Type Fix
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/analytics/store-comparison-chart.tsx` | MODIFIED | Updated the Recharts tooltip formatter to accept the library's nullable `ValueType` signature instead of assuming a plain `number`, fixing the store comparison chart type error |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the analytics store comparison tooltip type fix |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-01 — Analytics Date Range Picker Type Narrowing Fix
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/analytics/date-range-picker.tsx` | MODIFIED | Reused the already narrowed custom date range when building the selected label so TypeScript no longer accesses `from` and `to` on the `PeriodOrRange` union directly |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the analytics date range picker type narrowing fix |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
 ## 2026-04-01 — MQTT Broker Env Compatibility Fix
 
 ### Files Changed

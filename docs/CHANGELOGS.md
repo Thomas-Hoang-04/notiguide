@@ -1,5 +1,28 @@
 # Changelogs
 
+## 2026-04-01 — Backend Compose Registry Override
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/compose.yaml` | MODIFIED | Made the backend image reference and pull policy configurable via environment variables so deployments can switch from GHCR to a private Docker Hub repository without editing Compose again |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the backend Compose registry override change |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-01 — Backend Dockerfile For Local Image Builds
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/Dockerfile` | ADDED | Added a multi-stage Java 21 Docker build that packages the Spring Boot backend into a local runtime image and includes an actuator-based healthcheck |
+| `backend/.dockerignore` | MODIFIED | Excluded local env/secrets directories from the Docker build context so local image builds do not send `.env`, `firebase`, or `rsa` contents |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the backend Dockerfile addition for local image builds |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
 ## 2026-04-01 — Backend Compose Redis Healthcheck
 
 ### Files Changed

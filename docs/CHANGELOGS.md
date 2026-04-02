@@ -1,5 +1,403 @@
 # Changelogs
 
+## 2026-04-03 — Fix client-web store page nullable Select handler
+
+### Summary
+- Updated the client-web store public page service type selector to handle Base UI’s nullable `onValueChange` contract.
+- Normalized a cleared value back to `undefined` before updating component state so the page still matches `useJoinQueue`’s optional `serviceTypeId` input.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `client-web/src/app/[locale]/store/[storeId]/page.tsx` | MODIFIED | Wrapped the service type select handler to convert `null` into `undefined` before calling the state setter |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the client-web nullable select handler fix |
+
+### Verification
+- Ran: targeted `yarn biome check` on `client-web/src/app/[locale]/store/[storeId]/page.tsx`.
+
+## 2026-04-03 — Fix legacy store settings dialog nullable store ID
+
+### Summary
+- Guarded the legacy store settings dialog service-type toggle callback before calling `updateServiceType`.
+- Removed the remaining `store?.id` call-site that could pass `undefined` into an API requiring a definite store ID and break the TypeScript build.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/store/store-settings-dialog.tsx` | MODIFIED | Guarded the service-type active toggle callback with a definite local `storeId` before the API call |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the legacy dialog type fix |
+
+### Verification
+- Ran: targeted `yarn biome check` on `web/src/features/store/store-settings-dialog.tsx`.
+
+## 2026-04-03 — Fix store dialog numeric error typing
+
+### Summary
+- Tightened the create-store dialog numeric validation helper to write only to the known `StoreFormErrors` keys.
+- Removed the incorrect `Record<string, string>` expectation that caused the TypeScript build error when passing the typed dialog error object.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/store/store-form-dialog.tsx` | MODIFIED | Narrowed the numeric validation helper to the dialog’s typed numeric error fields |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the TypeScript fix for the store form dialog |
+
+### Verification
+- Ran: targeted `yarn biome check` on `web/src/features/store/store-form-dialog.tsx`.
+
+## 2026-04-03 — Handle nullable Select values in admin web
+
+### Summary
+- Updated Base UI `Select` handlers on the queue page and store settings page to accept `string | null` values.
+- Normalized cleared selections to `""` before updating React state or `localStorage`, which fixes the TypeScript build error from `onValueChange`.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/app/[locale]/dashboard/queue/page.tsx` | MODIFIED | Normalized nullable service-type select values before updating state and local storage |
+| `web/src/app/[locale]/dashboard/settings/store/page.tsx` | MODIFIED | Updated the default service type change handler to accept nullable select values |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the nullable select handler fix |
+
+### Verification
+- Ran: targeted `yarn biome check` on the two touched page files.
+
+## 2026-04-03 — Refactor store settings form duplication
+
+### Summary
+- Replaced the deprecated React form submit event alias with `SyntheticEvent<HTMLFormElement, SubmitEvent>` in the affected store forms.
+- Extracted the duplicated store general fields, admin assignment list, and queue settings cards into shared store feature components used by the admin settings page, dialogs, and inline store panel.
+- Extracted the duplicated queue settings state, fetch, toggle, and save handlers into a shared hook so the Admin Store Settings page and the SuperAdmin inline section no longer maintain separate copies of the same controller logic.
+- Extracted the remaining shared queue settings card composition into a reusable content component so those two store settings surfaces do not duplicate the same card wiring and save-button markup.
+- Kept the existing store behavior intact while reducing repeated validation, form markup, and service-admin management logic across the admin web app.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/store/service-type-form-dialog.tsx` | MODIFIED | Replaced the deprecated form submit event alias with `SyntheticEvent<HTMLFormElement, SubmitEvent>` |
+| `web/src/features/store/store-general-fields.tsx` | ADDED | Centralized shared store general form fields, validation, and update-request mapping |
+| `web/src/features/store/store-admins-content.tsx` | ADDED | Centralized shared store admin listing and unassign workflow for dialog and inline section variants |
+| `web/src/features/store/store-queue-settings-fields.tsx` | ADDED | Centralized shared queue behavior, queue limits, and no-show handling cards |
+| `web/src/features/store/store-admins-dialog.tsx` | MODIFIED | Reused the shared store admins content instead of duplicating list and unassign logic |
+| `web/src/features/store/store-admins-section.tsx` | MODIFIED | Reused the shared store admins content for the inline store panel |
+| `web/src/features/store/store-general-section.tsx` | MODIFIED | Reused the shared store general fields and validation helpers and updated submit typing to `SyntheticEvent<HTMLFormElement, SubmitEvent>` |
+| `web/src/features/store/store-form-dialog.tsx` | MODIFIED | Reused the shared store general fields and queue settings cards in the create/edit dialog and updated submit typing to `SyntheticEvent<HTMLFormElement, SubmitEvent>` |
+| `web/src/app/[locale]/dashboard/settings/store/page.tsx` | MODIFIED | Reused the shared queue settings cards on the admin settings page |
+| `web/src/features/store/store-queue-settings-content.tsx` | ADDED | Centralized the shared queue settings card composition, button wiring, and save actions |
+| `web/src/features/store/store-queue-settings-section.tsx` | MODIFIED | Reused the shared queue settings cards in the SuperAdmin inline store panel |
+| `web/src/features/store/use-store-queue-settings.ts` | ADDED | Centralized shared queue settings loading, toggle, and save behavior for store settings surfaces |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the duplicate-code cleanup and deprecated event typing fix |
+
+### Verification
+- Ran: targeted `yarn biome check` on the touched frontend files only.
+
+## 2026-04-03 — Fix admin web lint regressions
+
+### Summary
+- Fixed the `useHookAtTopLevel` lint error on the SuperAdmin stores page by moving `handleStoreUpdated` above the early auth return.
+- Fixed the `useExhaustiveDependencies` lint error in the inline queue settings section by removing the unnecessary `store.id` dependency from the local toggle-sync effect.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/app/[locale]/dashboard/stores/page.tsx` | MODIFIED | Moved the `handleStoreUpdated` hook above the conditional return to satisfy hook ordering rules |
+| `web/src/features/store/store-queue-settings-section.tsx` | MODIFIED | Removed the unnecessary `store.id` effect dependency flagged by Biome |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the admin web lint cleanup |
+
+### Verification
+- Not run: build/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-03 — Remove native number input steppers
+
+### Summary
+- Removed the browser-default up/down spinner controls from HTML number inputs across the web admin app.
+- Applied the change globally in the base stylesheet so all existing `type="number"` fields stay visually consistent without per-component overrides.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/app/globals.css` | MODIFIED | Hid native WebKit and Firefox number input spinner controls in the global base layer |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the global number input spinner removal |
+
+### Verification
+- Not run: build/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-03 — Trim create store dialog width
+
+### Summary
+- Reduced the create-store dialog width from the previous oversized setting to a more balanced `xs:max-w-4xl`.
+- Left the edit-store dialog width unchanged at `xs:max-w-3xl`.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/store/store-form-dialog.tsx` | MODIFIED | Reduced the create-store dialog width override from `xs:max-w-6xl` to `xs:max-w-4xl` |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the create store dialog width adjustment |
+
+### Verification
+- Not run: build/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-03 — Widen create store dialog
+
+### Summary
+- Increased the create-store dialog width so the initial store setup form has more room and feels less cramped.
+- Kept the edit-store dialog at its previous width, since the create flow is the one carrying the larger multi-section form.
+- Applied the width change on the same `xs:` breakpoint slot used by the shared dialog primitive so the override actually takes effect above mobile sizes.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/store/store-form-dialog.tsx` | MODIFIED | Overrode the shared `xs:` dialog width cap so create mode renders at `xs:max-w-6xl` while edit mode stays at `xs:max-w-3xl` |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the create store dialog width adjustment |
+
+### Verification
+- Not run: build/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-03 — Smooth inline panel collapse finish
+
+### Summary
+- Investigated the end-of-collapse glitch on the SuperAdmin inline store panel and refined the animation structure.
+- Split the collapsing wrapper from the padded content so the height animation no longer fights the panel padding at the tail end of the close transition.
+- Moved the fade/slide effect onto the content layer only and kept the outer shell responsible only for height collapse.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/store/store-management-table.tsx` | MODIFIED | Separated the clip wrapper from the padded content inside the animated store settings row |
+| `web/src/styles/glass.css` | MODIFIED | Simplified the shell transition to height only and moved the fade/slide motion to the content layer |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the inline panel collapse glitch fix |
+
+### Verification
+- Not run: build/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-02 — Animate inline store panel expansion
+
+### Summary
+- Added a smooth expand/collapse transition to the SuperAdmin inline store settings panel so opening and closing the row no longer feels abrupt.
+- The animation is implemented on the row content wrapper instead of the table row itself, which avoids the common jank from animating table layout directly.
+- Corrected the shared Base UI collapsible CSS state selectors in the same style file so future `Collapsible` usage matches `data-open` / `data-closed` properly.
+- Adjusted the panel enter timing to use a committed closed frame before switching to open, fixing the missing expand animation.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/store/store-management-table.tsx` | MODIFIED | Kept the inline store panel mounted only while opening/open/closing and drove animated visibility state per row |
+| `web/src/styles/glass.css` | MODIFIED | Added smooth grid-height, fade, and vertical offset transitions for the inline store panel and corrected shared collapsible state selectors |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the inline store panel animation change |
+
+### Verification
+- Not run: build/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-02 — Align service type header action
+
+### Summary
+- Updated the SuperAdmin store panel service types card to use the shared card action slot so the `Add service type` button stays aligned on the far right of the header instead of dropping under the title.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/store/store-queue-settings-section.tsx` | MODIFIED | Moved the `Add service type` button into `CardAction` so it renders at the right end of the card header |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the service type header alignment adjustment |
+
+### Verification
+- Not run: build/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-02 — Smooth SuperAdmin store panel updates
+
+### Summary
+- Removed the redundant store-row pencil action from SuperAdmin Store Management. The inline panel already covers store editing through its Overview/General tab, so the row action now stays focused on expand/collapse and delete.
+- Reworked inline store updates so queue behavior switches no longer trigger a page-level store list refetch. Toggling `allowJumpCall` or `allowNoShow` now updates the open panel and row state locally, which avoids the visible panel reload/skeleton cycle.
+- Stopped admin unassign actions from refreshing the whole store panel for the same reason; the admins list is updated in place.
+- Matched the service type dialog field widths by removing the narrower width cap from the `Prefix` input.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/app/[locale]/dashboard/stores/page.tsx` | MODIFIED | Removed store edit dialog wiring from the table flow and update store rows locally after inline panel edits |
+| `web/src/features/store/store-management-table.tsx` | MODIFIED | Removed the redundant pencil action and kept inline panel store updates scoped to the affected row |
+| `web/src/features/store/store-settings-panel.tsx` | MODIFIED | Passed concrete store-update callbacks only to the sections that actually mutate store row data |
+| `web/src/features/store/store-general-section.tsx` | MODIFIED | Returned the updated store record to the parent row after inline general edits |
+| `web/src/features/store/store-queue-settings-section.tsx` | MODIFIED | Removed the queue toggle refetch loop and kept queue behavior switch updates local to the panel |
+| `web/src/features/store/store-admins-section.tsx` | MODIFIED | Updated admin unassign flow in place without forcing a parent store refresh |
+| `web/src/features/store/service-type-form-dialog.tsx` | MODIFIED | Made the `Prefix` input use the same full-width layout as the service name field |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the SuperAdmin store panel and service type dialog refinements |
+
+### Verification
+- Not run: build/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-02 — Merge per-store settings into inline accordion panel
+
+### Summary
+- Previously, SuperAdmin store management used 3 separate dialogs for store settings: Admin assignment (`StoreAdminsDialog`), Queue settings (`StoreSettingsDialog`), and Store edit (`StoreFormDialog` in edit mode). The settings dialog was overflowing on smaller screens.
+- Refactored into an inline collapsible accordion panel that expands below each store row in the table. Clicking the gear icon toggles the panel; clicking again collapses it. Only one store can be expanded at a time.
+- The panel contains 3 tabs: **General** (name, address, active toggle), **Admins** (list + unassign), and **Queue Settings** (service types, queue behavior, queue limits, no-show handling).
+- Added `shadcn/ui` Collapsible component (base-ui primitive). CSS animation for smooth expand/collapse in `glass.css`.
+- Store create dialog and delete dialog remain as modal dialogs (unchanged).
+- Old `StoreAdminsDialog` and `StoreSettingsDialog` are no longer imported by the page but kept in the codebase for potential reuse.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/store/store-settings-panel.tsx` | ADDED | Main inline panel with 3-tab navigation (General, Admins, Queue Settings) |
+| `web/src/features/store/store-general-section.tsx` | ADDED | General info section (edit name/address/active) extracted for inline use |
+| `web/src/features/store/store-admins-section.tsx` | ADDED | Admins list section extracted from StoreAdminsDialog for inline use |
+| `web/src/features/store/store-queue-settings-section.tsx` | ADDED | Queue settings section extracted from StoreSettingsDialog for inline use |
+| `web/src/features/store/store-management-table.tsx` | MODIFIED | Replaced separate Users/Settings action buttons with single gear toggle; added expandable row with inline StoreSettingsPanel |
+| `web/src/app/[locale]/dashboard/stores/page.tsx` | MODIFIED | Removed StoreAdminsDialog and StoreSettingsDialog imports; removed admins/settings dialog state; replaced `onViewAdmins`/`onSettings` props with single `onStoreUpdated` |
+| `web/src/components/ui/collapsible.tsx` | ADDED | shadcn/ui Collapsible component (base-ui primitive) |
+| `web/src/styles/glass.css` | MODIFIED | Added collapsible panel expand/collapse animation keyframes |
+| `web/src/messages/en.json` | MODIFIED | Added translation keys: expandSettings, collapseSettings, sectionGeneral, sectionAdmins, sectionQueueSettings |
+| `web/src/messages/vi.json` | MODIFIED | Added Vietnamese translations for new keys |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this refactor |
+
+### Verification
+- Not run: build/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-02 — Enforce allowNoShow in backend no-show flow
+
+### Summary
+- `allowNoShow` was previously only a frontend/UI gate. The admin UI hid no-show controls when disabled, but backend queue logic still set grace timers from `store_settings` and the no-show endpoint could still apply `noShowAction`, `maxRequeues`, and `requeueOffset`.
+- Fix: queue runtime now treats `allowNoShow` as the authoritative backend gate for no-show behavior. Grace-expiry keys are only created when the store has no-show handling enabled, and manual `POST /api/queue/admin/{storeId}/tickets/{ticketId}/no-show` now rejects requests when the feature is disabled.
+- No automated tests were added per request.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/service/NoShowPolicy.kt` | ADDED | Added shared helper for deciding when no-show settings are applicable |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/service/QueueService.kt` | MODIFIED | Gated grace timer setup and manual no-show handling on `store.allowNoShow` |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged backend `allowNoShow` enforcement |
+
+### Verification
+- Not run: build/test commands were intentionally skipped per repository instruction. No automated tests were added per request.
+
+## 2026-04-02 — Fix StoreSettings read mapping regression
+
+### Summary
+- `StoreSettings` was recently changed to implement `Persistable<UUID>` so create flows could force `INSERT` for a non-null `storeId`.
+- That change introduced a read-time regression: `isNewEntity` was added as a primary-constructor parameter, and Spring Data R2DBC tried to bind it when hydrating `StoreSettings`, causing `MappingException: No property isNewEntity found...` on settings reads/updates.
+- Fix: moved the transient new-entity flag out of the persistence constructor into an entity-body property, exposed a `markNew()` helper for the create path, and removed the explicit `isNewEntity = false` update copy argument.
+- No automated tests were added per request.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/store/entity/StoreSettings.kt` | MODIFIED | Moved transient insert-state flag out of the primary constructor and added `markNew()` |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/store/service/StoreService.kt` | MODIFIED | Create path now uses `markNew()`; update path no longer carries a constructor-only transient flag |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the StoreSettings read mapping regression fix |
+
+### Verification
+- Not run: build/test commands were intentionally skipped per repository instruction. No automated tests were added per request.
+
+## 2026-04-02 — Service type UI audit (round 2, post-Haiku)
+
+### Summary
+Re-audit of service type selector rework. **3 real issues found + reverted 5 unnecessary Haiku changes**.
+
+**CRITICAL — `callSpecificTicket` frontend/backend mismatch**:
+- Frontend `callSpecificTicket()` was sending `?serviceTypeId=...` but backend `QueueAdminController.callSpecificTicket` only accepts `counterId` — the param was silently ignored.
+- Fix: Removed `serviceTypeId` parameter from frontend `callSpecificTicket()`. Jump-calls don't need service type context — the ticket is identified by ID and already belongs to its service type queue. The `counterId` was the legacy labeling field and is no longer used from the UI.
+
+**HIGH — `WaitingList` passed `serviceTypeId` for no reason**:
+- `WaitingList` accepted `serviceTypeId` prop and forwarded it to `callSpecificTicket`, but as above the backend ignored it. The ticket listing itself (`listWaitingTickets`) has no service type filter — it returns all tickets.
+- Fix: Removed `serviceTypeId` prop from `WaitingList`. The waiting list shows all tickets across service types (correct behavior — admin sees the full queue).
+
+**Reverted unnecessary Haiku changes**:
+- Reverted `useServiceTypes` hook `error: boolean` state — added but never consumed anywhere.
+- Reverted `joinServiceTypeId` fallback in client-web store page — redundant since `selectedServiceTypeId` is already auto-set by the useEffect.
+- Reverted Settings page SelectTrigger `w-full` — broke alignment with `max-w-xs` Input fields below it. Restored `max-w-xs`.
+- Reverted Queue page service type container from `flex flex-col gap-1` back to `w-44 shrink-0 l:w-52` — the original layout was coherent and the change was cosmetic churn.
+- Reverted `aria-hidden="true"` on client-web SelectTrigger chevron — not present on web admin Select component; consistency preserved.
+
+**Confirmed correct (no changes needed)**:
+- i18n keys: `queue.selectService`, `queue.selectServicePlaceholder` verified present in both en/vi for client-web
+- i18n keys: `settings.store.defaultServiceTypeLabel/Caption/Placeholder`, `queue.serviceQueueLabel/Placeholder` verified present in both en/vi for web admin
+- Backend `/api/queue/public/{storeId}/service-types` endpoint exists and returns `ServiceTypePublicDto[]` matching client-web type
+- `callNext()` correctly sends `serviceTypeId` — backend `callNextUntilSuccess` uses it to pop from service-type-specific queue
+- Client-web auto-selects first service type when ≤1 type exists; selector hidden; `selectedServiceTypeId` passed to `useJoinQueue` correctly
+- Client-web `joinQueue()` correctly sends `serviceTypeId` as query param; backend `QueuePublicController.issueTicket` accepts it
+- Store Settings page localStorage persistence pattern `store:{storeId}:defaultServiceTypeId` is correct
+- Queue page restores persisted default from localStorage on mount; falls back to first active type
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/queue/api.ts` | MODIFIED | Removed `serviceTypeId` param from `callSpecificTicket()` — backend doesn't accept it |
+| `web/src/features/queue/waiting-list.tsx` | MODIFIED | Removed `serviceTypeId` prop — not used by API, not meaningful for jump-calls |
+| `web/src/app/[locale]/dashboard/queue/page.tsx` | MODIFIED | Removed `serviceTypeId` prop from WaitingList usage; reverted container layout |
+| `web/src/app/[locale]/dashboard/settings/store/page.tsx` | MODIFIED | Restored `max-w-xs` on SelectTrigger |
+| `client-web/src/features/store/hooks.ts` | MODIFIED | Reverted unused `error` state from `useServiceTypes` hook |
+| `client-web/src/app/[locale]/store/[storeId]/page.tsx` | MODIFIED | Reverted redundant `joinServiceTypeId`/`serviceTypesLoading` changes |
+| `client-web/src/components/ui/select.tsx` | MODIFIED | Reverted `aria-hidden` on chevron icon |
+
+### Verification
+- Not run: build/lint/test commands intentionally skipped per repository instruction.
+
+---
+
+## 2026-04-02 — Service type queue selector rework
+
+### Summary
+- **Replaced Counter ID with Service Type dropdown** across the entire admin dashboard:
+  - **Store Settings page** (`/settings/store`): "Default Counter ID" text input replaced with a "Default Service Queue" Select dropdown listing active service types, persisted to `localStorage` as `store:{storeId}:defaultServiceTypeId`.
+  - **Queue page** (`/dashboard/queue`): Counter ID input replaced with a service type Select dropdown in the action bar. Selection is persisted to localStorage and auto-defaults to the first active type. `callNext()` and `callSpecificTicket()` now pass `serviceTypeId` instead of `counterId`.
+- **SuperAdmin service type CRUD**: Added a "Service Types" card with full CRUD (table + form dialog + delete dialog) inside the Store Settings dialog, reusing existing `ServiceTypesTable`, `ServiceTypeFormDialog`, and `DeleteServiceTypeDialog` components.
+- **Admin service type CRUD**: Kept as-is in the Settings > Service Types tab.
+- **Client-web service type selection**: Added `GET /service-types` API call and `useServiceTypes` hook. When a store has >1 active service type, a Select dropdown appears on the store page before the Join Queue button. When ≤1, the dropdown is hidden and the single type is used automatically. The selected `serviceTypeId` is passed to `POST /tickets`.
+- **New Select component** added to `client-web/src/components/ui/select.tsx` (base-ui/react, matching admin dashboard pattern with rounded-xl for client styling).
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/messages/en.json` | MODIFIED | Replaced `defaultCounterIdLabel/Placeholder/Caption` with `defaultServiceTypeLabel/Caption/Placeholder`; replaced `counterIdLabel/Placeholder` with `serviceQueueLabel/Placeholder` |
+| `web/src/messages/vi.json` | MODIFIED | Same key replacements (Vietnamese) |
+| `web/src/app/[locale]/dashboard/settings/store/page.tsx` | MODIFIED | Replaced Counter ID input with service type Select dropdown; fetches service types on mount |
+| `web/src/app/[locale]/dashboard/queue/page.tsx` | MODIFIED | Replaced Counter ID input with service type Select; passes `serviceTypeId` to `callNext`; fetches and auto-selects active service types |
+| `web/src/features/queue/api.ts` | MODIFIED | `callNext()` accepts optional `serviceTypeId` + `counterId`; `callSpecificTicket()` accepts optional `serviceTypeId` |
+| `web/src/features/queue/waiting-list.tsx` | MODIFIED | Changed `counterId` prop to `serviceTypeId`; passes to `callSpecificTicket` |
+| `web/src/features/store/store-settings-dialog.tsx` | MODIFIED | Added service type CRUD card (ServiceTypesTable, FormDialog, DeleteDialog) for SuperAdmin |
+| `client-web/src/components/ui/select.tsx` | ADDED | shadcn/ui-style Select component using @base-ui/react |
+| `client-web/src/types/store.ts` | MODIFIED | Added `ServiceTypePublicDto` type |
+| `client-web/src/features/store/api.ts` | MODIFIED | Added `listActiveServiceTypes()` function |
+| `client-web/src/features/store/hooks.ts` | MODIFIED | Added `useServiceTypes()` hook |
+| `client-web/src/features/queue/api.ts` | MODIFIED | `joinQueue()` accepts optional `serviceTypeId` query param |
+| `client-web/src/features/queue/hooks.ts` | MODIFIED | `useJoinQueue()` accepts optional `serviceTypeId` and passes to API |
+| `client-web/src/app/[locale]/store/[storeId]/page.tsx` | MODIFIED | Added service type dropdown (visible when >1 type), wired to `useJoinQueue` |
+| `client-web/src/messages/en.json` | MODIFIED | Added `selectService`, `selectServicePlaceholder` keys |
+| `client-web/src/messages/vi.json` | MODIFIED | Added `selectService`, `selectServicePlaceholder` keys |
+| `docs/CHANGELOGS.md` | MODIFIED | This entry |
+
+### Removed
+- `defaultCounterIdLabel`, `defaultCounterIdPlaceholder`, `defaultCounterIdCaption` i18n keys (replaced by service type equivalents)
+- `counterIdLabel`, `counterIdPlaceholder` i18n keys (replaced by `serviceQueueLabel`, `serviceQueuePlaceholder`)
+- `counterId` localStorage key pattern `store:{storeId}:defaultCounterId` (replaced by `store:{storeId}:defaultServiceTypeId`)
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
+## 2026-04-02 — Fix store_settings persistence & access control, add SUPER_ADMIN settings dialog
+
+### Summary
+- **StoreSettings INSERT bug**: `StoreSettings` entity had a non-null `@Id` (`storeId: UUID`), causing Spring Data R2DBC to issue UPDATE (not INSERT) on create — rows were silently lost. Fixed by implementing `Persistable<UUID>` with `isNewEntity` flag (default `false` = existing, explicitly `true` at creation).
+- **updateStore access control**: `PUT /api/stores/{id}` was SUPER_ADMIN-only, blocking regular ADMINs from toggling `allowJumpCall`/`allowNoShow` on the Settings page ("elevated admin required" error). Relaxed to `requireStoreAccess` with field-level guard: ADMINs may only toggle queue behavior flags; name/address/status changes still require SUPER_ADMIN.
+- **SUPER_ADMIN settings dialog**: Added a Settings icon button on each store row in the Store Management page, opening a dialog with the same queue settings controls as the ADMIN Settings page (queue behavior toggles, limits, no-show handling).
+- **Seed script**: Added `seed-store-settings.sql` to backfill missing `store_settings` rows for the 3 existing stores.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../store/entity/StoreSettings.kt` | MODIFIED | Implements `Persistable<UUID>` with `@Transient isNewEntity` flag (default `false`); create path passes `true` explicitly |
+| `backend/.../store/service/StoreService.kt` | MODIFIED | `createStore` passes `isNewEntity = true`; `updateStoreSettings` keeps explicit `isNewEntity = false` |
+| `backend/.../store/controller/StoreController.kt` | MODIFIED | `updateStore` uses `requireStoreAccess` + field-level guard instead of `requireSuperAdmin`; added `isSuperAdmin` helper |
+| `web/src/features/store/store-settings-dialog.tsx` | ADDED | Dialog for SUPER_ADMIN to view/edit queue settings per store |
+| `web/src/features/store/store-management-table.tsx` | MODIFIED | Added Settings icon button + `onSettings` prop |
+| `web/src/app/[locale]/dashboard/stores/page.tsx` | MODIFIED | Wired StoreSettingsDialog with open/target state |
+| `web/src/messages/en.json` | MODIFIED | Added `settingsButton`, `settingsDialogTitle` keys |
+| `web/src/messages/vi.json` | MODIFIED | Added `settingsButton`, `settingsDialogTitle` keys |
+| `backend/src/main/resources/db/seed-store-settings.sql` | ADDED | Backfill script for missing store_settings rows |
+| `docs/CHANGELOGS.md` | MODIFIED | This entry |
+
+### Verification
+- Not run: build/lint/test commands were intentionally skipped per repository instruction.
+
 ## 2026-04-02 — Client-Web Standalone PM2 Deployment
 
 ### Files Changed

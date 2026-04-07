@@ -7,6 +7,6 @@
 [submodule "client-web"]
 	path = client-web
 	url = https://github.com/Thomas-Hoang-04/notiguide-client.git
-[submodule "receiver"]
-	path = receiver
-	url = https://github.com/Thomas-Hoang-04/notiguide-device.git
+[submodule "transmitter"]
+	path = transmitter
+	url = https://github.com/Thomas-Hoang-04/notiguide-transmitter.git

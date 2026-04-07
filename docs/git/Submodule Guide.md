@@ -9,7 +9,7 @@ notiguide/                    (master repo — github.com/Thomas-Hoang-04/notigu
 ├── backend/                  (submodule — notiguide-be.git)
 ├── web/                      (submodule — notiguide-admin.git)
 ├── client-web/               (submodule — notiguide-client.git)
-├── receiver/                 (submodule — notiguide-device.git)
+├── transmitter/              (submodule — notiguide-transmitter.git)
 ├── docs/                     (tracked directly in master repo)
 ├── CLAUDE.md                 (tracked directly in master repo)
 └── .gitmodules               (submodule registry)

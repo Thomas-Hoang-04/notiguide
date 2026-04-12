@@ -10,3 +10,11 @@
 [submodule "transmitter"]
 	path = transmitter
 	url = https://github.com/Thomas-Hoang-04/notiguide-transmitter.git
+[submodule "receiver-esp32"]
+	path = receiver-esp32
+	url = https://github.com/Thomas-Hoang-04/notiguide-receiver.git
+	branch = esp32
+[submodule "receiver-esp8266"]
+	path = receiver-esp8266
+	url = https://github.com/Thomas-Hoang-04/notiguide-receiver.git
+	branch = esp8266

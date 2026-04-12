@@ -1,5 +1,17 @@
 # Changelogs
 
+## 2026-04-07 — Transmitter Hub Domain manuscript
+
+### Summary
+- Created a walkthrough document analyzing the transmitter hub system design and providing recommendations.
+- Covers: hub single-point-of-failure mitigation, 433 MHz vs NRF24L01 trade-offs, MQTTS vs Web Serial role separation, device provisioning flow detail, RF code table capacity, OLED/LED/button strategy, backend schema and endpoint changes needed, hub firmware FreeRTOS task architecture, implementation phasing, and open hardware questions.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/walkthrough/Transmitter Hub Domain.md` | CREATED | Full analysis manuscript covering 8 problem areas, backend changes, firmware architecture, and phased implementation plan |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the transmitter hub domain manuscript |
+
 ## 2026-04-03 — Fix client-web store page nullable Select handler
 
 ### Summary

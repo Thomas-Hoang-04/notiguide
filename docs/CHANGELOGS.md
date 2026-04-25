@@ -1,5 +1,145 @@
 # Changelogs
 
+## 2026-04-26 — Web Deployment Walkthrough (VPS + PM2)
+
+### Summary
+- Added a new walkthrough doc covering the full self-hosted deployment loop for the admin web: standalone build, asset copy steps, what to upload, the on-VPS directory layout, and `pm2 reload` for zero-downtime redeploys.
+- Documented the existing `web/ecosystem.config.cjs` setup (cluster mode, 2 instances, port 2312, `cwd` resolved from the ecosystem file's own directory) as the reference layout — no code changes, only documentation.
+- Verified Next.js standalone behavior and PM2 reload semantics against current Context7-fetched docs (Next.js 16.2.x `output.mdx`, PM2 application-declaration / quick-start) before writing.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/walkthrough/Web Deployment Walkthrough.md` | ADDED | New end-to-end VPS + PM2 deployment guide with build commands, asset copy steps, rsync layout, final directory tree, `pm2 reload` workflow, and a troubleshooting table |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the new walkthrough |
+
+### Verification
+- Cross-checked Next.js `output: "standalone"` semantics (manual `public/` and `.next/static/` copy required, `server.js` entry, traced `node_modules`) against `vercel/next.js@v16.2.2` docs via Context7.
+- Cross-checked `pm2 reload ecosystem.config.js` zero-downtime behavior and cluster-mode reload against PM2 official docs via Context7.
+- Confirmed repo state matches the doc: `web/next.config.ts` has `output: "standalone"`, `web/ecosystem.config.cjs` uses `__dirname`-relative `cwd`, port 2312, cluster mode with 2 instances.
+
+## 2026-04-26 — Receiver plan cleanup follow-up
+
+### Summary
+- Cleared the last stale and misleading references in `docs/planned/Receiver Integration Implementation Plan.md` after the D7 split fix landed.
+- Replaced the outdated transmitter-plan reference `§7.5` with the current `Phase T5 — Dispatch consumer`.
+- Replaced the broken internal `§D7 split` wording with a direct reference to `Phase D7 — Queue Dispatch`.
+- Removed deferred D7b queue constants and `queue.dispatch.*` i18n from the receiver plan so the admin-web section stays aligned with the actual in-scope D7a slice.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/Receiver Integration Implementation Plan.md` | MODIFIED | Fixed the stale transmitter cross-reference, fixed the broken D7 wording, and removed deferred queue-UI constants/i18n from the D7a-scoped web plan |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this cleanup follow-up |
+
+### Verification
+- Re-audited the updated receiver plan against the linked transmitter prep plan, current repo UI primitives, and the previously verified official framework docs.
+
+## 2026-04-26 — Delete all sessions (sign out everywhere)
+
+### Summary
+- Added a "Delete all sessions" capability that lets an admin wipe every active session for their account — including the current one — and forces a sign-out across all devices. The previously dormant `SessionService.deleteAllForAdmin` (0 callers in the indexed graph) is now load-bearing and wires Redis token blacklisting into the wipe so revoked access tokens stop validating immediately rather than relying on TTL expiry.
+- Repurposed `deleteAllForAdmin(adminId)` from a fire-and-forget repo delete into a full revocation: collects every session row, blacklists each `tokenHash` in Redis (`revoked:*` with TTL = `jwtProperties.accessExpirySeconds`), then bulk-deletes the rows and returns the count. Mirrors the pattern used by `revokeAllOtherSessions` minus the current-token exclusion.
+- New endpoint `DELETE /api/admins/{id}/sessions/all` (distinct from the existing `DELETE /api/admins/{id}/sessions` "revoke all others"). Verifies caller owns the id, calls `sessionService.deleteAllForAdmin`, additionally calls `refreshTokenService.revokeAll(id)` so the refresh-rotation path can't resurrect a session, and clears both auth cookies (`maxAge=0`) on the response so the browser drops them. Returns `RevokeAllResponse(revoked)`.
+- `AdminController` now also depends on `RefreshTokenService` and gained a private `clearCookie(name, path)` helper that mirrors the one in `AuthController` (kept duplicated rather than extracted — only two callers, extraction would add a shared util for ~10 lines).
+- Frontend security settings page now shows two destructive buttons in the Active Sessions card header: the existing "Revoke all others" (only when other sessions exist) and a new "Delete all" button (always shown when at least one session exists, including the current one). Both buttons sit in a `flex flex-wrap gap-2` `CardAction` and disable each other while a request is in flight.
+- "Delete all" flow: confirm via `AlertDialog` → call `deleteAllSessions(adminId)` → toast success with revoked count → 800 ms pause so the toast registers visually → `useAuthStore.logout()` which clears local zustand state and redirects to `/login` (the server already cleared cookies, so the extra `/api/auth/logout` POST is a harmless no-op against already-revoked refresh state).
+- Bilingual strings added (`deleteAll`, `deleteAllConfirm`, `deleteAllSuccess`) for EN/VI under `settings.security.*`. Vietnamese phrasing follows the established colloquial style ("Xoá tất cả", "Bạn sẽ bị đăng xuất khỏi mọi thiết bị.").
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/service/SessionService.kt` | MODIFIED | `deleteAllForAdmin(adminId)` now returns `Int` and revokes all session token hashes in Redis (`revoked:*`, TTL = access-token expiry) before bulk-deleting the rows. Was previously a thin wrapper over `sessionRepository.deleteByAdminId` with no Redis integration and no callers. |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/controller/AdminController.kt` | MODIFIED | Added `DELETE /{id}/sessions/all` endpoint that revokes all sessions, revokes all refresh tokens, clears auth + refresh cookies, and returns the revoked count. Injected `RefreshTokenService`. Added private `clearCookie(name, path)` helper and `ResponseCookie` import. |
+| `web/src/lib/constants.ts` | MODIFIED | Added `API_ROUTES.ADMINS.SESSIONS_ALL` route helper for the new endpoint. |
+| `web/src/features/admin/api.ts` | MODIFIED | Added `deleteAllSessions(adminId)` API function returning `{ revoked: number }`. |
+| `web/src/app/[locale]/dashboard/settings/security/page.tsx` | MODIFIED | Added "Delete all" destructive button next to "Revoke all others" in the Active Sessions `CardAction`, gated by `AlertDialog` confirmation. New `handleDeleteAll` calls the API, shows a success toast, then triggers `useAuthStore.logout()` after a brief delay so the user is signed out and redirected. Both buttons mutually disable while either is in flight. Visibility rule changed: action row now appears whenever `totalSessionsCount > 0` (was `otherSessionsCount > 0`) so the user can wipe their lone current session too. |
+| `web/src/messages/en.json` | MODIFIED | Added `settings.security.deleteAll`, `deleteAllConfirm`, `deleteAllSuccess`. |
+| `web/src/messages/vi.json` | MODIFIED | Added Vietnamese counterparts ("Xoá tất cả", confirm/success copy in colloquial style). |
+| `docs/CHANGELOGS.md` | MODIFIED | This entry. |
+
+### Security notes
+- Both layers of revocation are needed: Redis blacklist stops the access token instantly (`JWTAuthFilter.isRevoked` short-circuits on `revoked:{tokenHash}` presence), and `RefreshTokenService.revokeAll` prevents the refresh-rotation flow from minting a new access token from any surviving refresh cookie on another device.
+- Cookies are cleared with the same flags used to set them (`httpOnly`, `secure`, `sameSite`, `domain` if configured) — required for browsers to honor the deletion.
+- Only the principal whose id matches `{id}` can call the endpoint; cross-account use returns 403 (`ForbiddenException`) like the sibling endpoints.
+
+### Verification
+- Not run: per repository instruction, no build/lint/test commands were executed in this implementation flow. GitNexus impact analysis was run on `SessionService` (LOW risk, 4 upstream importers all already account for the contract) and `deleteAllForAdmin` (0 prior callers — purely new exposure).
+
+## 2026-04-25 — Receiver Integration Plan Audit
+
+### Summary
+- Audited `docs/planned/Receiver Integration Implementation Plan.md` against the current backend/web code, `docs/walkthrough/Web Styles.md`, GitNexus, and official docs fetched through Context7.
+- Reworked the plan into an implementation-ready receiver integration plan with corrected Redis ticket key usage, route conventions, migration details, Spring Boot config behavior, Next.js route param handling, shadcn/ui assumptions, bilingual UI requirements, and queue dispatch hooks.
+- Corrected remaining precision issues: identifier-safe hardware-model enum storage, R2DBC enum registration, `analytics_event.device_id` FK migration, pgcrypto bytea encryption/decryption functions, method-aware rate limiting, signing/encryption 503 gating, and queue-dispatch preflight before ticket issuance.
+- Simplified the root `device` table by keeping transient lifecycle ack state in Redis.
+- Kept the document focused on implementation shape and audit flow, with deferred transmitter-hub work linked to its own prep plan.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/Receiver Integration Implementation Plan.md` | MODIFIED | Replaced the stale draft with an audited receiver/device-domain implementation plan aligned to current backend, admin-web, Web Styles, Context7 docs, and GitNexus impact findings |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the receiver integration plan audit |
+
+### Audit Notes
+- Consulted Context7 official docs for Next.js dynamic params, Spring Boot `ConditionalOnProperty`/PEM handling, and shadcn/ui usage.
+- Queried GitNexus for current backend/admin-web patterns and ran impact checks for `QueueService`, `RedisKeyManager`, `MqttClientManager`, `SecurityConfig`, `RateLimitFilter`, `TicketDto`, and `QueueAdminController`.
+- No build or lint commands were run for this docs-only audit update.
+
+## 2026-04-25 — Client IP resolution hardening + Revoke all other sessions
+
+### Summary
+- **IP "unknown" root cause.** Nginx was already forwarding `X-Real-IP`/`X-Forwarded-For` correctly. The bug lived entirely in the backend: `server.forward-headers-strategy=framework` is on, so Spring's `ForwardedHeaderTransformer` rewrites `request.remoteAddress` using `InetSocketAddress.createUnresolved(host, port)`. Unresolved sockets have `getAddress() == null` but `getHostString()` holds the real IP string. The old `AuthController.extractClientIp` only read `remoteAddress.address.hostAddress` → always null → `"unknown"`. (The old `RateLimitFilter` happened to have a `hostString` fallback, which is why rate-limiting keys were correct but the sessions UI was not.)
+- **Fix.** Introduced shared `ClientIpResolver` that checks `remoteAddress.address.hostAddress` → `remoteAddress.hostString` (catches unresolved sockets written by the transformer) → `X-Real-IP` header (NOT stripped by the transformer, insurance against future config changes) → raw `X-Forwarded-For` → `"unknown"`. Both `AuthController` and `RateLimitFilter` now delegate to the resolver.
+- **Revoke all other sessions.** New `DELETE /api/admins/{id}/sessions` endpoint (distinct from the existing per-session `DELETE /api/admins/{id}/sessions/{sessionId}`) that revokes every session for the caller except the one presenting the current access token. Service adds tokens to Redis `revoked:*` set with TTL equal to access-token lifetime and removes DB rows. Frontend security page now shows a "Revoke all others" destructive button in the Active Sessions card header when `otherSessionsCount > 0`, guarded by AlertDialog. Bilingual strings (`revokeAll`, `revokeAllConfirm`, `revokeAllSuccess`) added for EN/VI.
+- **Nginx guidance (operational, not code).** The Nginx reverse proxy must set `X-Real-IP`, `X-Forwarded-For`, and `X-Forwarded-Proto` for IP resolution to work in production. See the Nginx block in this entry.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/shared/http/ClientIpResolver.kt` | CREATED | Shared resolver: `remoteAddress` → `X-Real-IP` → `X-Forwarded-For` → `"unknown"`, with IPv6 loopback normalization |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/controller/AuthController.kt` | MODIFIED | Delegated `extractClientIp` to `ClientIpResolver.resolve`, dropped inline normalization |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/ratelimit/RateLimitFilter.kt` | MODIFIED | Removed inline `extractClientIp`/`normalizeIp`, switched to `ClientIpResolver.resolve` |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/service/SessionService.kt` | MODIFIED | Added `revokeAllOtherSessions(adminId, currentTokenHash)` that blacklists each hash in Redis then deletes DB rows; returns revoked count |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/controller/AdminController.kt` | MODIFIED | Added `DELETE /{id}/sessions` endpoint returning `RevokeAllResponse(revoked)`; reuses access-token hash logic |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/dto/RevokeAllResponse.kt` | CREATED | Response DTO `{ revoked: Int }` |
+| `web/src/features/admin/api.ts` | MODIFIED | Added `revokeAllOtherSessions(adminId)` calling `DELETE /api/admins/{id}/sessions` with `{ revoked: number }` typing |
+| `web/src/app/[locale]/dashboard/settings/security/page.tsx` | MODIFIED | Added "Revoke all others" destructive-outline Button inside the Active Sessions `CardHeader` via shadcn's `CardAction` slot (grid auto-places it top-right), gated by `otherSessionsCount > 0`, wired to `handleRevokeAll` with AlertDialog confirmation and count-based success toast; follows `docs/walkthrough/Web Styles.md` tokens (`--destructive`, glass-card context) |
+| `web/src/messages/en.json` | MODIFIED | Added `security.revokeAll`, `security.revokeAllConfirm`, `security.revokeAllSuccess` |
+| `web/src/messages/vi.json` | MODIFIED | Added Vietnamese counterparts in colloquial phrasing |
+| `docs/CHANGELOGS.md` | MODIFIED | This entry |
+
+### Nginx configuration (user must apply on the server)
+Add the following to the backend's `location` block in the Nginx site config. Without these, the backend has no way to know the real client IP and will log `"unknown"` for any request (both login history and active sessions).
+
+```nginx
+location /api/ {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+
+    # --- Client IP propagation (required for login history / sessions UI) ---
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host  $host;
+    proxy_set_header X-Forwarded-Port  $server_port;
+
+    # --- SSE / websocket upgrade (already needed for /api/queue/admin/**/events) ---
+    proxy_set_header Upgrade           $http_upgrade;
+    proxy_set_header Connection        $http_connection;
+    proxy_buffering                    off;
+    proxy_read_timeout                 1h;
+}
+```
+
+After editing, run `sudo nginx -t && sudo systemctl reload nginx`. Spring's existing `server.forward-headers-strategy: framework` will pick up `X-Forwarded-For` automatically and rewrite `request.remoteAddress`; the new `ClientIpResolver` also reads `X-Real-IP` as an insurance fallback.
+
+### Notes / skipped
+- No new "Deployment" doc was created — Nginx guidance lives in this changelog entry per the user's preference to avoid new doc files. If more ops guidance accumulates, consider promoting this block into `docs/walkthrough/Deployment.md`.
+- Did not add a frontend toggle or config; Nginx changes are environment-level.
+- Did not add tests (project has none beyond `contextLoads()`).
+
 ## 2026-04-07 — Transmitter Hub Domain manuscript
 
 ### Summary

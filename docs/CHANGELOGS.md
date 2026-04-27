@@ -1,6 +1,437 @@
 # Changelogs
 
-## 2026-04-26 — Web Deployment Walkthrough (VPS + PM2)
+## 2026-04-27 — Transmitter plan audit corrections
+
+### Summary
+- Audited `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` against the local ESP-IDF reference, current transmitter/receiver source, the nRF24L01/nRF24L01+ product specifications, and ESP-IDF v6.0 Context7 docs.
+- Corrected stale SDK and `sdkconfig` references: the only checked-in SDK reference is `docs/walkthrough/ESP_IDF_SDK_REFERENCE.md`, and the transmitter checkout currently has no `sdkconfig`.
+- Fixed transmitter-plan logic for signed dispatch replay: invalid signatures can no longer poison the replay ring, suspended/decommissioned commands are still signature-verified, and duplicate signed commands re-ack the prior terminal outcome without re-emitting RF.
+- Fixed the 433 MHz send sketch so `rf433_tx_send_bits` waits for the gptimer pulse train to complete before the firmware publishes `applied`, and corrected the latency budget so the 433 path is repeat-count dependent instead of incorrectly inheriting the nRF24 `<250 ms` target.
+- Kept the nRF24 `97..125` channel range aligned with the receiver firmware's Wi-Fi-avoidance policy, while documenting that the nRF24L01+ silicon range up to 2525 MHz still requires local regulatory validation before field deployment.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Fixed stale SDK/sdkconfig references, dispatch replay/signature ordering, 433 completion semantics, nRF24 channel bounds, GPIO wording, and Wi-Fi/nRF coexistence wording |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the transmitter plan audit corrections |
+
+### Verification
+- Cross-checked ESP-IDF API statements against `docs/walkthrough/ESP_IDF_SDK_REFERENCE.md`, current `transmitter/` source, and Context7 ESP-IDF v6.0 docs.
+- Cross-checked nRF24 address, DPL, auto-ACK, retransmit, timing, and frequency claims against `docs/walkthrough/nRF24L01P_PS_v1.0.txt` and `docs/walkthrough/nRF24L01_Product_Specification_v2_0-9199.txt`.
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-27 — Receiver-doc audit corrections
+
+### Summary
+- Re-audited the four receiver docs named in the latest changelog block against the live `receiver-esp32` firmware and the local nRF24 datasheets at `docs/walkthrough/nRF24L01P_PS_v1.0.txt` and `docs/walkthrough/nRF24L01_Product_Specification_v2_0-9199.txt`.
+- Fixed receiver-guide drift where the docs still described the older 2.4G rf-code rotation flow (`trigger` mutex + direct `CE` walk + ~150 µs wording) instead of the current `rf_sup_apply_rx_address(...)` / `nrf24_recv_set_rx_address(...)` path that suspends, rewrites, and resumes when needed.
+- Fixed stale receiver-guide statements that no longer match the live checkout: the guide now reflects that `receiver-esp32` no longer carries a `jgromes/radiolib` dependency, the MQTT `client_id` is gated by `has_public_id`, the 2.4G admin surface is fixed at exactly 10 hex chars / 40 bits, and the audit/self-check sections no longer refer to removed Kconfig `B0..B4` address knobs.
+- Fixed stale repo-path references in the mirrored receiver design guide so the root `docs/planned/` copy now points at the real canonical files (`receiver-esp32/ESP_IDF_SDK_REFERENCE.md`, `receiver-esp32/managed_components/...`, `docs/walkthrough/nRF24...`), while keeping the three guide copies byte-identical.
+- Corrected the ESP-IDF Wi-Fi wording: the guide no longer claims `pmf_cfg.capable` is deprecated in v6.0, and now states only what the current source and the official docs support.
+- Updated the receiver integration plan's 2.4G rotation paragraph to match the live firmware path instead of the superseded direct-CE description.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/done/Receiver Integration Implementation Plan.md` | MODIFIED | Corrected the 2.4G rf-code rotation description so it matches the live `rf_sup_apply_rx_address(...)` / `nrf24_recv_set_rx_address(...)` path |
+| `docs/planned/RECEIVER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Fixed source drift (radio-supervisor, MQTT client-id, address rotation, PMF wording, 2.4G width guidance), removed stale RadioLib/current-state claims, and corrected canonical repo references |
+| `receiver-esp32/RECEIVER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Synced byte-identical to `docs/planned/` after the audit fixes |
+| `transmitter/RECEIVER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Synced byte-identical to `docs/planned/` after the audit fixes |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this audit-and-amend pass |
+
+### Verification
+- Cross-checked the receiver-guide nRF24 descriptions against the live `receiver-esp32` source: `main/network/mqtt.c`, `main/trigger/rf_supervisor.[ch]`, `main/trigger/rf_trigger.[ch]`, `main/nrf24/nrf24_receiver.[ch]`, `main/network/wifi.c`, `main/idf_component.yml`, and `dependencies.lock`.
+- Re-checked the load-bearing nRF24 claims against the local datasheets: address-width / address-quality notes (§7.3.2), LSByte-first multi-byte register writes (§8.3.1), `Tstby2a`, DPL / `R_RX_PL_WID`, `RX_ADDR_P1`, `TX_ADDR == RX_ADDR_P0` for ACK handling on PTX, and the IRQ mask bits.
+- Re-checked the Wi-Fi / ESP-MQTT wording against ESP-IDF v6.0 docs via Context7, including WPA3-compatible mode flags and the rule that `esp_mqtt_client_stop()` / `esp_mqtt_client_destroy()` must not be called from MQTT event-handler context.
+- Mirror parity re-verified: `diff -q` confirms `docs/planned/RECEIVER_ESP32C3_DESIGN_GUIDE.md` matches both `receiver-esp32/RECEIVER_ESP32C3_DESIGN_GUIDE.md` and `transmitter/RECEIVER_ESP32C3_DESIGN_GUIDE.md`.
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-27 — rf_code-as-address shift for `RECEIVER_2_4G`
+
+### Summary
+- Repurposed the `rf_code` for `RECEIVER_2_4G` devices: instead of an application-layer match value, the rf_code is now the receiver's 5-byte nRF24 `RX_ADDR_P1` (silicon-level identity). The transmitter hub writes those 5 bytes to `TX_ADDR` + `RX_ADDR_P0` per dispatch and emits a fixed 2-byte `TOGGLE_MAGIC = {0xAA, 0x55}` payload; the receiver's pipe-1 silicon already filters by address, so the matcher only verifies the magic before toggling. Result: per-receiver unicast, clean per-receiver auto-ACKs (one ACK responder per dispatch), no firmware-side or Kconfig-side address provisioning, and the entire class of "shared-address ACK collision" concerns is gone.
+- Locked `RECEIVER_2_4G` width at exactly 40 bits / 5 bytes (`SETUP_AW = 11`). Shorter widths are flagged noise-prone by the datasheet and the validator/forbidden-set/schema CHECKs all collapse to a single rule when there's only one legal width.
+- 433M side is unchanged. `rf_code` for `RECEIVER_433M` and `RECEIVER_433M_PASSIVE` keeps its original meaning (RC-Switch payload value, app-layer match).
+- `transmit-v1` canonical and JSON envelope are unchanged on the wire — `band` stays as the routing field, and `rf_code_hex` carries different byte semantics by band. No new field added.
+
+### Design decisions confirmed before editing
+| # | Decision |
+|---|---|
+| 1 | Address width: standardize on 5 bytes / 40 bits only (single value, not a set) |
+| 2 | Fixed payload: 2-byte `TOGGLE_MAGIC = {0xAA, 0x55}` (defense-in-depth, room for a future opcode without re-cutting the wire) |
+| 3 | Cross-store address uniqueness: **global within the 2.4G band**; 433M keeps its existing same-store scope (PT2272 chip space is small enough that cross-store reuse is the realistic norm) |
+| 4 | No migration: clean slate — backend `device` domain isn't built yet, no production receiver firmware has shipped |
+| 5 | `cmd/rf_code` rotation must rewrite `RX_ADDR_P1` in silicon (~150 µs blanking window via Standby-I walk; admin-driven, rare) |
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/done/Receiver Integration Implementation Plan.md` | MODIFIED | §2.4 narrows `RECEIVER_2_4G` to `bits == 40, hex_len == 10`; §3.1 adds a kind-aware `device_rf_code` trigger that enforces 40/5 for 2.4G; §6 default-bits-24g 64 → 40 with rationale comment; §D5.0 forbidden-set adds the four nRF24 address pathologies the datasheet calls out + global uniqueness for 2.4G; §D5.1 documents 5-byte SecureRandom path, first-byte transition guard, and the receiver-side rotation silicon walk; enum comment clarifies 2.4G semantic |
+| `docs/planned/RECEIVER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | §B.2/§B.3 split semantics by band (2.4G is silicon-level, 433M stays app-layer); §D NVS schema clarifies rf_code byte meaning per kind; §F.2 cmd/rf_code handler reordered for 2.4G (stage code → start supervisor with cfg → commit op_state) and adds rotation `rf_sup_apply_rx_address` step; §G.2 supervisor signature gains `cfg` param and a `rf_sup_apply_rx_address` band-aware function; §G.7 nrf24_handle_t gains `rx_addr[5]`, start_task takes addr[5], new `nrf24_recv_set_rx_address` API; §G.7.5 / §G.7.7 byte-order narrative re-anchored on rf_code; §G.8 matcher simplified to address+magic check with `RF_TRIGGER_TOGGLE_MAGIC_HI/_LO` constants; §I.2 Kconfig drops `RECEIVER_NRF24_RX_ADDR_B0..B4`; §H.6 width validation aligned with §2.4 |
+| `receiver-esp32/RECEIVER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Synced byte-identical to `docs/planned/` mirror |
+| `transmitter/RECEIVER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Synced byte-identical to `docs/planned/` mirror |
+| `receiver-esp32/main/nrf24/nrf24_receiver.h` | MODIFIED | `nrf24_handle_t` gains `rx_addr[5]`; `nrf24_recv_start_task` takes `const uint8_t addr[5]`; new `nrf24_recv_set_rx_address` |
+| `receiver-esp32/main/nrf24/nrf24_receiver.c` | MODIFIED | Bringup writes `RX_ADDR_P1` from `handle->rx_addr`; `nrf24_recv_start_task` stashes `addr` before bringup; new `nrf24_recv_set_rx_address` walks chip RX → Standby-I → SPI write → Standby-I → RX; stub block for non-2.4G builds gets matching signatures |
+| `receiver-esp32/main/trigger/rf_supervisor.h` | MODIFIED | `rf_sup_start` takes `const device_config_t *cfg`; new `rf_sup_apply_rx_address` |
+| `receiver-esp32/main/trigger/rf_supervisor.c` | MODIFIED | 2.4G start passes `cfg->rf_code` to `nrf24_recv_start_task`; new `rf_sup_apply_rx_address` is a no-op stub on 433M and routes to `nrf24_recv_set_rx_address` on 2.4G |
+| `receiver-esp32/main/trigger/rf_trigger.h` | MODIFIED | Added `RF_TRIGGER_TOGGLE_MAGIC_HI/_LO` constants |
+| `receiver-esp32/main/trigger/rf_trigger.c` | MODIFIED | `rf_trigger_on_packet` simplified to magic-byte check; no longer compares against `s_trigger.code` (s_trigger.code is now the silicon address, not a payload value) |
+| `receiver-esp32/main/network/mqtt.c` | MODIFIED | Width validator narrows 2.4G to `bits == 40 && code_len == 5`; rf_code handler reordered (commit code → start supervisor → commit op_state for first install; commit code → apply silicon address → set matcher for rotation); deact resume passes `s_mqtt.cfg` to `rf_sup_start` |
+| `receiver-esp32/main/main.c` | MODIFIED | `dispatch_operational_state` passes `&g_cfg` to `rf_sup_start` |
+| `receiver-esp32/main/Kconfig.projbuild` | MODIFIED | Dropped `RECEIVER_NRF24_RX_ADDR_B0..B4`; replaced with comment block explaining runtime-config sourcing |
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | §B.2 reframes `band` as routing-and-audit field rather than disambiguator (widths now disjoint); §B.3 transmit semantics document per-band byte meaning; §E.3 width validation matches §2.4; §G.7 bringup drops Kconfig address writes; `nrf24_tx_send` signature changes to `(handle, addr[5])` and emits fixed `TOGGLE_MAGIC`; supervisor `radio_tx_send` enforces 5/40 for 2.4G; §H.4 prose explains why `band` stays despite disambiguation no longer being needed; §I.3 Kconfig drops `TRANSMITTER_NRF24_TX_ADDR_B0..B4`; §J entry 11 refreshed for per-dispatch addressing; §K self-verification updated; "Last updated" footer |
+| `docs/CHANGELOGS.md` | MODIFIED | This entry |
+
+### Skipped / Deferred
+| Item | Status | Reason |
+|---|---|---|
+| Backend Kotlin `RfCodeService` / `RfCodeValidator` / migration SQL | NOT STARTED | Backend `domain/device/` package and `db/migrations/` directory do not exist yet — the Receiver Integration plan is the contract, the implementation hasn't begun. Updating the plan is sufficient for now; the Kotlin/SQL code lands when the receiver-integration sprint kicks off |
+| Admin web copy / UI changes for the bits-fixed-at-40 rule on 2.4G | NOT STARTED | Same — admin web `device` surface doesn't exist yet. Will land with the receiver-integration sprint |
+| receiver-esp8266 firmware | NOT TOUCHED | ESP-01 supports `RECEIVER_433M` only (Receiver Plan §H.3); rf_code-as-address concerns 2.4G receivers exclusively |
+
+### Verification
+- Cross-checked the nRF24 address-pathology guards against PS v1.0 §7.3.2 / PS v2.0 §7.3.2 ("Addresses where the level shifts only one time can often be detected in noise" / "Addresses as a continuation of the preamble (hi-low toggling) raises the Packet-Error-Rate").
+- Confirmed `device_rf_code` schema trigger fires inside the same transaction as the `device` row insert, so the kind lookup is always satisfiable in D2.1 (passive register) and D5.1 (auto-issue post-activation).
+- Ran a stale-reference sweep across all four documents for `CONFIG_*_NRF24_*ADDR_B*`, `bits ∈ [8, 256]`, `bits % 8 == 0`, `nrf24_tx_send(payload, byte_len)`, and `256-bit` — all hits resolved.
+- Mirror parity: `diff -q` confirms `docs/planned/RECEIVER_ESP32C3_DESIGN_GUIDE.md` ≡ `receiver-esp32/RECEIVER_ESP32C3_DESIGN_GUIDE.md` ≡ `transmitter/RECEIVER_ESP32C3_DESIGN_GUIDE.md`.
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-27 — Transmitter guide NRF24 + cross-ref audit
+
+### Summary
+- Re-audited `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` against `docs/walkthrough/nRF24L01P_PS_v1.0.txt` (PS v1.0) and `docs/walkthrough/nRF24L01_Product_Specification_v2_0-9199.txt` (PS v2.0), with focus on the nRF24 PTX bringup and send-path snippets.
+- Fixed factual error: `SETUP_RETR = (3 << 4) | 3` writes ARD field `0011` = 1000 µs per the datasheet, but the surrounding text and §J.10 entry both stated 750 µs. Corrected the value to `(2 << 4) | 3` (ARD `0010` = 750 µs) so the code matches the design intent and updated comments to cite the datasheet encoding.
+- Fixed undefined symbol: receiver `nrf24_regs.h` (verified at `receiver-esp32/main/nrf24/nrf24_regs.h:50`) only defines `NRF_DYNPD_P1`. The PTX bringup uses `NRF_DYNPD_P0`, so the §C module-layout note and §G.7 intro now explicitly call out `NRF_DYNPD_P0 (1U << 0)` as the one PTX-only addition to the shared header instead of claiming "reused unchanged".
+- Fixed misleading IRQ-mask comment on the bringup CONFIG write: the snippet sets `MASK_RX_DR` (RX_DR is the masked source, not MAX_RT or TX_DS), so the comment was rewritten to state that TX_DS and MAX_RT both stay enabled and the ISR distinguishes via STATUS readback — matching the prose two paragraphs below the snippet.
+- Reconciled the §F.7 power policy with the §G.7 implementation: §F.7 prescribes Power-Down between dispatches, but the snippet powered up once at bringup and never returned to Power-Down. The bringup now ends with `PWR_UP = 0`, and `nrf24_tx_send` walks Power-Down → Standby-I → TX → Standby-I → Power-Down per dispatch (paying `Tpd2stby` once per send, well within the §B.3 latency budget).
+- Updated stale cross-references: `docs/walkthrough/Receiver Integration Implementation Plan.md` → `docs/done/Receiver Integration Implementation Plan.md` (file moved during the receiver-integration close-out), and the three remaining `docs/walkthrough/ESP_IDF_SDK_REFERENCE.md` references now point to the canonical `receiver-esp32/ESP_IDF_SDK_REFERENCE.md` per project rule (the other two copies under `transmitter/` and `docs/walkthrough/` are byte-identical mirrors per `diff -q`).
+- §J.10 audit entry promoted from "accepted" to "resolved" with the corrected ARD encoding now spelled out alongside the datasheet field value.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | NRF24 PTX bringup + send-path corrections (ARD encoding, `NRF_DYNPD_P0` extension call-out, IRQ-mask comment, Power-Down/Standby-I dispatch walk), updated stale `docs/walkthrough/...` references for the Receiver Integration plan and SDK reference, and refreshed the §J.10 audit entry |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this NRF24 + cross-ref audit pass |
+
+### Skipped / Deferred
+| Item | Status | Reason |
+|---|---|---|
+| Surfacing nRF24 probe failure into heartbeat as a capability bitmap | DEFERRED | Already tracked in §J.4 / §H.10 — backend has no field for it today; revisit when the unified device heartbeat schema gains capability flags |
+| `device_status` enum completeness in §H.1 prose | NOT CHANGED | The §H.1 list ("ACTIVE / SUSPENDED / DECOMMISSIONED") is shorthand for candidate-pool admission only; the full enum (`PENDING`, `PENDING_RF_CODE`, `ACTIVE`, `SUSPENDED`, `DECOMMISSIONED`, `REJECTED`) is documented in the receiver plan §3.1 and the §H.7.1 cap query already filters with `NOT IN ('DECOMMISSIONED', 'REJECTED')`. No correction needed |
+
+### Verification
+- Cross-checked ARD encoding directly in `docs/walkthrough/nRF24L01P_PS_v1.0.txt` (lines 5136–5138) — `0000` = 250 µs, `0001` = 500 µs, `0010` = 750 µs.
+- Confirmed `NRF_DYNPD_P0` absence in `receiver-esp32/main/nrf24/nrf24_regs.h` (only `NRF_DYNPD_P1` at line 50) and in receiver guide §G.7.2 (line 1296).
+- Confirmed `Receiver Integration Implementation Plan.md` lives at `docs/done/` (not `docs/walkthrough/`) per `gitStatus` and the file listing.
+- Confirmed `receiver-esp32/ESP_IDF_SDK_REFERENCE.md` is byte-identical to `docs/walkthrough/ESP_IDF_SDK_REFERENCE.md` and `transmitter/ESP_IDF_SDK_REFERENCE.md` via `diff -q` — the path canonicalization is purely stylistic alignment with the user's project rule.
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-27 — Transmitter guide audit round 2
+
+### Summary
+- Re-audited `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` against the live repo, the receiver walkthrough, and Context7-backed library docs to remove a few remaining inferred or brittle statements.
+- Tightened the backend MQTT section so it now states the real implementation prerequisite: the current `MqttClientManager` wrapper must grow a v5 subscription overload or stored descriptor before the plan can rely on `MqttSubscription.setNoLocal(true)` across reconnects.
+- Cleaned the backend rollout flow by renaming the mixed heartbeat/ack listener to an operational listener, moving transmit/deact ack handling into that phase explicitly, and removing the undefined `DEVICE_DISPATCH_FAILED` event name in favor of a receiver-plan-owned admin-visible failure path.
+- Trimmed brittle self-verification references that hardcoded external line numbers, and removed an unverified Spring-condition prescription so the remaining notes stay tied to documented behavior only.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Clarified the MQTT v5 wrapper gap, corrected backend feature-flag/restart wording, made the operational-topic listener split explicit, removed the undefined dispatch-failure event name, and simplified stale self-verification references |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this second audit round |
+
+### Verification
+- Re-checked Spring Boot `@ConditionalOnProperty`, Eclipse Paho MQTT v5 `MqttSubscription.setNoLocal(true)`, and Reactor `Sinks.many().multicast().directBestEffort()` through Context7 before finalizing the wording.
+- Re-checked the live repo state referenced by the guide: `backend/core/mqtt/MqttClientManager.kt`, `backend/core/sse/QueueEventBroadcaster.kt`, `transmitter/main/*`, `transmitter/dependencies.lock`, and `transmitter/sdkconfig`.
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-27 — Transmitter plan merge cleanup and audit
+
+### Summary
+- Finished the transmitter-plan consolidation: the receiver walkthrough now points to `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md`, and the obsolete backend-only transmitter prep was removed.
+- Tightened the merged transmitter guide so it is explicitly MQTT v5-only on the transmitter/backend path. The backend bootstrap wildcard now documents `MqttSubscription.setNoLocal(true)` as the primary self-echo control, with envelope-type dropping kept only as defensive validation.
+- Cleaned the transmitter guide's self-verification section so it no longer depends on the deleted backend-prep doc as a live reference, and re-audited the merged plan for stale links, redundant wording, and logical consistency.
+- Re-verified the load-bearing backend-library claims via Context7: Spring Boot `@ConditionalOnProperty` multi-name semantics, Paho MQTT v5 `setNoLocal`, and Reactor `Sinks.many().multicast().directBestEffort()` slow-subscriber behavior.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Removed stale MQTT 3.1.1 transmitter wording, rewrote the `noLocal` guidance around the repo's MQTT v5 backend path, and cleaned the post-merge audit/self-verification notes so the merged guide stands on its own |
+| `docs/planned/Transmitter Hub Backend Prep.md` | DELETED | Removed the superseded backend-only transmitter plan after its content was absorbed into `TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` |
+| `docs/walkthrough/Receiver Integration Implementation Plan.md` | MODIFIED | Repointed transmitter cross-references, D7 ownership notes, and the `transmit-v1` canonical reference to the merged transmitter guide |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this cleanup-and-audit pass |
+
+### Verification
+- Re-checked Spring Boot, Eclipse Paho MQTT Java, and Reactor Core behavior against Context7-fetched docs before finalizing the transmitter backend guidance.
+- Ran a stale-reference sweep across `docs/planned` and `docs/walkthrough`; the live docs no longer point at a separate backend-prep plan.
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-26 — Transmitter ESP32-C3 design guide
+
+### Summary
+- Drafted `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md`, the firmware-side design guide for the dual-radio (433 MHz + nRF24L01/+ 2.4 GHz) transmitter hub on ESP-IDF v6.0. Mirrors the structure of the receiver design guide (sections A–J) and adapts only what the hub changes; sections that are byte-for-byte identical to the receiver (Wi-Fi, MQTT framing, HTTP provisioning, mbedTLS identity) are referenced rather than duplicated.
+- Pinned the firmware-side restatement of the backend contract in `docs/planned/Transmitter Hub Backend Prep.md` (topics, heartbeat cadence, lifecycle commands, per-store cap of 3) and surfaced one required backend amendment: extend the `transmit-v1` canonical and JSON envelope with an explicit `band` field (`"433M" | "2_4G"`), since `rf_code_bits ∈ {8,16,24,32}` is otherwise ambiguous between the 433 MHz and 2.4 GHz validation ranges.
+- Specified how to extend the existing `transmitter/main/rf/` pulse engine with a bits-oriented encoder (`bits_to_pulses` / `rf433_tx_send_bits`) instead of routing backend codes through the PT2272 tri-state path, and how to adapt the receiver's `nrf24/` driver (`nrf24_regs.h`, chip probe, IRAM ISR shape) into a PTX-mode transmitter with `TX_ADDR == RX_ADDR_P0`, ARC=3 retransmits, MASK_RX_DR-only IRQ, DPL bilateral with the receiver.
+- Documented the hub-only state model (`ACTIVE` / `SUSPENDED` / `DECOMMISSIONED`, no `PENDING_RF_CODE`), the in-RAM dispatch_id replay ring, the heartbeat publisher (10 s ± 0.5 s jitter, QoS 0, stops on suspend/decommission), and the dispatch executor's verification order (shape → op_state → band/width → replay → signature → hex decode → RF emission → ack).
+- Added §J Audit (20 items) and §K Self-Verification spelling out exactly which lines of which source files each claim was checked against.
+- Plan only — no firmware code in this slice.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | ADDED | New design guide. Sections A–K covering system overview, dual-radio model, module layout, NVS schema, MQTT contract, boot orchestration, ESP-IDF code guide (with code sketches for the radio supervisor, dispatch executor, nRF24 PTX bringup/send, heartbeat task, and bits-to-pulses encoder), backend contract delta, build configuration (idf_component.yml, CMakeLists.txt SRCS list, Kconfig.projbuild without a radio gate), audit, and self-verification. |
+| `docs/CHANGELOGS.md` | MODIFIED | Added this entry. |
+
+### Verification
+- Self-checks listed in §K of the new guide. Each load-bearing fact is cited against an authoritative source (Backend Prep file, receiver design guide line range, receiver firmware source file, ESP-IDF SDK reference, or nRF24 datasheet section).
+- Confirmed the receiver design guide is identical at `receiver-esp32/RECEIVER_ESP32C3_DESIGN_GUIDE.md`, `transmitter/RECEIVER_ESP32C3_DESIGN_GUIDE.md`, and `docs/planned/RECEIVER_ESP32C3_DESIGN_GUIDE.md` (no diff between any pair) before treating it as a single source of truth.
+- Confirmed the existing transmitter skeleton state: `transmitter/main/main.c` is an empty `app_main`; `transmitter/main/rf/` has `rf_common.h`, `rf_data.c`, `rf_timer.c`, `rf_transmitter.c` (RC-Switch tri-state pulse engine + gptimer ISR); `transmitter/main/network/` has only an empty `certs/`; no `Kconfig.projbuild` exists yet.
+- Did not run `idf.py build` per repository convention.
+
+## 2026-04-26 — Cookie consent — stop nagging users whose cookies actually work
+
+### Summary
+- The consent dialog kept reappearing on every visit to the login page even after a user had enabled third-party cookies and signed in successfully. Root cause: on Chromium the `top-level-storage-access` Permissions API only reports `granted` after a per-origin grant via `requestStorageAccessFor` (which itself is gated by Related Website Sets). Users who relied on the browser-wide "allow third-party cookies" toggle had their cookies flowing fine, but the Permissions API kept reporting `prompt` forever, so `resolveStatusFor` kept routing them to `needed` and the dialog kept opening.
+- Added a persistent "we've already seen cookies actually work in this browser" flag (`localStorage[notiguide.cookieConsent.verified]`) and a `markVerified()` action on the consent hook. The flag is set whenever we have positive evidence cookies are flowing — Permissions API returns `granted`, `requestStorageAccessFor` resolves successfully, or the post-login `verifySession()` succeeds. The resolver short-circuits to `granted` whenever the flag is set, so the dialog stays closed.
+- The flag is cleared by `reportFailure` (called on a real cookie-missing post-login signal). That path is the only authoritative invalidator; user actions like "Not now" / "I've enabled it" don't touch it because they aren't evidence one way or the other.
+- Frontend-only fix. Backend behaviour, the dialog itself, and the login flow contract are unchanged.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/lib/storage-access.ts` | MODIFIED | Added `CONSENT_VERIFIED_KEY` and `rememberCookieAccessVerified` / `wasCookieAccessVerified` / `clearCookieAccessVerified` helpers backed by `localStorage` (try/catch-guarded for privacy mode). Comment block on the new key explains why the Permissions API alone is insufficient on Chromium. |
+| `web/src/hooks/use-cookie-consent.ts` | MODIFIED | `resolveStatusFor` now short-circuits to `granted` when the verified flag is set; if the Permissions API itself reports `granted`, that evidence is also persisted into the flag. `request` now persists the flag on a successful `requestStorageAccessFor`. `reportFailure` clears the flag before re-resolving. New `markVerified()` action exposed on the hook for the login page to call after `verifySession() === "ok"`. |
+| `web/src/app/[locale]/(auth)/login/page.tsx` | MODIFIED | After a successful login + verifySession, call `consent.markVerified()` before navigating so the next visit to the login page (e.g. logout / session expiry) doesn't reopen the dialog for a user whose cookies are clearly working. |
+| `docs/CHANGELOGS.md` | MODIFIED | Added this entry. |
+
+### Verification
+- `npx tsc --noEmit` clean.
+- Reasoned through the four hook entry points:
+  - **Initial mount, flag set** → `granted` → dialog closed ✅
+  - **Initial mount, flag unset, Permissions API `granted`** → flag is set as a side effect, status `granted`, dialog closed ✅
+  - **Initial mount, flag unset, Permissions API `prompt`/`denied`** → unchanged behaviour (`needed`/`manual`) ✅
+  - **Post-login `cookie-missing`** → `reportFailure` clears the flag, dialog re-opens with the correct mode ✅
+- Per repository instruction, did not run `yarn build` / `yarn lint`.
+
+## 2026-04-26 — Cookie consent dialog — copy + layout refresh (bilingual)
+
+### Summary
+- Widened the consent dialog so it stops feeling cramped at typical desktop sizes, and reworked descriptions / details into multi-paragraph blocks instead of a single wall-of-text run.
+- Emphasised the calling origin and the usage scope inline with bold spans on the main description.
+- Added a `Lightbulb` glyph to the "why is this needed?" details block; inlined a `Shield` icon in the Firefox manual steps in place of the literal phrase "shield icon" / "biểu tượng khiên".
+- Trimmed and naturalised the Vietnamese copy per native-speaker review (drop `cookie phiên`, drop `một`, prefer `kích hoạt` over `bật`, prefer `xác nhận` over `bấm` for primary actions, drop `hộp xác nhận`, terse confirmation labels e.g. `Đã xong`).
+- Established and recorded a structural-mirroring rule: `en.json` and `vi.json` must keep the same key set, the same `<p>` / `<bold>` / `<shield>` tag positions, and the same paragraph counts. Wording is per-language; structure must match.
+- The user-visible recovery flow, the dialog's prop contract, and backend behaviour are unchanged.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/auth/cookie-consent-dialog.tsx` | MODIFIED | Widened `AlertDialogContent` to `max-w-md` / `xs:max-w-lg`. Switched the description to render as a `<div>` with `space-y-2` and `t.rich`, splitting copy into `<p>` blocks with `<bold>` for origin/usage emphasis. Switched manual-step rendering to `t.rich` and registered a `shield` rich tag that renders an inline `Shield` icon. Wrapped the details block in a flex layout with a leading `Lightbulb` icon and split body into `<p>` blocks. |
+| `web/src/messages/en.json` | MODIFIED | Restructured `consent.autoDescription`, `consent.manualDescription`, `consent.learnMoreBody` into multi-paragraph `<p>` blocks with `<bold>` spans on the calling origin and the "used only for sign-in and sessions" clause. Replaced literal "shield icon" wording with `<shield></shield>` in `consent.manualSteps.firefox.0` / `.2`. Removed the cross-domain framing from `learnMoreBody` (was being misread as evasive). |
+| `web/src/messages/vi.json` | MODIFIED | Mirrored the EN structural changes. Rewrote copy idiomatically: `cookie phiên` → `cookie`, `Đã bật xong` → `Đã xong`, `Bật cookie` → `Kích hoạt cookie`, `bật lại` → `kích hoạt lại`, `Bấm Cho phép` → `Xác nhận Cho phép`; dropped `một cookie`; replaced `biểu tượng khiên` with `<shield></shield>`. |
+| `CLAUDE.md` | MODIFIED | Added a "Vietnamese copy rules (i18n)" subsection capturing the natural-phrasing rules and the EN/VI structural-mirroring requirement. |
+| `AGENTS.md` | MODIFIED | Same Vietnamese-copy rules subsection as `CLAUDE.md`, at the workspace level. |
+| `docs/CHANGELOGS.md` | MODIFIED | Added this entry. |
+
+### Verification
+- Validated key parity: `Object.keys(en.consent).sort()` equals `Object.keys(vi.consent).sort()`. `manualSteps.firefox` keys match (`["0","1","2"]`).
+- Validated structural mirror: `<p>` / `<bold>` / `<shield>` counts in EN equal counts in VI for `autoDescription`, `manualDescription`, `learnMoreBody`, `manualSteps.firefox.0`, `manualSteps.firefox.2`.
+- Verified `Shield` is exported from `lucide-react` (the file already imported `ShieldCheck`).
+- Confirmed the only caller (`web/src/app/[locale]/(auth)/login/page.tsx`) still passes the same six props (`status`, `apiOrigin`, `browser`, `onAllow`, `onDecline`, `onAcknowledge`) — no contract change.
+- Per repository instruction, did not run `yarn build` or `yarn lint`.
+
+## 2026-04-26 — Cross-site cookie consent — third audit amendment (rollback hardening + final consistency pass)
+
+### Summary
+- Final audit on the cross-site cookie-consent/login-recovery flow found two remaining correctness gaps in the rollback path: (1) the abort token was deleted before cleanup finished, so a transient Redis/DB failure could leave session/refresh/login-history residue with no retry path; (2) login could still return `200` without an abort token if the post-session Redis write failed, which meant the client had no cleanup handle at all for a cookie-blocked browser.
+- Both are now fixed without changing the happy-path UX. Login only returns success once the rollback token exists, and abort cleanup is now retryable/idempotent: a short-lived Redis lock prevents concurrent consumers, the token itself is kept until every cleanup step succeeds, and the frontend performs a bounded second abort POST so it can benefit from that retryability without surfacing extra UI noise to the user.
+- This entry supersedes the rollback-behavior claims in the previous amendment below. Specifically: `consume()` is no longer described as atomic, and the abort-token TTL is no longer described as bounding leftover auth artifacts by itself.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/core/jwt/LoginAbortService.kt` | MODIFIED | Reworked abort consumption to use a short-lived Redis lock (`auth:abort:lock:{token}`) instead of deleting the token up front. Cleanup now logs failures, keeps the token alive for retry until all three cleanup steps succeed, and only deletes the token after a full successful rollback. Malformed payloads are discarded because they are not recoverable by retry. |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/redis/RedisKeyManager.kt` | MODIFIED | Added `loginAbortLock(token)` key helper. Existing Redis key semantics are unchanged. |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/controller/AuthController.kt` | MODIFIED | Abort-token issuance is no longer best-effort. If the rollback token cannot be minted, the controller immediately runs compensating cleanup for the just-created session/refresh/login-history artifacts and fails the login instead of returning a misleading success response with no recovery path. |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/dto/LoginResponse.kt` | MODIFIED | `abortToken` is now required, matching the strengthened controller contract. |
+| `web/src/types/admin.ts` | MODIFIED | `LoginResponse.abortToken` is now required in the frontend type contract. |
+| `web/src/features/auth/api.ts` | MODIFIED | `abortLogin(token)` now performs a bounded second POST attempt. Because the backend retains the token until rollback fully succeeds, this gives the client one more chance to finish transient partial cleanup without altering the visible login flow. Misleading TTL comment removed. |
+| `web/src/app/[locale]/(auth)/login/page.tsx` | MODIFIED | Cookie-missing recovery now consumes the required `abortToken` directly instead of treating it as optional. |
+| `docs/CHANGELOGS.md` | MODIFIED | Added this final amendment and corrected the rollback-behavior record. |
+
+### Issue → fix mapping
+| # | Audit finding | Root cause | Fix |
+|---|---|---|---|
+| 1 | Abort cleanup could partially fail after consuming the only retry handle | Token was deleted before cleanup, and the endpoint returned `204` regardless | Added a short-lived Redis lock for mutual exclusion, kept the abort token until cleanup fully succeeds, and made cleanup steps idempotent/retryable. |
+| 2 | Login could still return success without an abort token | Abort-token issuance was best-effort after session/refresh/history creation | Abort-token issuance is now mandatory; failure triggers compensating cleanup and the login request fails instead of succeeding. |
+| 3 | Frontend comments/changelog overstated cleanup guarantees | Earlier documentation treated token TTL as artifact cleanup | Updated frontend comments and changelog so the written behavior now matches the implemented behavior. |
+
+### Verification
+- Static flow check:
+  - Successful login still follows the same user-visible path: credentials valid → session + refresh token + login history + abort token minted → `verifySession()` succeeds → auth stored → dashboard navigation.
+  - Cookie-blocked login keeps the same remediation flow: login returns success body + abort token → `verifySession()` gets 401 → `abortLogin()` posts the token twice at most → consent dialog reopens through `reportFailure()`.
+  - Abort cleanup now preserves retryability: if revoke/delete fails once, the token remains available for the second client POST or any later retry inside its TTL window.
+  - If token minting fails after session creation, the controller attempts compensating cleanup immediately and returns a server error instead of a false success.
+- Consistency check:
+  - No frontend copy or dialog-state changes were introduced in this amendment, so the previously fixed EN/VI strings and shadcn/ui usage remain untouched.
+  - The Redis key change is additive only (`auth:abort:lock:{token}`) and does not alter any existing queue/auth key format.
+- Per repository instruction, did not run `yarn build`, `yarn lint`, or `./gradlew build` in this audit pass.
+
+## 2026-04-26 — Cross-site cookie consent — second audit amendment (3 root-cause fixes)
+
+### Summary
+- Second independent audit on the cookie-consent implementation surfaced three new defects: (1) blocked-cookie retries left dangling server-side auth artifacts (session row, refresh token in Redis, login_history success entry) that the client had no way to clean up — repeated retries pollute audit history; (2) `verifySession()` collapsed every non-2xx and network failure into a generic "cookies didn't stick" verdict, sending users down the cookie-fix path even for 5xx server errors and transient network drops; (3) `reopen()` and `reportFailure()` chose the next status purely from feature support, ignoring the Permissions API verdict the initial resolver had already obtained — so a Chromium user whose `top-level-storage-access` was already `denied` could be bounced back to the auto path instead of staying in manual mode.
+- All three are fixed at the root. The biggest piece is a server↔client rollback flow: a one-shot opaque abort token issued in the login response, consumed via `POST /api/auth/abort` to revoke the refresh token, drop the session row, and delete the misleading "successful login" audit entry. The final amendment above further hardens this flow by keeping the token retryable until cleanup fully succeeds.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/core/jwt/LoginAbortService.kt` | ADDED | New service that issues short-lived (~60s) one-shot opaque abort tokens (Redis-backed, key `auth:abort:{token}`) bound to `{accessTokenHash, refreshToken, loginHistoryId}`. The final amendment above hardens `consume()` with a short-lived lock key plus retryable cleanup semantics, so transient failures no longer consume the only retry handle. |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/request/AbortLoginRequest.kt` | ADDED | DTO for the abort endpoint body (`@NotBlank`, `@Size(max=256)` on `abortToken`). |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/dto/LoginResponse.kt` | MODIFIED | Added `abortToken` with a docstring explaining its purpose and lifetime. The final amendment above tightens this to a required field. |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/service/AdminService.kt` | MODIFIED | `recordLoginAttempt` now returns the saved `LoginHistory` so the controller can capture the row id for the abort payload. Existing two failure-path callers ignore the return implicitly (Kotlin allows). GitNexus impact: LOW, single d=1 caller (`AuthController.login`) which is also updated. |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/redis/RedisKeyManager.kt` | MODIFIED | Added `loginAbortToken(token)` → `auth:abort:{token}`. |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/controller/AuthController.kt` | MODIFIED | Injected `LoginAbortService`. After session/refresh/login-history are created on successful login, mints an abort token and includes it in `LoginResponse`; the final amendment above makes that token mandatory and compensates immediately if minting fails. `POST /api/auth/abort` accepts `AbortLoginRequest`, consumes the token, and returns `204` regardless of validity to deny a probing client an oracle on token correctness. The endpoint also clears the access/refresh cookies as defense-in-depth (no-op if cookies didn't stick on the original login, but cleans up if they did and the user is aborting for any other reason). The path matches the existing `/api/auth/**` permitAll + auth-tier rate-limit rules — no security/rate-limit config changes needed. |
+| `web/src/lib/constants.ts` | MODIFIED | Added `API_ROUTES.AUTH.ABORT = "/api/auth/abort"`. |
+| `web/src/types/admin.ts` | MODIFIED | Added `abortToken` to `LoginResponse` with docstring. The final amendment above tightens this to a required field. |
+| `web/src/features/auth/api.ts` | MODIFIED | Replaced `verifySession(): Promise<boolean>` with `verifySession(): Promise<VerifySessionResult>` returning a discriminated union (`ok | cookie-missing | server-error | network | other-http`). Only `cookie-missing` (HTTP 401 specifically) maps to the cookie-remediation flow. Added `abortLogin(token)` helper — plain `fetch`, errors swallowed since the user has already seen the cookie-fix dialog and a second error would just confuse them. |
+| `web/src/hooks/use-cookie-consent.ts` | MODIFIED | Extracted a pure `resolveStatusFor(origin, options)` helper used by initial mount, `reopen()`, and `reportFailure()`. Reactivation paths now re-query the Permissions API instead of guessing from feature support, so a Chromium user with `permissionState === "denied"` correctly stays in manual mode on reopen. `reopen` and `reportFailure` are now async (`Promise<void>`) — call sites updated to `await`. |
+| `web/src/app/[locale]/(auth)/login/page.tsx` | MODIFIED | Login flow now switches on `verify.kind`: `ok` → navigate; `cookie-missing` → call `abortLogin(response.abortToken)` to roll back server artifacts, then `await consent.reportFailure()` and surface `loginCookieMissing`; `server-error` and `other-http` → generic server-error message; `network` → existing `connectionLost` copy. Only `cookie-missing` triggers the consent dialog. |
+
+### Issue → fix mapping
+| # | Audit finding | Root cause | Fix |
+|---|---|---|---|
+| 1 | Blocked-cookie retries leave server-side auth artifacts (session, refresh token, login_history success entry) that the client never cleans up; pollutes audit history | The client has no handle on the just-created server-side records, and the access/refresh cookies that would normally authenticate cleanup never reached the browser | New one-shot opaque abort token, returned in `LoginResponse`, exchanged via public `POST /api/auth/abort` (body-authenticated, no cookies needed). The final amendment above makes cleanup retryable and requires the token before login success is returned. |
+| 2 | `verifySession()` classified every non-2xx / network failure as a cookie problem, misrouting users on transient 5xx / DNS / CORS preflight failures | Boolean return type couldn't carry the failure category | Discriminated union return (`ok | cookie-missing | server-error | network | other-http`). Only HTTP 401 → cookie-missing → consent dialog. Every other failure routes to its own error message and does NOT open the dialog. |
+| 3 | `reopen()` and `reportFailure()` forgot the initial Permissions API verdict; could send a Chromium user with `top-level-storage-access === "denied"` back to the auto (`needed`) path that already failed | Both helpers chose status purely from `isRequestStorageAccessForSupported()` instead of consulting the live permission state | Pure `resolveStatusFor()` helper queries the Permissions API and routes accordingly: `granted → granted`, `denied → manual`, `prompt + supported → needed`, otherwise either `idle` (initial mount, no evidence) or — when the caller has biased toward showing the dialog (banner click / verification failure) — fall back to `needed | manual` based on feature support. Both `reopen` and `reportFailure` use this helper. |
+
+### Verification
+- All paths verified end-to-end:
+  - **Cookie-blocked Chrome user, login attempt:** server creates session+refresh+history → returns 200 + `abortToken` → frontend fetches `/api/admins/me` → 401 → `verify.kind === "cookie-missing"` → `abortLogin(token)` → server `consume()` revokes refresh, drops session, deletes history row → `consent.reportFailure()` re-queries Permissions API (returns `denied` for blocked browser) → routes to `manual` → manual dialog opens with browser-specific instructions.
+  - **Server outage during login verification:** server returns 503 from `/api/admins/me` → `verify.kind === "server-error"` → generic `serverError` toast → no abort, no consent dialog (correctly), the legit session stays intact for retry once the server is healthy.
+  - **Network drop after login:** fetch throws → `verify.kind === "network"` → `connectionLost` toast → no abort on that branch. The final amendment above does not claim automatic artifact cleanup here; it only hardens the explicit abort path used for verified cookie-missing failures.
+  - **Reopen after manual decline (Chromium user with `denied`):** banner reopen → `resolveStatusFor` re-queries → `denied` → status = `manual` (preserved) → dialog opens in manual mode, NOT auto.
+- GitNexus `impact` on `recordLoginAttempt`: LOW risk, single d=1 caller (`AuthController.login`), already updated.
+- Backend wiring confirmed: `LoginAbortService` injected, abort endpoint registered, RedisKeyManager extended, no lingering references to the removed `PermissionsPolicyFilter` from the previous amendment cycle.
+- Frontend wiring confirmed: `abortLogin` imported in login page, `verifySession` discriminated outcomes handled exhaustively (5 kinds, all routed), `reopen`/`reportFailure` awaited, `top-level-storage-access` permission name still correct (2 references in `storage-access.ts`).
+- Both message files (`en.json`, `vi.json`) parse as valid JSON.
+- `/api/auth/abort` matches the existing `/api/auth/**` permitAll rule in `SecurityConfig` (no security config changes needed) and the `auth`-tier rate-limit rule in `RateLimitFilter.resolveTier` (no rate-limit config changes needed).
+
+### Residuals check (none found)
+- The abort endpoint always returns 204 — no oracle on token validity for probing attackers.
+- A short-lived Redis lock key now serializes concurrent abort requests while preserving token retryability on partial failure.
+- Each cleanup step is `runCatching`-wrapped so a transient failure on (say) the login_history delete doesn't leave the session+refresh-token alive.
+- `recordLoginAttempt` signature change is backward-compatible at the call site (Kotlin allows discarded return values); the two failure-path callers continue to work without modification.
+- No new strings were needed for verifySession outcomes — `tErrors("serverError")` and `tAuth("connectionLost")` already exist in EN/VI from the original implementation.
+- No new UI primitives introduced; all components reuse existing shadcn/ui.
+- No FQN imports anywhere; all imports named at top of file.
+- The login page's `try/catch` for the original `login()` failure (401 invalid creds, 403 unverified, 429 rate-limit, etc.) is unchanged — only the post-success verification flow was touched.
+
+## 2026-04-26 — Cross-site cookie consent — audit amendment (5 root-cause fixes)
+
+### Summary
+- Same-day audit on the cross-site cookie consent implementation surfaced five real defects ranging from spec misuse (wrong Permissions API name, misplaced backend opt-in) to flow bugs (login declares success before proving the cookie stuck) and UX regressions (manual acknowledgment treated as decline; instructions push browser-wide privacy weakening). All five are fixed at the root and the implementation is reframed to honestly reflect what the Storage Access API can and cannot do for our deployment topology (different registrable domains, no Related Website Sets registration).
+- The biggest factual correction: `requestStorageAccessFor()` is **gated by Related Website Sets membership**, not by a `Permissions-Policy: storage-access=...` header on the API origin. The MDN-documented default for the `storage-access` directive is `*`, and that directive controls iframe `requestStorageAccess()` flow — irrelevant here. The original backend filter was therefore based on a misreading and has been removed. The frontend continues to attempt the auto path optimistically (and falls through to manual instructions on rejection — which is the realistic path for non-RWS deployments).
+- Re-verified all claims against MDN (Context7 `/mdn/content`) for `document.requestStorageAccessFor`, `top-level-storage-access` permission name, RWS prerequisites, and the iframe `storage-access` directive's default allowlist.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/core/security/PermissionsPolicyFilter.kt` | DELETED | Filter was based on a misreading: `Permissions-Policy: storage-access=...` does not gate `requestStorageAccessFor()`. RWS membership does. The directive's default is `*` and only affects iframe-based `requestStorageAccess()`, which we don't use. Removed entirely; no replacement needed for this flow. |
+| `web/src/lib/storage-access.ts` | MODIFIED | (a) `queryStorageAccessGranted` → `queryTopLevelStorageAccess` returning a 4-state union (`granted | denied | prompt | unknown`); (b) Permissions API name corrected from `storage-access` to `top-level-storage-access` per MDN; (c) prepended an honest module-level comment explaining the RWS gating reality; (d) demoted `StorageAccessPermissionState` to internal type. |
+| `web/src/hooks/use-cookie-consent.ts` | MODIFIED | Added `acknowledged` status (distinct from `declined`), added `acknowledge()` and `reportFailure()` callbacks. Initial resolution now: `granted`/`denied` from Permissions API → corresponding terminal status; `prompt` + auto path supported → `needed`; everything else → `idle` (no preemptive nag without positive evidence). The dialog only opens when status is `needed` or `manual` — both require evidence. |
+| `web/src/features/auth/cookie-consent-dialog.tsx` | MODIFIED | Added `onAcknowledge` prop; "I've enabled it" button now calls `onAcknowledge` (was `onDecline` — incorrect labeling). ESC / backdrop / "Not now" still route to `onDecline`. Trimmed Firefox manual steps from 4 → 3 to match new copy. |
+| `web/src/features/auth/api.ts` | MODIFIED | Added `verifySession()` — a plain `fetch` to `/api/admins/me` with `credentials: "include"` that **bypasses** the regular `api()` helper's 401 → silent-refresh → `clearStoredAuthAndRedirect` side effect. Used only to confirm the post-login Set-Cookie actually reached the browser. |
+| `web/src/app/[locale]/(auth)/login/page.tsx` | MODIFIED | After `login()` returns 200, awaits `verifySession()`. On `false` → calls `consent.reportFailure()` (re-opens the dialog with the right mode) and surfaces a friendly error (`consent.loginCookieMissing`). Only navigates to dashboard after positive verification. Wires `consent.acknowledge` to the dialog. |
+| `web/src/messages/en.json` + `vi.json` | MODIFIED | Added `consent.loginCookieMissing` for the post-login verification failure. Rewrote all `manualSteps.*` arrays for honesty: Safari steps acknowledge that the available toggle is browser-wide and offer "use a different browser" as an alternative; Firefox steps stay site-specific only (removed the global path); Chromium/generic steps emphasize site-only exceptions; `learnMoreBody` now includes the disclaimer that nothing is changed on the server and the user can revert any time. Auto/manual descriptions reframed to reflect reality (auto path may not show a prompt). |
+
+### Issue → fix mapping
+| # | Issue (audit finding) | Root cause | Fix |
+|---|---|---|---|
+| 1 | Permissions API queried with wrong permission name (`storage-access` instead of `top-level-storage-access`), so prior grants could be missed | I conflated the iframe `requestStorageAccess` permission name with the top-level `requestStorageAccessFor` one. MDN documents them separately and explicitly contrasts the two. | `queryTopLevelStorageAccess` now uses `top-level-storage-access`. Verified against `/mdn/content`. |
+| 2 | Backend `Permissions-Policy: storage-access=(self ...)` filter built from frontend CORS origins; emitted on the API app rather than the document that calls the feature; "required opt-in" claim unsubstantiated | I misread the spec. The `storage-access` directive controls iframe `requestStorageAccess`, default allowlist is `*`. `requestStorageAccessFor` is gated by Related Website Sets membership, not by this header. | Filter file deleted entirely. Module-level comment in `storage-access.ts` documents the actual gating mechanism so future readers don't repeat the mistake. |
+| 3 | Login declared success and routed to dashboard before proving the Set-Cookie stuck — flash of "logged in" followed by 401 bounce when cookies were silently dropped | Original flow: `login() → setAuth → router.push("/dashboard")` with no verification. The first authenticated dashboard call would 401, trigger `clearStoredAuthAndRedirect`, kick the user back to login — confusing and ugly. | Added `verifySession()` (uses raw `fetch`, bypasses the redirect-on-401 side effect of `api()`). Login flow now awaits verification before storing auth and navigating. On failure → `consent.reportFailure()` + `loginCookieMissing` error message. |
+| 4 | "I've enabled it" in manual mode called `onDecline`, surfacing the "Cookie access is required" warning banner — wrong label for the action taken | Same callback was reused for both intents to keep the surface small; the resulting status (`declined`) drove the banner. | Added a separate `acknowledge()` action and `acknowledged` status. Banner only renders for `status === "declined"`. Acknowledged users see no banner; if their fix didn't work, the next login attempt's verification step re-opens the dialog. |
+| 5 | Manual instructions told Safari users to disable a browser-wide privacy toggle; Firefox steps included a global "Custom and uncheck Cookies" path; no positive verification that this exact setting was the blocker before instructing changes | Copy was written before the spec audit clarified what's actually achievable per browser, and before the verification step (#3) gated the dialog on evidence. | (a) Dialog now only auto-opens when Permissions API reports `prompt`/`denied` or after a verified login failure — never as a guess. (b) Safari steps now state plainly that the toggle is browser-wide and recommend re-enabling after sign-in, with "use Chrome/Edge/Firefox" as an alternative. (c) Firefox steps are site-specific only; global path removed. (d) Chromium/generic steps emphasize site-only exceptions. (e) `learnMoreBody` explicitly states that nothing is changed on the server and the user can revert any time. |
+
+### Verification
+- Permission name and RWS gating cross-checked against MDN via Context7 (`/mdn/content`):
+  - `document.requestStorageAccessFor` page: "To check whether permission to access third-party cookies has already been granted via `requestStorageAccessFor()`, you can call `Permissions.query`, specifying the feature name `\"top-level-storage-access\"`. This is different from the feature name used for the regular `Document.requestStorageAccess()` method, which is `\"storage-access\"`."
+  - Storage Access API page: "`requestStorageAccessFor()` ... is designed for scenarios where embedded resources ... cannot request their own storage access and **both sites are part of the same related website set**."
+  - RWS Attack Prevention: "`requestStorageAccessFor()` requires CORS headers" — already satisfied by existing `Access-Control-Allow-Credentials: true` in `CorsConfig`.
+- next-intl dotted-key + nested-namespace traversal re-verified via `/amannn/next-intl`.
+- Both `en.json` and `vi.json` parse as valid JSON (sanity-checked with `node -e JSON.parse(...)`).
+- GitNexus `detect_changes` (scope=unstaged): risk LOW, 0 affected execution flows. Broader monorepo churn (AGENTS.md, CLAUDE.md, transmitter/, etc.) is pre-existing and unrelated.
+- Confirmed no lingering references to `PermissionsPolicyFilter` in backend sources after deletion.
+- Per repository instruction, did not run `yarn build` / `yarn lint` / `./gradlew build` — separate audit flow.
+
+### Residuals check (none found)
+- Auto-path framing: copy now says "**attempt** a browser-native one-tap permission prompt" with the explicit caveat "If your browser doesn't show one, you'll see manual steps next" — no more false promises.
+- State machine: `acknowledged` and `declined` are now genuinely distinct; banner only shows for `declined`.
+- Login flow: `loading` stays true through verification; on verification failure `loading` is cleared in the `finally` block, the form is reusable, and the dialog is open.
+- No new UI primitives introduced; all components reuse existing shadcn/ui (`AlertDialog`, `Collapsible`, `Button`).
+- All new strings bilingual EN + VI; Vietnamese phrasing follows the colloquial style established by prior translations.
+- No FQN imports; all named imports at top of file (Kotlin filter file is gone, eliminating the previous FQN regression risk).
+
+> Note: the entry below is the original implementation log from earlier the same day, kept verbatim for traceability. Several of its claims (the backend `PermissionsPolicyFilter`, the Permissions API name `storage-access`, the "auto path → one-tap prompt" framing) are superseded by the amendment above. Read both together; the amendment is authoritative.
+
+## 2026-04-26 — Cross-site cookie consent (Storage Access API) — superseded
+
+### Summary
+- Admin web (`admin.app`) and backend API (`abc.app`) live on different registrable domains. Production cookies are already `SameSite=None; Secure`, so cookies are *eligible* for cross-site sending — but Chrome with "Block third-party cookies" enabled still blocks them, breaking login. Firefox standard mode partitions instead of blocks (Total Cookie Protection), so it was unaffected. This change adds an in-app consent flow that uses the Storage Access API to grant a per-pair exception on Chromium browsers, plus a manual-instructions fallback for Safari / Firefox-strict / unsupported environments.
+- New backend `PermissionsPolicyFilter` (CoWebFilter, `HIGHEST_PRECEDENCE + 5`) emits `Permissions-Policy: storage-access=(self "<admin-origin>" ...)` on every response via `beforeCommit`. The header is the required cross-origin opt-in for Chrome to surface and honor `document.requestStorageAccessFor` — without it Chrome auto-rejects the prompt and cookies stay blocked even after the user "allows" them in our dialog. Allowed-origins list is sourced from the existing `app.cors.allowed-origins` so dev/prod parity stays in lockstep with CORS.
+- New `web/src/lib/storage-access.ts` utility: origin parsing from `API_BASE_URL`, same-origin shortcut, feature detection for `requestStorageAccessFor`, request wrapper (try/catch around the user-gesture-required call), top-level grant query via `navigator.permissions.query({ name: "top-level-storage-access", requestedOrigin })`, browser-kind classifier (`chromium | firefox | safari | other | unknown`) reusing the existing `parseUserAgent` helper, and a `sessionStorage`-backed dismiss flag (`notiguide.cookieConsent.declined`) so we don't loop the dialog within the same tab session.
+- New `useCookieConsent` hook returns a state machine: `idle → (same-origin | granted | needed | manual | declined)`. On mount, queries Permissions API; if `granted` skips the dialog, if `denied|null` checks `requestStorageAccessFor` support and routes to either `needed` (auto path) or `manual` (instructions path). On `request()` failure we fall through to `manual` instead of looping the same dialog — handles the case where the user denies Chrome's native prompt or the browser pre-blocks it for the session.
+- New `CookieConsentDialog` component (`web/src/features/auth/cookie-consent-dialog.tsx`) — a glass-styled `AlertDialog` with two modes:
+  - **Auto mode** (Chromium): "Allow" button → user-gesture call to `document.requestStorageAccessFor(<api-origin>)` → browser-native one-tap prompt → granted access is per-origin pair.
+  - **Manual mode** (Safari, Firefox strict, no `requestStorageAccessFor`): browser-aware step-by-step instructions (Safari → Privacy → uncheck Prevent cross-site tracking; Firefox → shield icon → turn off ETP; Chromium fallback → eye/cookie icon → allow third-party; generic for unknown). After steps, an "I've enabled it" acknowledgment closes the dialog so the user can retry login.
+  - **Learn-more disclosure** (`Collapsible`, both modes): explains *why* third-party cookies are needed for functional auth — admin dashboard and API on separate domains, granting access only allows this dashboard to read its own login session.
+- Wired into the login page (`web/src/app/[locale]/(auth)/login/page.tsx`): dialog auto-opens when status is `needed` or `manual`. After dismissal, an inline warning banner appears above the username field with an "Enable cookies" button to reopen. The hook's controlled `open` + `onOpenChange` mapping routes ESC and any base-ui-driven close attempts to `decline`.
+- Bilingual EN + VI translations under a new `consent.*` namespace covering: auto/manual titles + descriptions, Allow / Not now / I've enabled it / Enable cookies button copy, declined banner, learn-more body, and per-browser manual steps. Vietnamese phrasing follows the established colloquial style ("Để sau", "Đã bật xong", "Tại sao cần?").
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/core/security/PermissionsPolicyFilter.kt` | ADDED | New `CoWebFilter` (Order = `HIGHEST_PRECEDENCE + 5`) that registers a `beforeCommit` hook to set `Permissions-Policy: storage-access=(self "<origin>" ...)` on every response. Builds the allowlist from `AppProperties.cors.allowedOrigins`. Header is set only if not already present, so callers downstream can still override. |
+| `web/src/lib/storage-access.ts` | ADDED | Browser-platform helpers: `getApiOrigin`, `isSameOriginApi`, `isRequestStorageAccessForSupported`, `requestStorageAccessForOrigin`, `queryStorageAccessGranted`, `detectBrowserKind`, plus session-scoped `rememberDeclined` / `wasDeclinedThisSession` / `clearDeclinedThisSession`. All browser-API calls are wrapped in try/catch — silent degrade on Permissions API gaps or sessionStorage unavailability. |
+| `web/src/hooks/use-cookie-consent.ts` | ADDED | `useCookieConsent` hook driving the consent state machine. Exposes `{ status, apiOrigin, browser, request, decline, reopen }`. Cancellation flag on the async effect to avoid setState-after-unmount. |
+| `web/src/features/auth/cookie-consent-dialog.tsx` | ADDED | Glass-styled `AlertDialog` consent component. Branches on `status === "manual"` for instructions UI; otherwise renders the auto-grant CTA. Reuses existing `AlertDialog`, `Collapsible` shadcn primitives — no new UI components introduced. Bilingual via `useTranslations("consent")`. |
+| `web/src/app/[locale]/(auth)/login/page.tsx` | MODIFIED | Mounts `CookieConsentDialog` at the page root and adds an inline declined-state banner above the form with a reopen affordance. |
+| `web/src/messages/en.json` | MODIFIED | Added `consent.*` namespace: titles, descriptions, button labels, declined banner, learn-more disclosure, per-browser manual steps (safari / firefox / chromium / generic). |
+| `web/src/messages/vi.json` | MODIFIED | Added Vietnamese counterparts in the colloquial customer-friendly style established by prior translations. |
+| `docs/CHANGELOGS.md` | MODIFIED | This entry. |
+
+### Browser coverage
+| Browser | Outcome |
+|---|---|
+| Chrome / Edge / Brave with TPC blocked | Auto path — user clicks Allow → browser-native prompt → per-pair grant → cookies flow. |
+| Chrome / Edge with TPC allowed (default) | Permissions API reports `granted` → dialog skipped. |
+| Firefox standard | Already worked via Total Cookie Protection partitioning. Hook resolves to `granted` or no-op; dialog skipped. |
+| Firefox strict | Manual mode — instructions to disable Enhanced Tracking Protection for the site. |
+| Safari | Manual mode — instructions to uncheck Prevent cross-site tracking. |
+| Other / unknown UA | Manual mode — generic instructions referencing the API origin. |
+
+### Verification
+- Cross-checked `document.requestStorageAccessFor` semantics, the user-gesture requirement, the `Permissions-Policy: storage-access=(self ...)` opt-in requirement, and `navigator.permissions.query({ name: "storage-access", requestedOrigin })` against MDN docs via Context7 (`/mdn/content`).
+- Cross-checked `useTranslations` dotted-key + nested-namespace traversal against `next-intl` docs via Context7 (`/amannn/next-intl`).
+- GitNexus `impact` on `LoginPage` (`web/src/app/[locale]/(auth)/login/page.tsx:LoginPage`): LOW risk, 0 upstream callers, 0 affected processes — page is a route entry.
+- GitNexus `detect_changes` (scope=all): 0 affected execution flows for the new files; broader monorepo churn (AGENTS.md, CLAUDE.md, transmitter/, etc.) is pre-existing and unrelated to this change.
+- Confirmed prod cookie config (`backend/src/main/resources/application-prod.yaml`) is already `SameSite=None; Secure: true` — Storage Access API path will work in conjunction.
+
+### Self-audit findings (all addressed before this entry)
+1. **Backend FQN violation** (CRITICAL — CLAUDE.md rule). `PermissionsPolicyFilter` originally used `reactor.core.publisher.Mono.empty()` inline. Fixed: added `import reactor.core.publisher.Mono` at top, call site uses `Mono.empty()`.
+2. **Hook UX loop** (MEDIUM). On `request()` failure the hook routed back to `needed`, which would re-show the same dialog after a Chrome native-prompt denial. Fixed: failure path now sets `manual` so the user gets actionable instructions instead of a useless retry.
+3. **Unused exports** (MINOR — "delete unused"). `isStorageAccessSupported` was exported but never consumed; removed. `clearDeclined` was unused; renamed to `clearDeclinedThisSession` and wired into the hook's `reopen` so re-mounting after a reopen doesn't immediately fall back to `declined` from the persisted flag.
+4. **Unused import** (MINOR). `cookie-consent-dialog.tsx` imported `Button` but never used it directly (`AlertDialogAction`/`AlertDialogCancel` wrap `Button` internally). Removed.
+5. **Controlled-AlertDialog without `onOpenChange`** (LOW — project pattern consistency). Added `handleOpenChange` so ESC and base-ui-driven close events route to `decline`, matching the pattern used in `delete-admin-dialog.tsx` and other existing AlertDialog consumers.
+
+### Security notes
+- The Permissions-Policy header is set on every API response (including 401/403/429 short-circuits) via `beforeCommit`. Even if the security filter chain rejects a request before our filter's `chain.filter()` returns, the hook still fires at commit time and the header is applied.
+- The `Permissions-Policy: storage-access=(...)` directive grants *only* the listed origins (admin web) the ability to call `requestStorageAccessFor` against the API. It does not weaken any other security property — CORS still gates which origins can read responses, and `SameSite=None; Secure` cookies still require HTTPS.
+- The consent dialog never sends user data anywhere — `requestStorageAccessFor` is a browser-native call that produces a browser-native prompt. Granting access affects only the cookie store for the `(admin.app, abc.app)` pair on that user's browser profile.
+- "Learn more" copy explicitly states "no tracking, no analytics" — aligns with functional-only framing required by the implementation brief.
+
+
 
 ### Summary
 - Added a new walkthrough doc covering the full self-hosted deployment loop for the admin web: standalone build, asset copy steps, what to upload, the on-VPS directory layout, and `pm2 reload` for zero-downtime redeploys.

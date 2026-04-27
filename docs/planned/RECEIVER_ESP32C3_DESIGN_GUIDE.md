@@ -12,20 +12,19 @@ and ESP-IDF bindings are defined here.
 
 Cross-refs:
 
-- Historical reference: `RECEIVER_DESIGN_GUIDE.md`
-- SDK reference: `ESP_IDF_SDK_REFERENCE.md`
+- Historical reference: `docs/planned/RECEIVER_DESIGN_GUIDE.md`
+- SDK reference: `receiver-esp32/ESP_IDF_SDK_REFERENCE.md`
 - SDK root: `/opt/esp/idf/` (v6.0.0)
-- ESP-MQTT headers for this repo: `managed_components/espressif__mqtt/include/mqtt_client.h`
+- ESP-MQTT headers for this repo: `receiver-esp32/managed_components/espressif__mqtt/include/mqtt_client.h`
 - Datasheets in this repo (both referenced by §G.7):
-  - `nRF24L01_Product_Specification_v2_0-9199.txt` — nRF24L01 PS v2.0 (legacy)
-  - `nRF24L01P_PS_v1.0.txt` — nRF24L01+ PS v1.0
+  - `docs/walkthrough/nRF24L01_Product_Specification_v2_0-9199.txt` — nRF24L01 PS v2.0 (legacy)
+  - `docs/walkthrough/nRF24L01P_PS_v1.0.txt` — nRF24L01+ PS v1.0
 
 This document describes the **target end state** of the ESP32-C3 port.
-The current repo snapshot is still transitional: `jgromes/radiolib`
-remains in `main/idf_component.yml`, while `managed_components/` already
-provides `espressif__mqtt` and `espressif__cjson`. Sections C–I describe
-the intended post-port layout after §I.1 removes the temporary RadioLib
-dependency.
+The live `receiver-esp32` checkout already uses managed
+`espressif/mqtt` + `espressif/cjson` components and no longer carries a
+`jgromes/radiolib` dependency. Sections C–I describe the intended
+module layout and backend contract around that native ESP-IDF base.
 
 ---
 
@@ -146,27 +145,37 @@ The device reports its active variant in the registration envelope
 ### B.2 Trigger-code shape
 
 The trigger payload keeps a single logical code field per device, but
-the 2.4 GHz path widens its legal size. `nRF24L01 / nRF24L01+` packets
-are **byte strings up to 32 B** (256 bits), so the wire shape becomes:
+the two bands assign the bytes very different meanings:
 
-- `rf_code_hex`: hex string, length in {2, 4, …, 64} (1–32 bytes).
-- `rf_code_bits`: `1..32` for `RECEIVER_433M`, `{8,16,…,256}` (byte-aligned)
-for `RECEIVER_2_4G`.
+- `rf_code_hex`: hex string. Length depends on `kind` (see below).
+- `rf_code_bits`:
+  - `RECEIVER_433M`: `1..32` (RC-Switch payload, see §B.3).
+  - `RECEIVER_2_4G`: **exactly 40** — the 5-byte nRF24 `RX_ADDR_P1`
+    written verbatim. Width is fixed because the silicon address
+    register is fixed; admin UIs must not surface a "pick the width"
+    control for 2.4G receivers.
 
-Backend validation must reject mismatched combinations before publish
-(for example `bits=64` with `RECEIVER_433M`, or non-byte-aligned `bits`
-with `RECEIVER_2_4G`). The canonical string for signing
-(`rf-code-v1|…`, §E.3) is identical across both radio families: same
-field names, same order, same encodings.
+Backend validation rejects any mismatched combination before publish or
+DB write (Receiver Plan §2.4): for example `bits = 64` with
+`RECEIVER_433M`, or `bits ≠ 40` with `RECEIVER_2_4G`. The canonical
+string for signing (`rf-code-v1|…`, §E.3) is identical across both
+radio families — same field names, same order, same encodings; only
+the byte semantics change with `kind`.
 
 ### B.3 Matching semantics
 
 - `RECEIVER_433M`: decode a 1–32 bit value from timing; mask to `bits`;
-  compare bitwise.
-- `RECEIVER_2_4G`: on each received packet, `memcmp` the first
-  `bits/8` bytes against the stored code. Packet length ≥ `bits/8` is
-  required; extra bytes are ignored so fixed-length senders remain
-  interoperable.
+  compare bitwise against the stored code, then toggle the vibrator.
+- `RECEIVER_2_4G`: the rf_code IS the receiver's silicon-level
+  identity. The chip's pipe-1 address matcher (`RX_ADDR_P1`) accepts
+  only frames addressed to this exact 5-byte value, so by the time the
+  payload reaches `rf_trigger_on_packet` it has *already* been
+  hardware-filtered as "for me". The matcher then verifies the payload
+  carries `TOGGLE_MAGIC = {0xAA, 0x55}` (§G.8) and toggles the
+  vibrator. The magic is a defense-in-depth guard against
+  improbable CRC-pass-by-noise on a frame that randomly matches the
+  address bits; it is firmware-defined, never appears on backend or
+  admin surfaces, and never changes per device.
 
 A match toggles continuous vibrator pulsing. The next qualifying match
 toggles it back off.
@@ -200,14 +209,14 @@ main/
 └── network/certs/mqtt_ca.pem  broker CA (embedded via EMBED_TXTFILES)
 ```
 
-This is the intended post-port layout. The current repo snapshot is
-smaller (`main.c`, `rf/`, `vibrator/`) and still carries temporary
-component scaffolding until the rest of this plan lands.
+This is the target module layout. The current repo snapshot is still
+smaller (`main.c`, `rf/`, `vibrator/`), but it already sits on the
+native ESP-IDF component set rather than a temporary radio shim.
 
 The target end state keeps `main/` C-only. The native
 `nRF24L01 / nRF24L01+` path talks to the chip through the ESP-IDF SPI
-master API directly (§G.7); the
-temporary RadioLib dependency in the current tree is removed in §I.1.
+master API directly (§G.7); §I.1 records the current lean component
+manifest.
 
 Coupling rule: `rf/` and `nrf24/` and `vibrator/` do not
 depend on each other. `rf/` or `nrf24/` call into `trigger/rf_trigger`
@@ -292,8 +301,8 @@ on reprovision.
 | `public_id`     | `str`          | activation         | backend-minted operational identity                                                                         |
 | `device_name`   | `str`          | activation         | backend-assigned human label                                                                                |
 | `rx_type`       | `u8`           | activation         | `0=RECEIVER_433M`, `1=RECEIVER_2_4G`; copied from the compiled Kconfig variant                              |
-| `rf_code`       | `blob` (≤32 B) | `cmd/rf_code` MQTT | active trigger code; for 433 MHz this stores the little-endian 32-bit value in the first 4 bytes           |
-| `rf_code_bits`  | `u8`           | `cmd/rf_code` MQTT | `1..32` for 433 MHz; `{8,16,…,256}` for 2.4 GHz                                                            |
+| `rf_code`       | `blob` (≤32 B) | `cmd/rf_code` MQTT | active trigger code. **433 MHz**: little-endian 32-bit value in the first 4 bytes. **2.4 GHz**: 5-byte nRF24 `RX_ADDR_P1`, byte 0 = LSByte on wire. |
+| `rf_code_bits`  | `u8`           | `cmd/rf_code` MQTT | `1..32` for 433 MHz; **always `40`** for 2.4 GHz                                                            |
 | `rf_code_ver`   | `u32`          | `cmd/rf_code` MQTT | monotonic per `public_id`                                                                                   |
 | `op_state`      | `u8`           | activation + MQTT  | `PENDING_RF_CODE`, `ACTIVE`, `SUSPENDED`, `DECOMMISSIONED`                                                  |
 | `last_deact_id` | `str`          | `cmd/deact` MQTT   | most recent applied deactivation `command_id` for replay suppression                                        |
@@ -305,8 +314,10 @@ Rules:
   disagree, firmware enters `RECOVERY_REQUIRED` and raises SoftAP.
 - `rf_code` is a blob, not a `u32`. For `RECEIVER_433M`, the first
   four bytes hold the little-endian value and only the low
-  `rf_code_bits` are significant. For `RECEIVER_2_4G`, the first
-  `rf_code_bits/8` bytes hold the packet prefix.
+  `rf_code_bits` are significant. For `RECEIVER_2_4G`, all five
+  bytes hold the nRF24 pipe-1 address; the firmware writes them
+  verbatim to `RX_ADDR_P1` (LSByte first on the wire — see §G.7.7)
+  on first install and on every rotation.
 - `rf_code`, `rf_code_bits`, and `rf_code_ver` are committed under one
   `nvs_commit()` transaction to avoid torn updates.
 - The first activation commit writes `public_id`, `device_name`,
@@ -502,8 +513,10 @@ the operational session comes up immediately with
 
 - `RECEIVER_433M`: `rf_code_bits ∈ [1, 32]` and
   `hex_len == 2 * ceil(bits / 8)`.
-- `RECEIVER_2_4G`: `rf_code_bits ∈ [8, 256]`,
-  `rf_code_bits % 8 == 0`, and `hex_len == bits / 4`.
+- `RECEIVER_2_4G`: `rf_code_bits == 40` and `hex_len == 10`. The 5
+  bytes are the receiver's `RX_ADDR_P1`; firmware writes them
+  verbatim to the chip register on first install (§F.2 first-install
+  path) and on every rotation (§F.2 rotation path).
 - `code_version` is monotonic within one `public_id`.
 - The backend signs the canonical string below; the device rebuilds it
   byte-for-byte before accepting the command.
@@ -637,7 +650,7 @@ Common settings:
 9. subscribe receiver/device/{public_id}/cmd/#
 10. dispatch on op_state:
       PENDING_RF_CODE -> wait for first cmd/rf_code
-      ACTIVE          -> rf_sup_start()
+      ACTIVE          -> rf_sup_start(&g_cfg)   # supplies rf_code → RX_ADDR_P1 on 2.4G
       SUSPENDED       -> leave RF idle until signed resume
       DECOMMISSIONED  -> stay on Wi-Fi/MQTT; RF remains deleted
 11. idle loop
@@ -652,18 +665,43 @@ Common settings:
 - Rebuild `rf-code-v1|...` and verify `signature_b64` with the pinned
   backend public key.
 - Reject with `status = rejected` on shape error, signature failure,
-  stale `code_version`, or radio-specific width mismatch.
+  stale `code_version`, or radio-specific width mismatch
+  (`RECEIVER_2_4G` requires `bits == 40`; anything else is rejected
+  before NVS or radio side effects).
 - If `code_version` equals the stored version, ack `unchanged`.
-- Otherwise:
-  - if `op_state == PENDING_RF_CODE`, first call `rf_sup_start()`;
-    on failure, ack `rejected` and leave both NVS and in-RAM trigger
-    state untouched
-  - commit `rf_code`, `rf_code_bits`, `rf_code_ver` in one NVS
-    transaction
-  - if this is the first code, persist `op_state = ACTIVE` in the same
-    commit
-  - update in-RAM trigger state under the trigger mutex
-  - only then publish ack `applied`
+- Otherwise apply the new code. The order matters because on
+  `RECEIVER_2_4G` the rf_code is the chip's `RX_ADDR_P1`, so
+  `rf_sup_start` (first install) and `rf_sup_apply_rx_address`
+  (rotation) both need the new bytes available before they touch
+  silicon:
+  - **First install** (`op_state == PENDING_RF_CODE`):
+    1. Stage the new `rf_code`, `rf_code_bits`, `rf_code_ver` into the
+       in-RAM `g_cfg` only (no NVS write yet).
+    2. Call `rf_sup_start(&g_cfg)` — on 2.4G the supervisor reads
+       `g_cfg.rf_code` and writes it to `RX_ADDR_P1` during bringup
+       (§G.2 / §G.7.4). On failure, **roll back** the in-RAM stage and
+       ack `rejected`; nothing landed in NVS so the next reboot stays
+       `PENDING_RF_CODE`.
+    3. Commit `rf_code`, `rf_code_bits`, `rf_code_ver`, and
+       `op_state = ACTIVE` to NVS in one transaction.
+    4. Call `rf_trigger_set(code, code_len, bits, version)`. The
+       matcher takes its own internal mutex; on 2.4G this updates only
+       the in-RAM metadata because the address is already on the chip
+       from step 2.
+    5. Publish ack `applied`.
+  - **Later update** (once a code already exists):
+    1. Commit `rf_code`, `rf_code_bits`, `rf_code_ver` to NVS in one
+       transaction.
+    2. Call `rf_sup_apply_rx_address(code, 5)`. On 2.4G this delegates
+       to `nrf24_recv_set_rx_address`: if the receiver is active and
+       not already suspended, the driver suspends it, rewrites
+       `RX_ADDR_P1`, then resumes; if it is already suspended, it
+       rewrites in place; if it has not been started yet, it just
+       stashes the address for the next bringup. On `RECEIVER_433M`
+       builds the call is a no-op stub.
+    3. Call `rf_trigger_set(code, code_len, bits, version)` to refresh
+       the in-RAM matcher metadata.
+    4. Publish ack `applied`.
 
 **`cmd/deact` received**
 
@@ -678,8 +716,9 @@ Common settings:
   - `suspend` -> `rf_sup_suspend()`, persist `SUSPENDED` and
     `last_deact_id`, then ack `ok`
   - `resume` -> if a code is stored, `rf_sup_resume()` or
-    `rf_sup_start()` as appropriate, persist `ACTIVE`; if no code is
-    stored, persist `PENDING_RF_CODE`; write `last_deact_id`, then ack
+    `rf_sup_start(&g_cfg)` as appropriate, persist `ACTIVE`; if no
+    code is stored, persist `PENDING_RF_CODE`; write `last_deact_id`,
+    then ack
   - `decommission` -> `rf_sup_delete()`, persist `DECOMMISSIONED` and
     `last_deact_id`, then ack `ok`
 
@@ -762,9 +801,9 @@ HTTP 200, set the `PROV_DONE` event, and restart after a short delay.
 
 Snippets elide error handling. ESP-IDF core headers were cross-checked
 against `/opt/esp/idf/components`; ESP-MQTT details were verified
-against `managed_components/espressif__mqtt/include/mqtt_client.h`.
-The target end state is C-only in `main/`; the temporary
-`jgromes/radiolib` dependency is removed per §I.1.
+against `receiver-esp32/managed_components/espressif__mqtt/include/mqtt_client.h`.
+The current receiver tree is C-only in `main/` and carries no RadioLib
+dependency; §I.1 just records the active component manifest.
 
 ### G.1 NVS — ESP-IDF pattern
 
@@ -788,40 +827,75 @@ or `_NEW_VERSION_FOUND` → `nvs_flash_erase()` + retry.
 
 ```c
 #include "trigger/rf_supervisor.h"
+#include "config/device_config.h"
 #include "sdkconfig.h"
 
 #if CONFIG_RECEIVER_RADIO_433M
 #  include "rf/rf_common.h"
    static RFHandler g_rf;
-   esp_err_t rf_sup_start  (void){ return rf_recv_start_task(CONFIG_RECEIVER_RF433_RX_GPIO, &g_rf); }
-   esp_err_t rf_sup_suspend(void){ return rf_recv_suspend(&g_rf); }
-   esp_err_t rf_sup_resume (void){ return rf_recv_resume (&g_rf); }
-   esp_err_t rf_sup_delete (void){ return rf_recv_deinit (&g_rf); }
 #elif CONFIG_RECEIVER_RADIO_2_4G
 #  include "nrf24/nrf24_receiver.h"
    static nrf24_handle_t g_nrf;
-   esp_err_t rf_sup_start  (void){ return nrf24_recv_start_task(&g_nrf); }
+#endif
+   static bool s_started;
+   static bool s_suspended;
+
+   esp_err_t rf_sup_start(const device_config_t *c){
+       if (s_started && !s_suspended) return ESP_OK;
+       if (s_started && s_suspended)  return rf_sup_resume();
+
+#if CONFIG_RECEIVER_RADIO_433M
+       (void)c;
+       esp_err_t err = rf_recv_start_task((gpio_num_t)CONFIG_RECEIVER_RF433_RX_GPIO, &g_rf);
+#else
+       // The 2.4G path only starts once a complete 40-bit rf_code is
+       // present in RAM; that rf_code becomes RX_ADDR_P1 during bringup.
+       if (!c || !device_config_has_rf_code(c) || c->rf_code_len != 5U ||
+           c->rf_code_bits != 40U) return ESP_ERR_INVALID_STATE;
+       esp_err_t err = nrf24_recv_start_task(&g_nrf, c->rf_code);
+#endif
+       if (err == ESP_OK) { s_started = true; s_suspended = false; }
+       return err;
+   }
+
+#if CONFIG_RECEIVER_RADIO_433M
+   esp_err_t rf_sup_suspend(void){ return rf_recv_suspend(&g_rf); }
+   esp_err_t rf_sup_resume (void){ return rf_recv_resume (&g_rf); }
+   esp_err_t rf_sup_delete (void){ return rf_recv_deinit (&g_rf); }
+   // No-op on 433M: nRF24 address rotation only matters for 2.4G.
+   esp_err_t rf_sup_apply_rx_address(const uint8_t *addr, size_t n){
+       (void)addr; (void)n; return ESP_OK;
+   }
+#else
    esp_err_t rf_sup_suspend(void){ return nrf24_recv_suspend(&g_nrf); }
    esp_err_t rf_sup_resume (void){ return nrf24_recv_resume (&g_nrf); }
    esp_err_t rf_sup_delete (void){ return nrf24_recv_deinit (&g_nrf); }
+   esp_err_t rf_sup_apply_rx_address(const uint8_t *addr, size_t n){
+       if (!addr || n != 5U) return ESP_ERR_INVALID_ARG;
+       if (!s_started) return ESP_OK;
+       return nrf24_recv_set_rx_address(&g_nrf, addr);
+   }
 #endif
 ```
 
 The MQTT handler calls the `rf_sup_*` API; it never knows which radio
 is active. On `ESP_OK`/`esp_err_t` failure, the deactivation handler
-acks `rejected` and does **not** persist the new `op_state`.
+acks `rejected` and does **not** persist the new `op_state`. The
+2.4G-only `rf_sup_apply_rx_address` is a no-op stub on 433M builds so
+the rf_code rotation path in §F.2 stays band-agnostic; on 2.4G it also
+returns `ESP_OK` when the receiver has not been started yet, so the
+next `rf_sup_start` pushes the stored address during bringup.
 
 ### G.3 Wi-Fi — STA + SoftAP + WPA3-Compatible
 
 ESP-IDF v6 requires `esp_netif` and separate event bases. The STA path
-below uses v6's native **WPA3-Compatible Mode**: if the AP advertises
-WPA3 (including WPA3-Personal RSN-override / transition-mode APs) the
-station negotiates SAE, otherwise it falls back to WPA2 automatically.
-In v6, leave `pmf_cfg.capable` alone and use the native compatibility
-flags instead; `pmf_cfg.capable` itself is **deprecated** per
-`esp_wifi_types_generic.h`:
-*"Device will always connect in PMF mode if other device also
-advertises PMF capability"*.
+below uses the v6 WPA3-compatible flags explicitly: the current
+`receiver-esp32` checkout keeps
+`disable_wpa3_compatible_mode = 0`, so a WPA3-capable AP can negotiate
+SAE while WPA2-only networks still work. PMF is still configured
+through `pmf_cfg`; the live source only sets `.required = false`, so
+this guide does not treat `pmf_cfg.capable` as deprecated or rely on it
+for the WPA3-compat behavior.
 
 ```c
 #include "esp_wifi.h"
@@ -921,9 +995,10 @@ steady-state operational states after activation.
   this override **supersedes** `authmode` / `pairwise_cipher`. A
   WPA3-aware installer phone thus negotiates SAE; older phones
   still associate with the same PSK over WPA2.
-- `pmf_cfg.capable` is **deprecated in v6** — omitted. If a deployment
-is WPA3-only and must refuse WPA2 associations, set
-`pmf_cfg.required = true` on the STA side instead.
+- `pmf_cfg` is still the PMF control surface in ESP-IDF v6.0. The live
+receiver code only sets `.required = false`, which means PMF is not
+made mandatory here. If a deployment wants to require PMF, set
+`pmf_cfg.required = true` and validate against the target IDF build.
 - The config variables use nested designated initializers; only the
 SSID/password arrays still need `strlcpy()` after initialization.
 - `failure_retry_cnt` only takes effect with `WIFI_ALL_CHANNEL_SCAN`;
@@ -939,7 +1014,7 @@ pre-association is silently ignored.
 ### G.4 MQTT — new v6 config layout
 
 The `esp_mqtt_client_config_t` fields are **nested** in ESP-MQTT 1.0.0
-(`managed_components/espressif__mqtt/include/mqtt_client.h`). The CA PEM
+(`receiver-esp32/managed_components/espressif__mqtt/include/mqtt_client.h`). The CA PEM
 is embedded via `EMBED_TXTFILES` (auto-NUL-terminated → valid C string).
 
 ```c
@@ -972,7 +1047,7 @@ void mqtt_start(const device_config_t *cfg) {
         },
         .credentials = {
             .username = cfg->mqtt_user,
-            .client_id = cfg->public_id,                    // NULL pre-activation => default ID
+            .client_id = cfg->has_public_id ? cfg->public_id : NULL,
             .set_null_client_id = false,
             .authentication = {
                 .password = cfg->mqtt_pwd,
@@ -1211,8 +1286,9 @@ command byte for *every* command; we capture it and use it instead
 of issuing a separate NOP.
 - Multi-byte registers (addresses) are sent **LSByte-first** on the
 wire (datasheet §8.3.1). The driver uses `memcpy` — the byte order
-in `CONFIG_RECEIVER_NRF24_RX_ADDR` is the byte order on the wire,
-and must match what the transmitter writes to `TX_ADDR`.
+of the persisted `rf_code` blob is the byte order on the wire, and
+matches what the transmitter writes to `TX_ADDR` for the same
+device (see §B.2 / §G.7.7).
 
 #### G.7.2 Register / command defines
 
@@ -1343,12 +1419,16 @@ typedef struct {
     TaskHandle_t     task;
     void            *spi;      // opaque spi_device_handle_t; concrete in .c
     nrf24_variant_t  chip;     // populated by nrf24_recv_start_task (§G.7.6)
+    uint8_t          rx_addr[5]; // current RX_ADDR_P1, copied from rf_code
+                                  // on start_task and on every set_rx_address
 } nrf24_handle_t;
 
-esp_err_t nrf24_recv_start_task(nrf24_handle_t *h);
-esp_err_t nrf24_recv_suspend  (nrf24_handle_t *h);
-esp_err_t nrf24_recv_resume   (nrf24_handle_t *h);
-esp_err_t nrf24_recv_deinit   (nrf24_handle_t *h);
+// `addr` must be 5 bytes; LSByte first (§G.7.7).
+esp_err_t nrf24_recv_start_task     (nrf24_handle_t *h, const uint8_t addr[5]);
+esp_err_t nrf24_recv_set_rx_address (nrf24_handle_t *h, const uint8_t addr[5]);
+esp_err_t nrf24_recv_suspend        (nrf24_handle_t *h);
+esp_err_t nrf24_recv_resume         (nrf24_handle_t *h);
+esp_err_t nrf24_recv_deinit         (nrf24_handle_t *h);
 ```
 
 #### G.7.4 Implementation
@@ -1541,12 +1621,14 @@ static esp_err_t nrf_bringup(nrf24_handle_t *h) {
     nrf_wreg8(NRF_REG_RX_PW_P1, NRF_PAYLOAD_WIDTH);     // fixed 32-byte payload
 #endif
 
-    const uint8_t addr[5] = {
-        CONFIG_RECEIVER_NRF24_RX_ADDR_B0, CONFIG_RECEIVER_NRF24_RX_ADDR_B1,
-        CONFIG_RECEIVER_NRF24_RX_ADDR_B2, CONFIG_RECEIVER_NRF24_RX_ADDR_B3,
-        CONFIG_RECEIVER_NRF24_RX_ADDR_B4,
-    };
-    nrf_wreg(NRF_REG_RX_ADDR_P1, addr, 5);              // LSByte first on the wire
+    // Pipe 1 address is the receiver's `rf_code` — the silicon-level
+    // identity assigned by the backend at activation and rotated via
+    // `cmd/rf_code`. The 5 bytes are written LSByte first on the wire
+    // (datasheet §8.3.1). On a fresh boot before any cmd/rf_code lands
+    // (op_state == PENDING_RF_CODE) the supervisor doesn't start the
+    // 2.4G receiver at all — see §F.1 — so this code path is only
+    // reached after the config carries a valid 5-byte rf_code.
+    nrf_wreg(NRF_REG_RX_ADDR_P1, h->rx_addr, 5);
 
     nrf_cmd(NRF_CMD_FLUSH_RX);
     nrf_cmd(NRF_CMD_FLUSH_TX);
@@ -1561,8 +1643,10 @@ static esp_err_t nrf_bringup(nrf24_handle_t *h) {
     return ESP_OK;
 }
 
-esp_err_t nrf24_recv_start_task(nrf24_handle_t *h) {
+esp_err_t nrf24_recv_start_task(nrf24_handle_t *h, const uint8_t addr[5]) {
     if (h->rx_active) return ESP_OK;
+    if (!addr) return ESP_ERR_INVALID_ARG;
+    memcpy(h->rx_addr, addr, 5);  // bringup writes RX_ADDR_P1 from h->rx_addr
 
     // SPI bus: SPI_DMA_DISABLED because our transfers are ≤ 33 B (1 cmd +
     // 32 payload); CPU mode is faster at that size and drops the DMA-
@@ -1646,6 +1730,34 @@ esp_err_t nrf24_recv_resume(nrf24_handle_t *h) {
     return ESP_OK;
 }
 
+// Apply a new RX_ADDR_P1 to the chip in silicon. Called by the rf_code
+// rotation path (§F.2). If the receiver is already active, reuse the
+// suspend/resume helpers so CE, IRQ masking, task state, and FIFO
+// cleanup follow the same path as a lifecycle pause. If the receiver is
+// already suspended, rewrite in place; if it has not been started yet,
+// just stash the address for the next bringup.
+esp_err_t nrf24_recv_set_rx_address(nrf24_handle_t *h, const uint8_t addr[5]) {
+    if (!h || !addr) return ESP_ERR_INVALID_ARG;
+    if (!h->rx_active) {
+        // Receiver hasn't been started yet (op_state was PENDING_RF_CODE
+        // up until this call). Just stash the address; bringup will use
+        // it when the supervisor finally starts the task.
+        memcpy(h->rx_addr, addr, 5);
+        return ESP_OK;
+    }
+    bool restore_active = !h->rx_suspended;
+    if (restore_active) {
+        ESP_RETURN_ON_ERROR(nrf24_recv_suspend(h), NRF_TAG, "failed to suspend receiver");
+    }
+
+    nrf_wreg(NRF_REG_RX_ADDR_P1, addr, 5);               // 5 SPI bytes, LSByte first
+    memcpy(h->rx_addr, addr, 5);
+    if (restore_active) {
+        ESP_RETURN_ON_ERROR(nrf24_recv_resume(h), NRF_TAG, "failed to resume receiver");
+    }
+    return ESP_OK;
+}
+
 esp_err_t nrf24_recv_deinit(nrf24_handle_t *h) {
     if (!h->rx_active) return ESP_ERR_INVALID_STATE;
     ESP_ERROR_CHECK(gpio_isr_handler_remove(IRQ_GPIO));
@@ -1687,19 +1799,22 @@ runs the chip-probe sequence (§G.7.6) so FEATURE becomes writable
 on the legacy nRF24L01 exactly the same way it already is on the
 nRF24L01+; DPL is then programmed identically on both. When DPL is
 off, the chip returns to the reset-default static-payload path and
-`RX_PW_P1` is programmed to 32 bytes. The matcher (§G.8) only
-inspects `rf_code_bits/8` bytes in either mode.
+`RX_PW_P1` is programmed to 32 bytes. With the rf_code-as-address
+model the matcher (§G.8) only inspects the first 2 bytes of the
+payload (the `TOGGLE_MAGIC`) in either mode, so the static 32-byte
+case is harmless — the trailing bytes are ignored.
 - **DPL is a two-sided config.** A receiver in DPL mode expects the
 Enhanced ShockBurst packet control field (length) to be present; a
 sender without DPL produces frames that fail CRC on this side. The
 transmitter must be configured to match — if you have mixed-mode
 senders, set `CONFIG_RECEIVER_NRF24_ENABLE_DPL=n`.
 - **Address byte order.** The datasheet specifies multi-byte
-registers ship **LSByte first** on the wire. The five
-`CONFIG_RECEIVER_NRF24_RX_ADDR_Bn` bytes are written in index
-order — so `B0` is the first byte clocked out and matches the
-byte a transmitter puts in its `TX_ADDR[0]` slot. Document this
-convention with the Kconfig prompt (§I.2).
+registers ship **LSByte first** on the wire. The 5-byte rf_code
+loaded from NVS is written verbatim in index order — `rf_code[0]`
+is the first byte clocked out and matches the byte a transmitter
+puts in its `TX_ADDR[0]` slot. The backend mints addresses with
+the same convention (§E.3 / Receiver Plan §2.4); no in-firmware
+swap is needed.
 - **CE handling.** CE is plain GPIO toggled by us — not by
 `.spics_io_num`. Keep CE high for the full RX window; set low to
 enter Standby-I on suspend. Only the low→high edge (Standby-I →
@@ -1794,13 +1909,17 @@ which ones matter at runtime.
 | `RX_ADDR_P2..P5` (0x0C..0x0F) | 1 B each | Pipes 2–5 receive address (LSByte only; upper 4 B shared with P1)                                          | PRX                                  | No.                                                     |
 
 
-For **this firmware** (PRX only): we write 5 bytes to `RX_ADDR_P1`.
-`TX_ADDR` is left at its reset default and never touched — a transmit
-path would be a separate module in a future extension.
+For **this firmware** (PRX only): we write 5 bytes to `RX_ADDR_P1`,
+and those 5 bytes come from `cfg->rf_code` — the backend-minted
+identity that arrives via the activation `result` envelope (first
+install) or `cmd/rf_code` (rotation). `TX_ADDR` is left at its reset
+default and never touched.
 
-For **the transmitter** (out-of-scope for this doc, but the same
-driver shape would apply): set `TX_ADDR` and `RX_ADDR_P0` to the
-same 5 bytes (auto-ACK path), then pulse CE.
+For **the transmitter hub** (Transmitter Guide §G.7): set `TX_ADDR`
+and `RX_ADDR_P0` to the destination receiver's 5-byte rf_code, then
+load the fixed `TOGGLE_MAGIC = {0xAA, 0x55}` payload and pulse CE.
+The hub rewrites these registers per dispatch; nothing about the
+address lives in hub firmware.
 
 **Byte order on the wire (nRF24L01 PS v2.0 §8.3.1 / nRF24L01+ PS v1.0
 §8.3.1):** multi-byte registers are clocked **LSByte first, MSBit
@@ -1808,47 +1927,51 @@ first within each byte**. The 5-byte SPI payload for a
 `W_REGISTER(RX_ADDR_P1, …)` therefore starts with the byte that the
 radio will match *first in time* against the preamble.
 
-**Concrete example.** Agreed-on address (as you'd write it in a logic
-trace from earliest-transmitted to latest): `0xC3 0x5A 0x5A 0x5A 0xE7`.
+**Concrete example.** Suppose the backend mints `rf_code_hex =
+"C35A5A5AE7"` for a `RECEIVER_2_4G` device. The corresponding
+plaintext is `{0xC3, 0x5A, 0x5A, 0x5A, 0xE7}` and that's what lands in
+the device's NVS `rf_code` blob and on the chip's `RX_ADDR_P1`:
 
 
 |                                               | Value  | Where it lives                                                   |
 | --------------------------------------------- | ------ | ---------------------------------------------------------------- |
-| Wire-order byte 0 (LSByte, first out of MOSI) | `0xC3` | `RX_ADDR_P1[0]` on the receiver; `TX_ADDR[0]` on the transmitter |
-| Wire-order byte 1                             | `0x5A` | `RX_ADDR_P1[1]` / `TX_ADDR[1]`                                   |
-| Wire-order byte 2                             | `0x5A` | `RX_ADDR_P1[2]` / `TX_ADDR[2]`                                   |
-| Wire-order byte 3                             | `0x5A` | `RX_ADDR_P1[3]` / `TX_ADDR[3]`                                   |
-| Wire-order byte 4 (MSByte, last out of MOSI)  | `0xE7` | `RX_ADDR_P1[4]` / `TX_ADDR[4]`                                   |
+| Wire-order byte 0 (LSByte, first out of MOSI) | `0xC3` | `rf_code[0]` / `RX_ADDR_P1[0]` on the receiver; `TX_ADDR[0]` on the transmitter |
+| Wire-order byte 1                             | `0x5A` | `rf_code[1]` / `RX_ADDR_P1[1]` / `TX_ADDR[1]`                    |
+| Wire-order byte 2                             | `0x5A` | `rf_code[2]` / `RX_ADDR_P1[2]` / `TX_ADDR[2]`                    |
+| Wire-order byte 3                             | `0x5A` | `rf_code[3]` / `RX_ADDR_P1[3]` / `TX_ADDR[3]`                    |
+| Wire-order byte 4 (MSByte, last out of MOSI)  | `0xE7` | `rf_code[4]` / `RX_ADDR_P1[4]` / `TX_ADDR[4]`                    |
 
 
-Our Kconfig exposes these as five separate hex symbols, in *wire
-order*:
-
-```
-CONFIG_RECEIVER_NRF24_RX_ADDR_B0 = 0xC3   # LSByte on the wire
-CONFIG_RECEIVER_NRF24_RX_ADDR_B1 = 0x5A
-CONFIG_RECEIVER_NRF24_RX_ADDR_B2 = 0x5A
-CONFIG_RECEIVER_NRF24_RX_ADDR_B3 = 0x5A
-CONFIG_RECEIVER_NRF24_RX_ADDR_B4 = 0xE7   # MSByte on the wire
-```
-
-In firmware we simply `memcpy` those five bytes in index order into
-the SPI payload (see `nrf_wreg(NRF_REG_RX_ADDR_P1, addr, 5)` in
+In firmware we simply `memcpy` the 5 bytes in index order into the
+SPI payload (see `nrf_wreg(NRF_REG_RX_ADDR_P1, h->rx_addr, 5)` in
 §G.7.4) — no byte-swapping, no endian conversion. The transmitter
-writes the **same** five bytes in the **same** index order to its
-`TX_ADDR` register, and the on-air preamble match succeeds.
+hub writes the **same** five bytes in the **same** index order to
+its `TX_ADDR` register before each dispatch (Transmitter Guide §G.7),
+and the on-air preamble match succeeds.
 
 Common pitfall: if someone describes the address to you as a single
 hex literal like `0xE75A5A5AC3`, that is the **natural** (big-endian,
-MSByte-first) spelling. Read it right-to-left when converting to our
-wire-order `B0..B4` byte array — `B0 = 0xC3`, `B4 = 0xE7`. The
-Kconfig prompts for `B0` and `B4` explicitly label which end of the
-wire they live on to avoid this flip.
+MSByte-first) spelling. The backend always emits `rf_code_hex` in
+**wire order** — first hex pair is byte 0 (LSByte on wire). The
+admin UI surfaces the same wire-order convention, so what you read
+on screen matches what's clocked out of MOSI.
 
 ### G.8 RF trigger — unified matcher
 
-One module, two match functions. MQTT owns the write side (mutex);
-the radio owns the read side.
+One module, two match functions, asymmetric work per band:
+
+- **433 MHz** (`rf_trigger_on_frame`): the matcher is the *only*
+  receiver-side filter. The pulse decoder hands every decoded value
+  to the matcher, which masks to `bits` and bitwise-compares against
+  the stored code.
+- **2.4 GHz** (`rf_trigger_on_packet`): hardware does the heavy
+  lifting. Pipe-1 silicon already filtered to "for me" before the
+  payload reached the host MCU, so the matcher only confirms the
+  payload carries `TOGGLE_MAGIC = {0xAA, 0x55}` (defense-in-depth
+  against improbable CRC-pass-by-noise) and toggles. The stored
+  `rf_code` is *not* compared against the payload — it is the
+  silicon address, applied to `RX_ADDR_P1` at bringup and rotation
+  (§F.2 / §G.7.4).
 
 ```c
 // trigger/rf_trigger.h
@@ -1856,6 +1979,10 @@ esp_err_t rf_trigger_set(const uint8_t *code, size_t code_len, uint8_t bits, uin
 void rf_trigger_restore_from_cfg(const device_config_t *cfg);
 void rf_trigger_on_frame (uint32_t value, uint8_t value_bits);  // 433 MHz path
 void rf_trigger_on_packet(const uint8_t *pkt, size_t pkt_len);  // nRF24 path
+
+// Two-byte payload the transmitter hub always sends to a 2.4G receiver.
+#define RF_TRIGGER_TOGGLE_MAGIC_HI 0xAA
+#define RF_TRIGGER_TOGGLE_MAGIC_LO 0x55
 ```
 
 ```c
@@ -1886,19 +2013,23 @@ void rf_trigger_on_frame(uint32_t value, uint8_t value_bits) {
 }
 
 void rf_trigger_on_packet(const uint8_t *pkt, size_t pkt_len) {
-    uint8_t buf[32]; size_t need; uint8_t bits;
-    xSemaphoreTake(s_mtx, portMAX_DELAY);
-    memcpy(buf, s_trg.code, s_trg.code_len);
-    need = s_trg.code_len; bits = s_trg.bits;
-    xSemaphoreGive(s_mtx);
-    if (!bits || (bits % 8) != 0 || pkt_len < need) return;
-    if (memcmp(pkt, buf, need) == 0)
-        vibrator_toggle_pulsing(&s_vibrator);
+    // 2.4G: the chip already address-matched on RX_ADDR_P1, so the
+    // packet is destined for us. Verify the fixed 2-byte TOGGLE_MAGIC
+    // before toggling — guards against the (vanishingly rare) case
+    // where noise produces a frame that passes both the address
+    // matcher and CRC. We do NOT compare pkt against s_trg.code:
+    // s_trg.code is the silicon address, not a payload value.
+    if (!pkt || pkt_len < 2) return;
+    if (pkt[0] != RF_TRIGGER_TOGGLE_MAGIC_HI ||
+        pkt[1] != RF_TRIGGER_TOGGLE_MAGIC_LO) return;
+    vibrator_toggle_pulsing(&s_vibrator);
 }
 ```
 
 Never hold the mutex across `vibrator_toggle_pulsing` — the vibrator
-task may contend on its own state.
+task may contend on its own state. The 2.4G matcher doesn't take the
+mutex at all because it reads no shared trigger state; the magic is a
+compile-time constant.
 
 ### G.9 Vibrator — existing module
 
@@ -2099,8 +2230,9 @@ payload-driven.
 
 - `RECEIVER_433M`: `rf_code_bits ∈ [1, 32]`,
   `hex_len == 2 * ceil(bits / 8)`
-- `RECEIVER_2_4G`: `rf_code_bits ∈ [8, 256]`,
-  `rf_code_bits % 8 == 0`, `hex_len == bits / 4`
+- `RECEIVER_2_4G`: `rf_code_bits == 40`, `hex_len == 10` (the rf_code
+  is the receiver's 5-byte nRF24 `RX_ADDR_P1` — see §B.2 and Receiver
+  Plan §2.4)
 
 Do this validation **before** signing or publishing. If the backend
 signs an invalid retained payload, the device will correctly reject it,
@@ -2153,7 +2285,7 @@ or 2.4 GHz unit.
 The RF-code editor should adapt to `receiver_type`:
 
 - `RECEIVER_433M` → up to 8 hex chars, common preset 24 bits
-- `RECEIVER_2_4G` → up to 64 hex chars, default example 40 bits
+- `RECEIVER_2_4G` → exactly 10 hex chars (40 bits)
 
 ### H.9 Broker credentials and ACLs
 
@@ -2182,10 +2314,10 @@ dependencies:
   espressif/cjson: '*'
 ```
 
-The current manifest in-tree still lists `jgromes/radiolib: '*'` — drop
-it when this plan lands. `dependencies.lock` should then retain only the
-managed `espressif__mqtt` / `espressif__cjson` components, and the
-vendored `components/jgromes__radiolib/` tree can be dropped.
+The live manifest already contains only `idf`, `espressif/mqtt`, and
+`espressif/cjson`. Keep `dependencies.lock` aligned with those managed
+components; no `jgromes/radiolib` entry or vendored
+`components/jgromes__radiolib/` tree should return.
 
 ### I.2 Kconfig (Receiver submenu)
 
@@ -2245,13 +2377,12 @@ config RECEIVER_NRF24_ENABLE_DPL
     default y
     depends on RECEIVER_RADIO_2_4G
 
-# Five-byte RX address on pipe 1. Byte 0 goes out first (datasheet
-# §8.3.1 LSByte-first) and must match the transmitter's TX_ADDR[0].
-config RECEIVER_NRF24_RX_ADDR_B0 hex "nRF24 RX addr byte 0 (LSByte on wire)" default 0xE7 depends on RECEIVER_RADIO_2_4G
-config RECEIVER_NRF24_RX_ADDR_B1 hex "nRF24 RX addr byte 1" default 0xE7 depends on RECEIVER_RADIO_2_4G
-config RECEIVER_NRF24_RX_ADDR_B2 hex "nRF24 RX addr byte 2" default 0xE7 depends on RECEIVER_RADIO_2_4G
-config RECEIVER_NRF24_RX_ADDR_B3 hex "nRF24 RX addr byte 3" default 0xE7 depends on RECEIVER_RADIO_2_4G
-config RECEIVER_NRF24_RX_ADDR_B4 hex "nRF24 RX addr byte 4 (MSByte on wire)" default 0xE7 depends on RECEIVER_RADIO_2_4G
+# RX address on pipe 1 is NOT a Kconfig — it is the `rf_code` blob the
+# backend mints at activation and rotates via `cmd/rf_code` (§B.2 /
+# §F.2). Build-time defaults would let two devices flashed from the
+# same source tree share an address; sourcing from runtime config
+# guarantees uniqueness scoped by the backend's §D5.0 forbidden-set
+# and global 2.4G uniqueness check.
 
 config RECEIVER_VIBRATOR_GPIO int "Vibrator GPIO" default 10
 
@@ -2374,8 +2505,9 @@ above or is an **accepted** trade-off noted for visibility.
   IDF Component Manager places `espressif/mqtt` and `espressif/cjson`
     at `managed_components/espressif__mqtt/` and
     `managed_components/espressif__cjson/` (double-underscore).
-    `PRIV_REQUIRES` uses those exact names. The current vendored
-    `jgromes__radiolib` tree is transitional and is removed by §I.1.
+    `PRIV_REQUIRES` uses those exact names. The live manifest and
+    `dependencies.lock` already reflect that lean set; no
+    `jgromes__radiolib` component remains in the current tree.
 20. **nRF24 / Wi-Fi 2.4 GHz coexistence (resolved, §I.2).** The driver
   defaults to channel **100 (2500 MHz)** and Kconfig *enforces* a
     floor of 97 (2497 MHz). That keeps the nRF24 center frequency above
@@ -2386,7 +2518,8 @@ above or is an **accepted** trade-off noted for visibility.
     catches any residual cross-band bit flips: failed packets are
     silently dropped by the chip and never reach `rf_trigger_on_packet`.
 21. **`public_id` as client_id pre-activation (resolved, §G.4).**
-  `cfg->public_id` is `NULL` before activation (NVS key absent).
+  `cfg->has_public_id` is false before activation, so the MQTT config
+    passes `client_id = NULL`.
     With `set_null_client_id = false`,
     `esp_mqtt_client_config_t.credentials.client_id = NULL` makes
     ESP-MQTT use its built-in
@@ -2398,24 +2531,24 @@ above or is an **accepted** trade-off noted for visibility.
   matchers return early when `bits == 0` — that represents "no code
     stored yet" (pre-first-`cmd/rf_code`). This keeps the dormant
     pre-code state explicit on both receiver families.
-23. **nRF24 address sourced from Kconfig (resolved, §I.2).** Five hex
-  bytes, `B0..B4`, written in index order (= LSByte-first on the
-    wire, per datasheet §8.3.1). Kconfig prompts call this out so
-    integrators don't silently diverge from the transmitter's
-    `TX_ADDR[0]` byte.
+23. **nRF24 address sourced from runtime config (resolved, §B.2 /
+  §G.7.7).** The 2.4G address is the backend-minted 5-byte `rf_code`,
+    stored in NVS in wire order (`rf_code[0]` = LSByte on the wire)
+    and pushed into `RX_ADDR_P1` at bringup / rotation. No Kconfig-side
+    `B0..B4` address knobs remain.
 24. **Schema-version bump (accepted, §D).** `schema_ver = 1` is kept
   because no device ever sees a legacy layout on the same flash —
     ESP-01 firmware never runs on a C3 image and vice versa. If, in
     the future, a **single** firmware must read both legacy (`u32`
     `rf_code`) and new (`blob` `rf_code`), bump to `2` and add a
     one-shot migration in `device_config_load`.
-25. **Pure-C end state (resolved in plan).** After §I.1 removes
-  RadioLib, every source file in `main/` is `.c`. `main.c` defines `app_main`
+25. **Pure-C current state (resolved, §I.1).** The live receiver tree
+  is already C-only in `main/`. `main.c` defines `app_main`
     directly — no `extern "C"` wrapper, no `.cpp`, no `.hpp`.
     `espressif/cjson` and `espressif/mqtt` both ship C headers; the
-    project pulls no C++-only dependency. Dependent audit items
-    (earlier drafts' C/C++ contract and component-name rules for
-    RadioLib) are obsolete and have been removed from this list.
+    project pulls no C++-only dependency. Earlier draft notes that
+    assumed a live RadioLib dependency are obsolete and have been
+    removed from this list.
 26. **nRF24 driver provenance (resolved, §G.7).** Wire protocol
   cross-checked against **both** datasheets: nRF24L01 PS v2.0
     §8.3.1 Table 16 / nRF24L01+ PS v1.0 §8.3.1 Table 20 (command
@@ -2518,10 +2651,10 @@ above or is an **accepted** trade-off noted for visibility.
     SoftAP advertises WPA2 but upgrades
     capable clients to SAE. The SoftAP flag **overrides**
     `authmode` and `pairwise_cipher` per the SDK docstring —
-    `authmode = WIFI_AUTH_WPA2_PSK` is left for clarity but is
-    effectively redundant when compat mode is on. `pmf_cfg.capable`
-    is deprecated in v6 and omitted from both configs;
-    `pmf_cfg.required` is retained as the opt-in to force PMF.
+    `authmode = WIFI_AUTH_WPA2_PSK` is left as an explicit floor
+    rather than the entire story. PMF is still configured through
+    `pmf_cfg`; the live source only sets `required = false`, and this
+    guide no longer treats `pmf_cfg.capable` as deprecated.
 38. **Config-struct style: nested designated initializers (resolved,
   §G.3 / §G.4 / §G.7.4).** Every ESP-IDF v6 config struct
     (`wifi_config_t`, `esp_mqtt_client_config_t`, `spi_bus_config_t`,
@@ -2538,10 +2671,11 @@ above or is an **accepted** trade-off noted for visibility.
   carry both TX and RX address registers; role is decided by
     `CONFIG.PRIM_RX`. This firmware writes `RX_ADDR_P1` only;
     `TX_ADDR` stays at reset. Byte order on the wire is LSByte-first
-    per datasheet §8.3.1 and our Kconfig symbols `B0..B4` are already
-    in wire order so no in-firmware swap is needed. §G.7.7 includes
-    a worked example mapping a natural big-endian hex literal
-    (`0xE75A5A5AC3`) to the `B0..B4` wire-order bytes.
+    per datasheet §8.3.1 and the persisted `rf_code[0..4]` bytes are
+    already in wire order, so no in-firmware swap is needed. §G.7.7
+    includes a worked example mapping a natural big-endian hex literal
+    (`0xE75A5A5AC3`) to the corresponding `rf_code[0..4]` wire-order
+    bytes.
 40. **Cross-device backend invariants (resolved, §H.1).** ESP-01 and
   ESP32-C3 receivers keep the same topic topology, envelope types,
     `ack_for` values, deactivation actions, canonical strings, and

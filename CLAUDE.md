@@ -112,11 +112,27 @@ Currently scaffolded with default create-next-app structure; implementation plan
 - The frontend should be written in a way that is easy to understand and maintain.
 - The frontend UI should be modern, coherent to current design (refer strictly to `docs/walkthrough/Web Styles.md`), with breathability.
 - The physical device domain (`receiver`) has been set up using ESP-IDF v6.0. You can always refer the source code of ESP-IDF v6.0 in '/home/thomas/esp/v6.0/esp-idf'.
+- Only use the UI components existing in the project. Do not create new UI components. Only crawl new components from shadcn/ui if necessary.
+
+### Vietnamese copy rules (i18n)
+
+`vi.json` must read like text written by a native Vietnamese speaker, not a translation of `en.json`. Treat the EN copy as the source of meaning, never the source of phrasing.
+
+- **Don't over-qualify nouns.** Use plain `cookie` — not `cookie phiên`, not `một cookie`. Drop the determiner `một` ("a/one") unless cardinality matters; Vietnamese rarely requires it.
+- **Action confirmations stay terse.** Don't add the verb back when context implies it: `Đã xong`, not `Đã bật xong`.
+- **Avoid `bấm` for committing a primary action button.** Prefer `xác nhận` (e.g., `Xác nhận Cho phép`). `bấm` is acceptable for taps on icons/links.
+- **Avoid `hộp xác nhận`** — sounds technical. Describe behavior instead (e.g., `trình duyệt sẽ hỏi quyền truy cập`).
+- **Prefer `kích hoạt` over `bật`** for "enable/turn on" in feature/permission contexts.
+- **Don't frame requests as "you change your browser, we don't change anything."** In a security/permission context users may misread it as evasive. Focus on the user's choice, scope (this site only), and reversibility instead.
+
+**Structural mirroring (both directions):** `en.json` and `vi.json` must mirror each other structurally — same keys, same number of paragraphs (`<p>` blocks), same rich-text tags (`<bold>`, `<shield>`, etc.) in equivalent positions. When you change one side's structure, change the other immediately. Wording is per-language; structure must match.
+
+When unsure about Vietnamese phrasing, propose the copy in plain text in chat and get approval before writing to `vi.json`. Do not iterate edits blindly.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **notiguide** (19245 symbols, 35449 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **notiguide** (14505 symbols, 25760 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

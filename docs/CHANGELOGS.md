@@ -1,5 +1,28 @@
 # Changelogs
 
+## 2026-04-27 — Merged receiver + transmitter into a unified Device Integration Implementation Plan
+
+### Summary
+- Renamed `docs/planned/Receiver Integration Implementation Plan.md` to `docs/planned/Device Integration Implementation Plan.md` and folded the transmitter §H backend slice from `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` (Phases T0–T8 / §H.1–§H.10) into the same plan so both domains can be implemented in one slice.
+- Restructured the plan around combined phases: F0 (foundation, ex-D0/T0), D1 enrollment, D2 + T1 bootstrap (with `DeviceFamily` discriminator), D2.1 passive register, D3 approval, D4 + T2 activation, D5 RF code (receivers only), D6 + T6 lifecycle, T3 + T4 heartbeat ingestion + election, D7a + T5 dispatch backend + consumer, D7b + T7 queue UI + cap surface. D7b is no longer deferred — it lands together with the transmitter consumer.
+- Verified the Spring Boot 3.5 `@ConditionalOnProperty` AND-semantics, Reactor `Sinks.many().multicast().directBestEffort()` slow-subscriber semantics, and Paho MQTTv5 `MqttSubscription.setNoLocal(true)` availability through Context7 (`/websites/spring_io_spring-boot_3_5`, `/reactor/reactor-core`, `/eclipse/paho.mqtt.java`).
+- Verified backend code state: `MqttClientManager` currently exposes only `subscribe(topicFilter, qos)` (`backend/src/main/kotlin/com/thomas/notiguide/core/mqtt/MqttClientManager.kt`), so Phase F0 explicitly covers the v5 subscription overload before any transmitter listener can rely on `noLocal`.
+- Updated cross-references in `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` and `docs/planned/RECEIVER_ESP32C3_DESIGN_GUIDE.md` to point at the new plan; reworded "Receiver Plan §X" to "Device Integration Plan §X" since section anchors are preserved. The transmitter guide §H is now a duplicate kept for firmware-side cross-references only — the plan is the source of truth.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/Device Integration Implementation Plan.md` | ADDED | New unified plan covering receiver and transmitter backend implementation end-to-end |
+| `docs/planned/Receiver Integration Implementation Plan.md` | DELETED | Superseded by the unified plan |
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Updated header cross-reference to point at the new plan; marked §H as a duplicate; reworded all "Receiver Plan §X" mentions to "Device Integration Plan §X" |
+| `docs/planned/RECEIVER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Reworded "Receiver Plan §X" mentions to "Device Integration Plan §X" |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the rename and merge |
+
+### Verification
+- All "Receiver Integration Implementation Plan" / "Receiver Plan §X" references in `docs/planned/` are gone (`grep` returned empty after the edits). Historical entries in this changelog are intentionally left untouched.
+- Section anchors used by the firmware design guides (§2.3, §2.4, §3.1, §5, §6, §D5.0, §D5.1, §D6, §D7a) are preserved verbatim in the new plan, so the wording change is a label rename, not an anchor break.
+- Per repository instruction, did not run build, lint, or test commands.
+
 ## 2026-04-27 — Transmitter plan audit corrections
 
 ### Summary

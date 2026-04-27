@@ -156,7 +156,7 @@ the two bands assign the bytes very different meanings:
     control for 2.4G receivers.
 
 Backend validation rejects any mismatched combination before publish or
-DB write (Receiver Plan §2.4): for example `bits = 64` with
+DB write (Device Integration Plan §2.4): for example `bits = 64` with
 `RECEIVER_433M`, or `bits ≠ 40` with `RECEIVER_2_4G`. The canonical
 string for signing (`rf-code-v1|…`, §E.3) is identical across both
 radio families — same field names, same order, same encodings; only
@@ -1813,7 +1813,7 @@ registers ship **LSByte first** on the wire. The 5-byte rf_code
 loaded from NVS is written verbatim in index order — `rf_code[0]`
 is the first byte clocked out and matches the byte a transmitter
 puts in its `TX_ADDR[0]` slot. The backend mints addresses with
-the same convention (§E.3 / Receiver Plan §2.4); no in-firmware
+the same convention (§E.3 / Device Integration Plan §2.4); no in-firmware
 swap is needed.
 - **CE handling.** CE is plain GPIO toggled by us — not by
 `.spics_io_num`. Keep CE high for the full RX window; set low to

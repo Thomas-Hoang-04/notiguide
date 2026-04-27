@@ -22,12 +22,16 @@ This guide stands on top of:
   provisioning (§G.5), nRF24 register knowledge (§G.7), and mbedTLS
   identity (§G.10) verbatim; receiver-side material is referenced, not
   duplicated.
-- **Receiver Integration Implementation Plan** —
-  `docs/done/Receiver Integration Implementation Plan.md`. Owns
-  the unified `device` domain, signing key plumbing, RF-code shape,
-  enrollment tokens, and the queue-side dispatch broadcaster that this
-  plan consumes. §H below adds the transmitter-shaped delta on top of
-  it; nothing here re-implements receiver-domain code.
+- **Device Integration Implementation Plan** —
+  `docs/planned/Device Integration Implementation Plan.md`. Owns
+  the unified `device` domain end-to-end (receivers **and** transmitter
+  hubs): schema, enrollment tokens, signing-key plumbing, RF-code
+  shape, lifecycle, queue-side dispatch broadcaster, transmitter
+  bootstrap intake, heartbeat ingestion, active-hub election, and the
+  dispatch consumer. §H below originated the backend slice for the
+  transmitter hub and has since been folded into that plan; treat the
+  implementation plan as the source of truth and §H here as a
+  duplicate kept for firmware-side context only.
 
 Cross-refs:
 
@@ -171,7 +175,7 @@ dual-radio in firmware.
 ### B.2 Band selection from the dispatch envelope
 
 `cmd/transmit` carries `rf_code_hex`, `rf_code_bits`, and an explicit
-`band`. Per the Receiver Plan §2.4 validation table:
+`band`. Per the Device Integration Plan §2.4 validation table:
 
 - `RECEIVER_433M` and `RECEIVER_433M_PASSIVE`: `rf_code_bits ∈ [1, 32]`,
   `hex_len == 2 * ceil(bits / 8)`. The bytes are the application-layer
@@ -193,13 +197,13 @@ it on the backend.
 
 - **433 MHz**: rebuild the integer plaintext from the hex (big-endian,
   `byte_len = ceil(bits/8)`, only the bottom `bits` LSBs significant —
-  Receiver Plan §3.1 schema comment), encode as a pulse train with the
+  Device Integration Plan §3.1 schema comment), encode as a pulse train with the
   active RC-Switch-family protocol, repeat `TX_REPEAT_COUNT` times,
   release GPIO (§G.6). The rf_code bytes are an application-layer
   match value — the receiver's MCU-side matcher compares the decoded
   pulse-train value against its stored rf_code.
 - **2.4 GHz**: the dispatch's `rf_code_hex` is the destination
-  receiver's 5-byte nRF24 address (Receiver Plan §2.4 — `bits == 40`,
+  receiver's 5-byte nRF24 address (Device Integration Plan §2.4 — `bits == 40`,
   `byte_len == 5`). The hub writes those 5 bytes to **both** `TX_ADDR`
   and `RX_ADDR_P0` (auto-ACK requires `RX_ADDR_P0 == TX_ADDR`),
   loads the firmware-defined fixed `TOGGLE_MAGIC = {0xAA, 0x55}`
@@ -450,7 +454,7 @@ Validation order on the hub:
 
 1. JSON shape, `schema_version == 1`, all required fields present.
 2. `band ∈ { "433M", "2_4G" }`.
-3. Width per band (mirrors Receiver Plan §2.4 exactly):
+3. Width per band (mirrors Device Integration Plan §2.4 exactly):
    - `433M`: `bits ∈ [1, 32]`, `hex_len == 2 * ceil(bits/8)`.
    - `2_4G`: `bits == 40`, `hex_len == 10` — the bytes are the
      destination receiver's `RX_ADDR_P1`. The hub does not own a
@@ -716,7 +720,7 @@ esp_err_t radio_supervisor_deinit(void);
 //                      that the receiver MCU matches at app layer.
 //                      `bits` is the significant width.
 //   RADIO_BAND_2_4G : `payload` = the destination receiver's 5-byte
-//                      nRF24 address (Receiver Plan §2.4 fixes
+//                      nRF24 address (Device Integration Plan §2.4 fixes
 //                      bits == 40, byte_len == 5). `bits` is 40.
 typedef enum { RADIO_BAND_433M = 0, RADIO_BAND_2_4G = 1 } radio_band_t;
 
@@ -747,7 +751,7 @@ esp_err_t radio_tx_send(radio_band_t band, const uint8_t *p, size_t n, uint8_t b
     if (band == RADIO_BAND_433M) {
         r = rf433_tx_send_bits(&s_rf, p, n, bits);
     } else {
-        // Width must be 40 / 5 bytes (Receiver Plan §2.4) — caller is
+        // Width must be 40 / 5 bytes (Device Integration Plan §2.4) — caller is
         // expected to have pre-validated this against the §E.3 width
         // table. nrf24_tx_send writes the address to TX_ADDR +
         // RX_ADDR_P0 internally and sends the fixed TOGGLE_MAGIC.
@@ -822,7 +826,7 @@ oriented** encoder that complements the existing `tristate_to_pulses`
 `rf_data.c`'s `tristate_to_pulses` represents each tri-state symbol
 ('0', '1', 'F') as **two** pulse-pairs — the PT2272 wire format.
 Backend `cmd/transmit` for `band=433M` carries a flat `uint32_t` of
-`bits ∈ [1, 32]` (Receiver Plan §3.1 schema comment). Encoding it as
+`bits ∈ [1, 32]` (Device Integration Plan §3.1 schema comment). Encoding it as
 PT2272 tri-state would only work for codes whose 2-bit groups are in
 `{00, 01, 11}` and would silently misencode `10` groups. Don't go
 through tri-state; emit one pulse-pair per logic bit:
@@ -1010,8 +1014,8 @@ static esp_err_t nrf_tx_bringup(nrf24_tx_t *h) {
 #endif
 
     // PTX address ownership: TX_ADDR == RX_ADDR_P0 == destination
-    // receiver's RX_ADDR_P1 (= the receiver's rf_code, Receiver Plan
-    // §2.4). Per-dispatch addressing — the hub does not bake any
+    // receiver's RX_ADDR_P1 (= the receiver's rf_code, Device
+    // Integration Plan §2.4). Per-dispatch addressing — the hub does not bake any
     // address at boot. `nrf24_tx_send` writes both registers from the
     // 5 bytes carried in `cmd/transmit.rf_code_hex` immediately
     // before each W_TX_PAYLOAD.
@@ -1112,7 +1116,7 @@ the SPI payload of `W_REGISTER(TX_ADDR, …)` and
 Kconfig involvement. The receiver firmware applies the same bytes
 to its `RX_ADDR_P1`, so a frame transmitted to address `A` is
 silicon-matched by exactly one receiver in the global 2.4G uniqueness
-namespace (Receiver Plan §D5.0).
+namespace (Device Integration Plan §D5.0).
 
 ### G.8 Dispatch executor
 
@@ -1257,7 +1261,7 @@ meaning.
 
 Reuse Receiver §G.10 verbatim. The pinned backend public key Kconfig
 key is renamed `CONFIG_TRANSMITTER_BACKEND_PUBKEY_B64`. The signing
-key is shared with the receiver fleet (§H.7.0 / Receiver Plan §6: one
+key is shared with the receiver fleet (§H.7.0 / Device Integration Plan §6: one
 signing key covers both families), so the dev `.pem` generated for
 receivers can be reused for hubs without rotation.
 
@@ -1273,13 +1277,22 @@ Both are bounded by mbedTLS hardware acceleration and well within the
 
 ---
 
-## H. Backend Implementation Plan
+## H. Backend Implementation Plan (DUPLICATE — see Device Integration Implementation Plan)
+
+> **Status (2026-04-27):** This section originated the backend slice
+> for the transmitter hub and has been folded into
+> `docs/planned/Device Integration Implementation Plan.md` (Phases F0,
+> T1–T7). That plan is now the source of truth for backend work and
+> covers receivers and transmitters together. The text below is kept
+> in place for firmware-side cross-references (§A–§G refer to §H.x
+> anchors); when the two diverge, fix the implementation plan first
+> and refresh §H here.
 
 This section is the backend slice of the transmitter hub plan: the
 package additions, configuration, and phased rollout that turn the
 firmware contract above into a working server. It builds on top of
 the unified `device` domain established by the
-`Receiver Integration Implementation Plan.md` and reuses receiver-
+`Device Integration Implementation Plan.md` and reuses receiver-
 domain code wherever the contracts overlap.
 
 ### H.1 Topology (the contract pinned for firmware)
@@ -1372,10 +1385,10 @@ in `core/device/DeviceCanonical.kt` next to the receiver-side ones.
 UTF-8, no trailing newline, exact field order:
 
 - `activate-v1|<challenge_id>|<nonce>|<issued_at>|<expires_at>` —
-  reused verbatim from the Receiver Plan §2.3. The transmitter
+  reused verbatim from the Device Integration Plan §2.3. The transmitter
   activation path differs only in the topic namespace.
 - `deact-v1|<public_id>|<command_id>|<action>|<issued_at>` — reused
-  verbatim from the Receiver Plan §2.3. Applied to the hub topic
+  verbatim from the Device Integration Plan §2.3. Applied to the hub topic
   namespace via the `DeviceMqttPublisher` route.
 - `transmit-v1|<hub_public_id>|<dispatch_id>|<receiver_public_id>|<band>|<rf_code_hex>|<rf_code_bits>|<issued_at>`
   — new, with the `band` field per §H.4.
@@ -1426,7 +1439,7 @@ of `transmit-v1` from day one rather than a future `transmit-v2`.
 ### H.5 Package additions to the unified `device` domain
 
 Add the following to the unified `device` domain established by the
-Receiver Plan §5:
+Device Integration Plan §5:
 
 ```text
 backend/src/main/kotlin/com/thomas/notiguide/domain/device/
@@ -1440,7 +1453,7 @@ backend/src/main/kotlin/com/thomas/notiguide/domain/device/
 
 Existing receiver-domain code is reused verbatim:
 
-| Concern                                                              | Reused from Receiver Plan                                                       |
+| Concern                                                              | Reused from Device Integration Plan                                                       |
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | Enrollment tokens                                                    | `EnrollmentTokenService` (D1)                                                   |
 | Bootstrap intake (validation, token consume, upsert, challenge mint) | `DeviceRegistrationService` (D2)                                                |
@@ -1453,7 +1466,7 @@ Existing receiver-domain code is reused verbatim:
 ### H.6 Backend configuration
 
 Add to `application.yaml`, next to the `device:` block from the
-Receiver Plan §6:
+Device Integration Plan §6:
 
 ```yaml
 device:
@@ -1512,7 +1525,7 @@ every file touched and any skipped item.
    so the feature gate is real.
 
 The signing key, `DeviceCommandSigner`, and the
-`DeviceCommandSigningProperties` config from the Receiver Plan §6 are
+`DeviceCommandSigningProperties` config from the Device Integration Plan §6 are
 reused unchanged. One signing key covers both fleets.
 
 #### H.7.1 Phase T1 — Bootstrap intake
@@ -1586,14 +1599,14 @@ reused unchanged. One signing key covers both fleets.
 
 - `TransmitterDispatchService` subscribes to
   `DeviceDispatchEventBroadcaster`. The broadcaster shape is
-  documented by the Receiver Plan §D7a alongside the queue-side
+  documented by the Device Integration Plan §D7a alongside the queue-side
   publisher; the Reactor underpinning is `Sinks.many().multicast().directBestEffort()`
   — fan out to coroutine-side consumers, drop on slow subscriber so
   one stuck listener never stalls dispatch.
 - On `DEVICE_CALL_REQUESTED`:
   1. `electActive(event.storeId)`. If null, mark the queue-side
      dispatch as failed through the same admin-visible queue-dispatch
-     failure path owned by Receiver Plan D7a; this guide does not pin
+     failure path owned by Device Integration Plan §D7a; this guide does not pin
      a separate transmitter-specific SSE event name.
   2. Decrypt the receiver's RF code (only point in the system that
      does so on the dispatch hot path).
@@ -1609,7 +1622,7 @@ reused unchanged. One signing key covers both fleets.
     canonical string needed. Re-elect, sign, publish.
 - Transmit-ack ingestion lives in §H.7.3's operational-listener path.
 
-#### H.7.6 Phase T6 — Lifecycle (reuse from Receiver Plan D6)
+#### H.7.6 Phase T6 — Lifecycle (reuse from Device Integration Plan §D6)
 
 - `DeviceLifecycleService` already publishes `cmd/deact` with
   `deact-v1`. Hub case routes via the extended `DeviceMqttPublisher`
@@ -1637,7 +1650,7 @@ through the existing admin UI cleanly:
 - Hub firmware (this guide §A–§G; not a backend concern).
 - Web Serial bridge.
 - Dedicated transmitter admin-web screens beyond the unified Device
-  tab from the Receiver Plan.
+  tab from the Device Integration Plan.
 - Per-device MQTT credentials and broker ACLs.
 
 ### H.8 Suggested execution order
@@ -1662,7 +1675,7 @@ exists.
 
 ### H.9 Cross-domain dependencies
 
-- The Receiver Integration Implementation Plan owns the unified
+- The Device Integration Implementation Plan owns the unified
   `device` domain, the `DeviceDispatchEventBroadcaster` producer, the
   RF-code shape, and the queue-side D7a plumbing. This guide consumes
   all of it; nothing here re-implements receiver-domain code.
@@ -1678,7 +1691,7 @@ exists.
 - Transmit ack analytics emission (how many dispatches actually fired
   vs. failed silently).
 - In-field rotation of the backend command-signing key — shared with
-  the Receiver Plan's deferred list.
+  the Device Integration Plan's deferred list.
 - Surfacing `nrf24` probe failures into the heartbeat envelope as a
   capability bitmap so admin can flag a 433-only hub before it tries
   to dispatch a 2.4 G code (related: §J.4).
@@ -1798,7 +1811,7 @@ config TRANSMITTER_NRF24_ENABLE_DPL
 
 # TX address is NOT a Kconfig — every dispatch carries its own
 # destination address in `cmd/transmit.rf_code_hex` (= the receiver's
-# rf_code, see Receiver Plan §2.4). The hub writes TX_ADDR +
+# rf_code, see Device Integration Plan §2.4). The hub writes TX_ADDR +
 # RX_ADDR_P0 from those 5 bytes immediately before W_TX_PAYLOAD;
 # nothing about the address is built into the firmware image.
 
@@ -1962,7 +1975,7 @@ above or is an **accepted** trade-off noted for visibility.
     firmware persists `device_name` from the activation `result`
     payload (same field name as the receiver, same persistence
     pattern). Backend-side the field is `assigned_name`
-    (Receiver-Plan §3.1); the wire field stays `assigned_device_name`
+    (Device Integration Plan §3.1); the wire field stays `assigned_device_name`
     for cross-fleet symmetry.
 23. **Single-instance globals (accepted, §G.7).** The nRF24 driver
     keeps file-static `s_spi` / single-handle state, matching the
@@ -2002,7 +2015,7 @@ Cross-checks performed during drafting and subsequent audit passes.
   RX_ADDR_P0 == receiver's RX_ADDR_P1` matches the table in Receiver
   §G.7.7. With the rf_code-as-address model, the destination
   receiver's `RX_ADDR_P1` is the bytes the backend mints as the
-  receiver's `device_rf_code` (Receiver Plan §2.4 — `bits == 40`),
+  receiver's `device_rf_code` (Device Integration Plan §2.4 — `bits == 40`),
   and the hub writes those exact bytes to its `TX_ADDR` and
   `RX_ADDR_P0` per dispatch.
 - **DPL bilateral, retransmit retry, channel range, byte order.**

@@ -1,5 +1,312 @@
 # Changelogs
 
+## 2026-04-30 — Enrollment token purpose statement
+
+### Summary
+- Added a purpose paragraph to the Integration Plan's Phase D1 explaining *why* enrollment tokens exist: they are the authorization link between an admin invitation and a physical device's bootstrap request.
+- Updated the NVS schema tables in all three firmware guides (transmitter, ESP32-C3 receiver, ESP-01 receiver) to note the token is "admin-issued single-use authorization" instead of only describing its erasure lifecycle.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/Device Integration Implementation Plan.md` | MODIFIED | Added purpose paragraph to Phase D1 |
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Updated `enroll_token` NVS description |
+| `docs/planned/RECEIVER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Updated `enroll_token` NVS description |
+| `docs/planned/RECEIVER_DESIGN_GUIDE.md` | MODIFIED | Updated `enroll_token` NVS description |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this change |
+
+## 2026-04-30 — Transmitter guide cleanup + nRF24 datasheet audit
+
+### Summary
+- Cleaned up redundant content in `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md`: removed duplicate CMakeLists.txt (§G.5 now references §I.2), eliminated repeated "Avoid GPIO18/19" sentence in §C.1, simplified reference-baselines block.
+- Fixed §G.3 `wifi_start_sta` code sketch: removed premature `esp_wifi_set_ps()` call that contradicted §F.1 step 9 (power-save must come after `IP_EVENT_STA_GOT_IP`).
+- Fixed §G.9 `heartbeat_stop` race condition: task handle was NULLed before the task exited; now the task self-nulls before `vTaskDelete`.
+- Corrected two nRF24 comment imprecisions after full 18-point datasheet audit:
+  - §G.7 CONFIG register comment: "PTX has no RX path" → clarified that PTX receives empty ACKs but RX_DR is correctly masked for that design.
+  - §G.7 SETUP_RETR comment: 750µs ARD is margin, not a requirement — 250µs already satisfies empty-ACK at 1/2 Mbps per PS v1.0 §7.4.2.
+- Updated last-updated date to 2026-04-30.
+
+### nRF24 Datasheet Audit Results
+All 18 claims verified against nRF24L01+ PS v1.0 and nRF24L01 PS v2.0:
+- Register addresses, bit positions, command bytes: all correct
+- ACTIVATE 0x50+0x73 for legacy chip probe: correct
+- TX_ADDR == RX_ADDR_P0 requirement for auto-ACK: correct per datasheet
+- Tpd2stby 10ms (vs 4.5ms worst-case): conservatively correct
+- Thce 15µs (vs 10µs minimum): correct with 50% margin
+- SPI byte order (LSByte first for multi-byte registers): correct
+- Power state transitions: match datasheet state diagram exactly
+- Two comment-level imprecisions fixed (no functional bugs)
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Removed redundancy, fixed wifi_start_sta/heartbeat_stop bugs, corrected nRF24 comments |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this cleanup + audit pass |
+
+### Verification
+- Cross-checked all 76 internal §-references against section headings — all valid.
+- Verified ESP-MQTT 1.0.0 claims (6/6 correct) against managed-component header.
+- Verified Wi-Fi config fields (`failure_retry_cnt`, `disable_wpa3_compatible_mode`, `sae_pwe_h2e`, `wpa3_compatible_mode`) against receiver-esp32 usage.
+- Verified receiver `EN_AA = 0x02` (pipe 1) matches guide's PTX-side comment.
+- Confirmed `rf_common.h` types (`RFHandler`, `Protocol`, `RFPulse`, `RFTicks`) and existing functions match guide references.
+- Confirmed backend device domain does not yet exist (guide describes target state — correct).
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-29 — Final transmitter guide coherence cleanup
+
+### Summary
+- Re-audited `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` against the live transmitter repo state, the unified device plan, Context7-backed framework docs, and `docs/walkthrough/ESP_IDF_SDK_REFERENCE.md`.
+- Removed the remaining stale queue-dispatch wording inherited from older split-plan assumptions: the guide now explicitly uses `DEVICE_DISPATCH_FAILED` for queue-side failure signaling and matches the current disabled-preflight admin flow (`dispatchReady`, `error = "no_active_transmitter"`) instead of describing the dispatch UI as hidden.
+- Stripped the tail-end audit/provenance scaffolding (`J. Audit & Open Questions`, `K. Self-Verification`) so the file stays factual, implementation-focused, and independently usable rather than carrying drafting history.
+- Tightened a few remaining repo-state phrasings (`Reference baselines`, plain `Last updated`, checked-in `idf_component.yml` wording) and repaired the deferred nRF24 heartbeat-flag reference so it points at the live runtime section instead of the removed audit appendix.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Replaced stale queue/UI failure wording, removed non-implementation audit appendices, and tightened repo-aligned standalone wording |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this final transmitter-guide cleanup pass |
+
+### Verification
+- Re-checked the transmitter guide against the live repo surfaces: `transmitter/main/main.c`, `transmitter/main/CMakeLists.txt`, `transmitter/main/idf_component.yml`, `transmitter/sdkconfig`, and `transmitter/managed_components/espressif__mqtt/include/mqtt_client.h`.
+- Re-checked the queue-side integration contract against `docs/planned/Device Integration Implementation Plan.md`, specifically the `DEVICE_DISPATCH_FAILED` path and the `GET /api/queue/admin/{storeId}/available-devices` preflight envelope.
+- Re-queried current framework/API semantics through Context7 for Spring Boot 3.5 `@ConditionalOnProperty`, Reactor Core `Sinks.many().multicast().directBestEffort()`, and Eclipse Paho MQTT v5 `MqttSubscription.setNoLocal(true)`, and re-used `docs/walkthrough/ESP_IDF_SDK_REFERENCE.md` plus the byte-identical checked-in mirror copies as the ESP-IDF baseline.
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-29 — Final device-plan audit corrections for queue-failure flow and repo-aligned UI details
+
+### Summary
+- Re-audited `docs/planned/Device Integration Implementation Plan.md` against the live backend/web queue flow, current selector patterns, and Context7-backed framework/API docs.
+- Fixed a stale internal cross-reference: the `band` justification now points to §2.4, not §2.5.
+- Corrected a queue-lifecycle overstatement: pause/resume in the current repo toggles `queue_state` but does not broadcast an SSE queue event today, so the summary table no longer claims one.
+- Fixed two repo-alignment issues in the admin-web plan: the passive-register dialog now points at `API_ROUTES.DEVICES.PASSIVE`, and the store selector guidance now matches the repo’s current `listStores(0, 100)` selector pattern instead of vague “load enough pages” wording.
+- Tightened the transmitter dispatch failure path so it no longer implies an impossible “re-call” flow from a ticket that is already in `CALLED`. The plan now treats `DEVICE_DISPATCH_FAILED` as a fail-closed operator signal, keeps the device reservation in place while signal state is uncertain, and explicitly defers any queue-side resend affordance to §11.
+- Closed the cross-instance eventing gap: the plan now states that `DEVICE_DISPATCH_FAILED` must widen backend `MqttPublisher.QueueEventType` and go through both the MQTT-backed queue-event fan-out and the local SSE broadcaster, not just the frontend listener types.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/Device Integration Implementation Plan.md` | MODIFIED | Fixed remaining stale refs, corrected pause/resume event wording, aligned passive-register UI guidance with the live repo, and repaired the queue dispatch failure / reservation logic |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this final audit-correction pass |
+
+### Verification
+- Cross-checked repo-grounded claims against the live files: `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/service/QueueService.kt`, `backend/src/main/kotlin/com/thomas/notiguide/core/mqtt/MqttPublisher.kt`, `backend/src/main/kotlin/com/thomas/notiguide/core/sse/QueueEventBroadcaster.kt`, `backend/src/main/kotlin/com/thomas/notiguide/core/security/SecurityConfig.kt`, `web/src/features/store/api.ts`, `web/src/features/queue/store-selector.tsx`, `web/src/features/admin/create-admin-dialog.tsx`, `web/src/features/admin/assign-store-dialog.tsx`, `web/src/types/queue.ts`, and `web/src/hooks/use-queue-events.ts`.
+- Re-checked load-bearing framework/API semantics through Context7 for Spring Boot 3.5 `@ConditionalOnProperty`, Next.js 16 App Router `params` Promise handling, and Eclipse Paho MQTT v5 subscription options / `noLocal`.
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-29 — Transmitter design guide final audit
+
+### Summary
+Final audit pass on `TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` for standalone correctness, stale references, and cross-doc consistency.
+
+### Audit Findings
+
+| # | Section | Finding | Fix |
+|---|---------|---------|-----|
+| 1 | Header | Datasheet paths `docs/walkthrough/nRF24L01P_PS_v1.0.txt` and `docs/walkthrough/nRF24L01_Product_Specification_v2_0-9199.txt` don't exist — actual location is `docs/nrf24/` | Fixed paths |
+| 2 | §H.4 | Cross-doc reference "§2.4 width rules" points to the Device Integration Plan, breaking standalone intent | Changed to `§B.2` (local section) |
+| 3 | §J.1 | Stale problem statement: "bits ∈ {8,16,24,32} is ambiguous between 433M and 2.4G" — but width rules are now disjoint per §B.2 (40 only on 2.4G) | Updated to reflect resolved disjoint state |
+
+### Verified Correct (no change needed)
+- §I.1: `idf_component.yml` current state (`idf >= 4.1.0`, `espressif/mqtt: '*'`) matches guide's description; tightening to `~1.0.0` is a planned action
+- §I.1: `dependencies.lock` records `idf 6.0.0` and `mqtt 1.0.0` — matches guide's claim
+- §I.2: Current `CMakeLists.txt` SRCS and PRIV_REQUIRES match guide's current-state description; post-port additions are planned
+- §G.3: `WIFI_IF_STA` / `WIFI_IF_AP` confirmed as the v6 constants (receiver already uses them)
+- §G.4: `esp_mqtt_client_stop` "Cannot be called from the MQTT event handler" — confirmed in managed-component header
+- §G.7: SETUP_RETR `(2 << 4) | 3` = ARD 750µs, ARC 3 — correct per nRF24L01+ datasheet SETUP_RETR register encoding
+- §E.5: Heartbeat QoS 0 rationale sound — liveness TTL absorbs missed packets
+- §D: NVS schema key names all within 15-char limit (verified: longest is `last_deact_id` at 13 chars)
+- §A.2: `op_state` set `{ACTIVE, SUSPENDED, DECOMMISSIONED}` matches §H.1 / §H.7.4 candidate-pool exclusion rules
+- §C.1: Pin map avoids GPIO18/19 (USB-Serial-JTAG) — confirmed ESP32-C3 constraint from SDK reference
+- §F.7: `Tpd2stby ≤ 4.5 ms` (PS v1.0 with Ls=90mH) — correct; `NRF_TPD2STBY_MS = 10` provides generous margin
+- §G.1: NVS encryption with HMAC (`CONFIG_NVS_ENCRYPTION=y`, `CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y`) confirmed in sdkconfig
+- §K: All internal §H.x cross-references verified — no dangling anchors
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Fixed 3 audit findings: stale datasheet paths, cross-doc §2.4 reference, stale §J.1 problem statement |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this audit |
+
+## 2026-04-29 — Device integration plan: platform-consistency principle, conciseness pass, and audit
+
+### Summary
+
+**Platform consistency (§1.0):**
+- Added §1.0 "Platform Consistency Principle" establishing device-bound tickets as regular queue tickets with a `device_id` attachment.
+- Added lifecycle comparison table (issue, wait, call, serve, cancel, no-show, transfer, pause/resume, cleanup) mapping shared vs. device-specific vs. mobile-web-specific behavior.
+- Reinforced §D7a with platform-consistency invariant; added §9.7 "Unified queue view" and §D7b inline parity note.
+- Documented inherent platform differences as medium constraints, not feature gaps.
+
+**Backend/frontend parity in implementation sections:**
+- §D7a hooks: documented shared-then-branch pattern (call, serve/cancel, no-show requeue/skip, transfer) with explicit `device_id` presence/absence branching.
+- §9.7: added "Unified queue view" paragraph, "Serving display" paragraph, per-row device indicator spec.
+- §D7b: added inline parity note referencing §1.0 and §9.7.
+
+**Conciseness cleanup:**
+- §D7a hooks: condensed from per-hook paragraphs restating shared flow to concise table-referenced format.
+- §D7b: collapsed platform-consistency paragraph into one-liner referencing §1.0 and §9.7.
+- §D5.1: shortened 2.4G rotation paragraph from firmware-level detail to observable behavior with firmware guide reference.
+- §T1: collapsed "Why pre-assign store_id" from two paragraphs to two sentences.
+- §T5: shortened DEVICE_STOP_REQUESTED explanation and transmit-ack ingestion note.
+- §D7a broadcaster: collapsed Reactor Core citation into one sentence.
+
+**Audit fixes:**
+- §3.2 migration step 6: added missing `updated_at` column (present in §3.1 final schema but absent from migration steps).
+- §1.0 Cancel row: fixed to note `DEVICE_STOP_REQUESTED` fires only if prior status was CALLED (a WAITING cancel has no active RF broadcast).
+- §D7a Serve/Cancel hook: added same conditional note.
+- §9.8.1 Kind badge: fixed to use authoritative §9.6 kind-label-map value (`433 MHz Receiver` / `Bộ thu 433 MHz`) instead of inconsistent `433 MHz Passive Receiver` / `Thiết bị nhận 433 MHz thụ động`.
+- §9.9.1: fixed Vietnamese label from `Hub phát tín hiệu` to §9.6-authoritative `Bộ phát tín hiệu`.
+- §2.3: removed incorrect `(§2.5)` cross-reference on band mapping (§2.5 is topology rules, not band definition; mapping is inline in §2.3).
+- §T5 step 3: same fix — removed `/ §2.5` from band derivation reference.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/Device Integration Implementation Plan.md` | MODIFIED | Added §1.0 platform-consistency principle; reinforced §D7a/§D7b/§9.7 with parity guarantees; conciseness pass on hooks/T1/T5/D5.1; fixed 7 audit findings (migration gap, cancel logic, label inconsistencies, stale cross-refs) |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this change |
+
+### Audit Findings Summary
+
+| # | Section | Finding | Severity | Fix |
+|---|---------|---------|----------|-----|
+| 1 | §3.2 step 6 | `updated_at` column missing from migration ADD list despite being in §3.1 final schema | MEDIUM | Added to step 6 |
+| 2 | §1.0 Cancel row | `DEVICE_STOP_REQUESTED` fires unconditionally but WAITING cancels have no active RF broadcast | LOW | Conditioned on prior status CALLED |
+| 3 | §D7a hooks | Same as #2 in hook description | LOW | Added conditional note |
+| 4 | §9.8.1 | Kind badge text `433 MHz Passive Receiver` doesn't match §9.6 authoritative label `433 MHz Receiver` | LOW | Fixed to reference §9.6 |
+| 5 | §9.9.1 | Vietnamese label `Hub phát tín hiệu` doesn't match §9.6 `Bộ phát tín hiệu` | LOW | Fixed |
+| 6 | §2.3 | `(§2.5)` cross-ref on band mapping points to topology rules, not band definition | LOW | Removed |
+| 7 | §T5 step 3 | Same stale `§2.5` reference | LOW | Removed |
+
+### Verification
+- Cross-checked lifecycle table against actual `QueueService` method signatures (`issueTicket`, `callNext`, `callSpecificTicket`, `serveTicket`, `cancelTicket`, `handleNoShow`, `transferTicket`) — all confirmed present.
+- Verified `TicketDto` shape (6 fields, no `deviceId`/`deviceName` yet — matches plan's D7a widening intent).
+- Verified `QueueSseEvent` and `QueueEventType` in both backend and frontend — confirmed `DEVICE_DISPATCH_FAILED` is not yet present (matches plan's D7b widening intent).
+- Verified `RedisTTLPolicy` values: `TICKET_WAITING` = 12h, `TICKET_CALLED` = 30min, `TICKET_TERMINAL` = 2h — matches §1.0 table.
+- Verified `FcmNotificationService.sendProactiveAlert` gracefully skips tickets without FCM tokens (`?: return`) — device-bound tickets naturally excluded from position alerts.
+- Verified `sendTicketCalledNotification` method name matches plan's hook description.
+- Verified `notifier_device` table columns match migration drop list.
+- Verified all UI components listed in §9.8 exist in `web/src/components/ui/`.
+- Verified version numbers in §1.1 against `build.gradle.kts` and `package.json`.
+- Verified `bootJar.exclude("db/**")` present — migration shipping claim accurate.
+- No code changes — documentation only.
+
+## 2026-04-29 — Transmitter guide standalone conversion for firmware container
+
+### Summary
+- Converted `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` into a standalone implementation plan that no longer depends on the receiver design guide or a sibling backend-planning doc to explain the load-bearing transmitter behavior.
+- Copied and adapted the reused receiver-derived material directly into the transmitter guide where it mattered: provisioning envelopes, activation/deactivation canonicals, Wi-Fi/MQTT implementation notes, HTTP provisioning flow, nRF24 register/API details, mbedTLS identity handling, and backend contract expectations.
+- Removed the remaining wording that still read like cross-doc indirection, then tightened the audit and self-verification sections so the transmitter plan now justifies its own logic locally.
+- Re-ran a final accuracy/consistency sweep against the current transmitter checkout, the receiver guide as the source for reused implementation details, the checked-in ESP-IDF reference, and current ESP-MQTT headers.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Inlined the reused receiver-side implementation details, removed remaining cross-doc dependencies, and finished the standalone audit cleanup |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the transmitter-guide standalone conversion and final audit |
+
+### Verification
+- Cross-checked the copied/adapted sections against `docs/planned/RECEIVER_ESP32C3_DESIGN_GUIDE.md` to keep the reused ESP-IDF, provisioning, nRF24, and mbedTLS guidance semantically aligned where the transmitter intentionally mirrors it.
+- Re-verified ESP-IDF v6 Wi-Fi and ESP-MQTT guidance through Context7 and checked the managed-component header in `transmitter/managed_components/espressif__mqtt/include/mqtt_client.h` for the exact event fields and API caveats the guide relies on.
+- Re-checked repo-grounded statements against the live transmitter tree, including `transmitter/sdkconfig`, `transmitter/main/CMakeLists.txt`, `transmitter/main/idf_component.yml`, and the current `main/rf/*` layout.
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-29 — Final transmitter guide audit cleanup
+
+### Summary
+- Re-audited `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` for remaining repo-drift, stale references, and wording that no longer matched the current checkout.
+- Removed the host-specific absolute ESP-IDF path from the guide and kept the checked-in `docs/walkthrough/ESP_IDF_SDK_REFERENCE.md` copy as the cited audit baseline.
+- Corrected stale current-state claims: this checkout does have mirrored SDK-reference copies under `receiver-esp32/` and `transmitter/`, and it now has a checked-in `transmitter/sdkconfig` with `esp32c3` target plus NVS encryption / HMAC protection enabled.
+- Tightened the ESP-IDF/NVS sections and self-verification notes so they describe the real repo state without implying missing files or absent configuration that no longer applies.
+- Refreshed the guide metadata to reflect this final audit pass and the Context7-backed techstack re-check.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Removed stale SDK-copy and sdkconfig-absence claims, dropped the absolute SDK path, and refreshed the audit metadata / verification wording |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this final transmitter-guide audit cleanup |
+
+### Verification
+- Cross-checked repo-state claims against the live checkout: `transmitter/sdkconfig`, `transmitter/sdkconfig.old`, `transmitter/ESP_IDF_SDK_REFERENCE.md`, `receiver-esp32/ESP_IDF_SDK_REFERENCE.md`, `transmitter/main/CMakeLists.txt`, `transmitter/main/idf_component.yml`, and `backend/src/main/kotlin/com/thomas/notiguide/core/mqtt/MqttClientManager.kt`.
+- Confirmed the three ESP-IDF reference copies are byte-identical and that the checked-in `transmitter/sdkconfig` already enables `CONFIG_NVS_ENCRYPTION=y` and `CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y`.
+- Re-checked the backend library claims through Context7 for Spring Boot 3.5 `@ConditionalOnProperty`, Reactor Core `Sinks.many().multicast().directBestEffort()`, and Eclipse Paho MQTT v5 `MqttSubscription.setNoLocal(true)`.
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-29 — Explicit device-kind UI label map
+
+### Summary
+- Replaced the vague "use `devices.kind.*`" wording with an explicit `device.kind` -> visible label map for admin UI surfaces.
+- Defined the actual English and Vietnamese labels for each receiver/hub kind and made it explicit that the visible UI must never show either the backend enum literal or the i18n key name itself.
+- Tightened the passive-registration form and hub-list wording to point at the label map instead of naming i18n keys as if they were the final badges.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/Device Integration Implementation Plan.md` | MODIFIED | Added an explicit `device.kind` label map with English/Vietnamese visible strings and updated kind-badge/kind-column wording to reference those visible labels rather than raw enums or i18n key names |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the device-kind label clarification |
+
+### Verification
+- Kept the change aligned with the repo's existing admin-web i18n/UI rules and the plan's `devices.kind.*` key structure while making the visible label values explicit.
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-29 — 2.4 GHz-only toggle payload clarification
+
+### Summary
+- Clarified in both transmitter-facing planning docs that the fixed `TOGGLE_MAGIC = 0xAA 0x55` payload belongs only to the `RECEIVER_2_4G` transmit path.
+- Made the 433 MHz wording explicit: there is no separate toggle payload on that band, and the normal 433 MHz receiver-side check compares the decoded transmitted RF frame against the stored `rf_code`.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/Device Integration Implementation Plan.md` | MODIFIED | Clarified that `TOGGLE_MAGIC` is 2.4 GHz only and that 433 MHz receivers compare the decoded transmitted frame against `rf_code` |
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Clarified per-band transmit semantics so 433 MHz has no separate toggle payload and 2.4 GHz alone emits `TOGGLE_MAGIC` |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this payload-semantics clarification |
+
+### Verification
+- Kept the clarification repo-grounded and aligned with the current transmitter design wording already used by the unified device plan.
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-29 — PT2272-compatible 433 MHz protocol note
+
+### Summary
+- Added an explicit note to the transmitter guide and the unified device plan that passive PT2272 and pin-compatible 433 MHz decoder ICs map to protocol IDs `1..4` in the live `transmitter/main/rf/rf_data.c` table.
+- Pinned the exact common waveform shape for that subset: non-inverted `sync 1:31`, `zero 1:3`, `one 3:1`, with only the base pulse length varying (`350`, `320`, `240`, `150` µs).
+- Clarified that protocol `1` remains the current default via `PROTO_ID`, while protocols `5+` stay available in the RF engine for other 433 MHz families but are outside the PT2272-compatible contract.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Added the PT2272 / pin-compatible protocol-IDs `1..4` note next to the 433 MHz RF engine discussion |
+| `docs/planned/Device Integration Implementation Plan.md` | MODIFIED | Added the PT2272-compatible protocol subset note to the 433 MHz RF-code contract section |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this protocol note |
+
+### Verification
+- Cross-checked the protocol subset against the live `transmitter/main/rf/rf_data.c` `proto[]` table and `transmitter/main/rf/rf_common.h` defaults (`PROTO_ID = 1`).
+- Per repository instruction, did not run build, lint, or test commands.
+
+## 2026-04-29 — Final audit pass on Device Integration Implementation Plan
+
+### Summary
+- Re-audited `docs/planned/Device Integration Implementation Plan.md` against the live backend/web repo surfaces, the current `transmitter/` and receiver repo state, and the merged transmitter design guide so the plan no longer implies transmitter rollout before the transmitter domain is actually implemented and vetted.
+- Kept transmitter sequencing implicit in the plan order instead of adding a separate rollout-gate requirement; the plan already assumes transmitter-side work follows `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md`.
+- Fixed a queue-flow gap: the old plan wanted the queue UI disabled for `no_active_transmitter` but defined no read path for that state. `GET /api/queue/admin/{storeId}/available-devices` now returns a preflight envelope (`devices`, `dispatchReady`, optional `error`) instead of a bare array, so the disabled state is data-driven and coherent.
+- Fixed the async failure path: the old plan assumed the existing queue SSE surface would automatically pick up `DEVICE_DISPATCH_FAILED`, but the current frontend only listens to a fixed ticket-event list. The plan now explicitly requires widening `QueueEventType`, `QueueSseEvent`, and `useQueueEvents` so dispatch failures can surface in the queue page.
+- Tightened the stop-flow logic: `DEVICE_STOP_REQUESTED` now defines the same explicit failure path when no live hub can be elected, instead of leaving that case implicit while a receiver might keep vibrating.
+- Removed an ungrounded frontend assumption: the hub detail page no longer pretends it can read backend YAML at runtime; it now polls on a fixed 15-second client interval aligned with the documented heartbeat defaults.
+- Tightened MQTT wording so the plan states only the repo-grounded requirement (the current wrapper must preserve MQTT v5 `noLocal` semantics across reconnects) without over-asserting implementation details the live wrapper does not yet expose.
+- Re-checked the load-bearing framework/API claims through Context7 where they mattered to this doc pass: Spring Boot 3.5 `@ConditionalOnProperty` semantics, Next.js 16 App Router `params` Promise usage, and Reactor Core `directBestEffort()` slow-subscriber behaviour.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/Device Integration Implementation Plan.md` | MODIFIED | Final doc audit: transmitter sequencing cleanup, queue dispatch preflight envelope, explicit SSE/event typing updates for `DEVICE_DISPATCH_FAILED`, stop-flow failure handling, hub-detail polling clarification, and MQTT wording cleanup |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this final audit pass |
+
+### Verification
+- Cross-checked repo-grounded statements against the live files: `backend/src/main/kotlin/com/thomas/notiguide/core/mqtt/MqttClientManager.kt`, `backend/src/main/kotlin/com/thomas/notiguide/core/mqtt/MqttConfig.kt`, `backend/src/main/kotlin/com/thomas/notiguide/core/security/SecurityConfig.kt`, `backend/src/main/kotlin/com/thomas/notiguide/core/ratelimit/RateLimitFilter.kt`, `backend/src/main/kotlin/com/thomas/notiguide/core/sse/QueueEventBroadcaster.kt`, `backend/src/main/resources/db/schema.sql`, `web/src/components/layout/sidebar.tsx`, `web/src/lib/constants.ts`, `web/src/types/queue.ts`, `web/src/hooks/use-queue-events.ts`, and `web/src/app/[locale]/dashboard/queue/page.tsx`.
+- Re-checked transmitter/receiver current-state assumptions against the live checkout: `transmitter/main/*`, `transmitter/dependencies.lock`, `transmitter/sdkconfig`, `receiver-esp32/main/*`, and `receiver-esp8266/*`.
+- Re-checked framework/API semantics through Context7 for Spring Boot 3.5, Next.js 16.2.x App Router params, and Reactor Core multicast sink behaviour.
+- Per repository instruction, did not run build, lint, or test commands.
+
 ## 2026-04-27 — Merged receiver + transmitter into a unified Device Integration Implementation Plan
 
 ### Summary

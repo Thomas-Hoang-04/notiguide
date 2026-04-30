@@ -297,7 +297,7 @@ on reprovision.
 | `mqtt_uri`      | `str`          | provisioning       | must be `mqtts://...`                                                                                       |
 | `mqtt_user`     | `str`          | provisioning       | shared broker credential                                                                                    |
 | `mqtt_pwd`      | `str`          | provisioning       | shared broker credential                                                                                    |
-| `enroll_token`  | `str`          | provisioning       | erased after successful activation or terminal bootstrap failure                                            |
+| `enroll_token`  | `str`          | provisioning       | admin-issued single-use authorization; erased after activation or terminal bootstrap failure                 |
 | `public_id`     | `str`          | activation         | backend-minted operational identity                                                                         |
 | `device_name`   | `str`          | activation         | backend-assigned human label                                                                                |
 | `rx_type`       | `u8`           | activation         | `0=RECEIVER_433M`, `1=RECEIVER_2_4G`; copied from the compiled Kconfig variant                              |

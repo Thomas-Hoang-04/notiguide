@@ -8,42 +8,23 @@ transmit *and* **nRF24L01 / nRF24L01+** 2.4 GHz transmit. Band
 selection is a per-dispatch decision made on each inbound
 `cmd/transmit`, not a Kconfig gate.
 
-This guide is the **only** transmitter contract going forward — the
-older backend-only prep was merged into §H and removed. Section H is
-the backend implementation plan; sections A–G describe the firmware;
-sections I–K cover firmware build config, audit, and self-
-verification.
+This guide is the standalone transmitter-hub implementation plan.
+Sections A–G define firmware behavior and code structure; sections H–I
+capture the backend contract the firmware depends on and the
+firmware-side build configuration.
 
-This guide stands on top of:
+Everything load-bearing that the transmitter firmware reuses from
+sibling receiver/backend docs has been copied or restated here. Related
+repo docs may still exist, but no implementation step below requires
+them.
 
-- **Receiver design guide** — `docs/planned/RECEIVER_ESP32C3_DESIGN_GUIDE.md`.
-  The radio peer at the other end of every dispatch. The transmitter
-  reuses the receiver's Wi-Fi (§G.3), MQTT framing (§G.4), HTTP
-  provisioning (§G.5), nRF24 register knowledge (§G.7), and mbedTLS
-  identity (§G.10) verbatim; receiver-side material is referenced, not
-  duplicated.
-- **Device Integration Implementation Plan** —
-  `docs/planned/Device Integration Implementation Plan.md`. Owns
-  the unified `device` domain end-to-end (receivers **and** transmitter
-  hubs): schema, enrollment tokens, signing-key plumbing, RF-code
-  shape, lifecycle, queue-side dispatch broadcaster, transmitter
-  bootstrap intake, heartbeat ingestion, active-hub election, and the
-  dispatch consumer. §H below originated the backend slice for the
-  transmitter hub and has since been folded into that plan; treat the
-  implementation plan as the source of truth and §H here as a
-  duplicate kept for firmware-side context only.
+Reference baselines:
 
-Cross-refs:
-
-- SDK reference: `docs/walkthrough/ESP_IDF_SDK_REFERENCE.md` (the only
-  checked-in indexed ESP-IDF reference in this workspace as of this
-  audit; no `transmitter/` or `receiver-esp32/` copy is present)
-- SDK root: `/home/thomas/esp/v6.0/esp-idf` (v6.0.0)
-- ESP-MQTT headers (managed component used by both firmwares):
-  `transmitter/managed_components/espressif__mqtt/include/mqtt_client.h`
-- Datasheets:
-  - `docs/walkthrough/nRF24L01P_PS_v1.0.txt` — nRF24L01+ PS v1.0
-  - `docs/walkthrough/nRF24L01_Product_Specification_v2_0-9199.txt` — nRF24L01 PS v2.0 (legacy)
+- ESP-IDF v6.0 SDK reference: `docs/walkthrough/ESP_IDF_SDK_REFERENCE.md`
+  (mirrored into `transmitter/ESP_IDF_SDK_REFERENCE.md` for Dev Container use)
+- ESP-MQTT 1.0.0 headers: `transmitter/managed_components/espressif__mqtt/include/mqtt_client.h`
+- nRF24L01+ PS v1.0: `docs/nrf24/nRF24L01P_PS_v1.0.txt`
+- nRF24L01 PS v2.0 (legacy): `docs/nrf24/nRF24L01_Product_Specification_v2_0-9199.txt`
 
 This document describes the **target end state**. The current
 `transmitter/` repo snapshot is a fresh ESP-IDF skeleton: `main.c` is
@@ -51,7 +32,7 @@ an empty `app_main`, and only an RC-Switch-style 433 MHz pulse engine
 exists under `main/rf/` (`rf_common.h`, `rf_data.c`, `rf_timer.c`,
 `rf_transmitter.c`).
 
-**Last updated:** 2026-04-27 (audit fixes: SDK refs, replay order, 433 completion, nRF24 channel bounds)
+**Last updated:** 2026-04-30
 
 ---
 
@@ -59,17 +40,15 @@ exists under `main/rf/` (`rf_common.h`, `rf_data.c`, `rf_timer.c`,
 
 Scope:
 
-1. SoftAP provisioning and local recovery — same wire format as the
-   receiver (Receiver §F.4).
-2. Backend registration plus challenge-response activation — same
-   `activate-v1|...` canonical, different bootstrap topic namespace
-   (`transmitter/...`, §E.1).
+1. SoftAP provisioning and local recovery over a small local HTTP API.
+2. Backend registration plus challenge-response activation using the
+   bootstrap envelopes and `activate-v1|...` canonical defined in §E.3.
 3. Post-activation operation: subscribe to dispatch commands, broadcast
    the requested RF code on the requested band, and publish a periodic
    heartbeat so the per-store hub election (§H.7.4) sees the unit live.
-4. Remote deactivation: `suspend`, `resume`, `decommission` — same
-   `deact-v1|...` canonical as the receiver, applied to the hub's own
-   topic family.
+4. Remote deactivation with the signed
+   `deact-v1|<public_id>|<command_id>|<action>|<issued_at>` lifecycle
+   command defined in §E.3.
 
 Key behavioural difference from the receiver:
 
@@ -102,7 +81,8 @@ boot ─► load NVS ─► wifi config missing?
                                      pending → narrow to bootstrap/{cid}
                                      rejected ─► erase enroll_token ─► SoftAP recovery
                                      challenge ─► sign response ─► wait result
-                                     result    ─► persist public_id, device_name,
+                                     result    ─► persist public_id,
+                                                 assigned_device_name → device_name,
                                                  op_state=ACTIVE,
                                                  erase enroll_token,
                                                  restart MQTT with client_id=public_id
@@ -142,17 +122,17 @@ Derived, not stored:
 - `RECOVERY_REQUIRED` = `wifi_ssid` present, `op_state` missing,
   `enroll_token` missing.
 
-There is no `rx_type` on this device — the hub always carries both
-radios — so the receiver's compiled-vs-stored mismatch path
-(Receiver §A.2) does not exist here.
+There is no stored radio-variant field on this device. The hub always
+carries both radios, so firmware never enters a compiled-vs-stored
+variant mismatch recovery branch.
 
 ### A.3 Reprovision
 
-Same model as the receiver (Receiver §A.3): erase `device_cfg`, keep
-`identity`. The EC keypair persists, so the backend can recognise the
-physical hub across reactivations; the next activation mints a fresh
-`hub-XXXXX` `public_id`, orphaning any retained `cmd/deact` on the
-old topic.
+Reprovision erases the `device_cfg` namespace and keeps `identity`.
+The EC keypair therefore persists across reactivations, so the backend
+can still recognize the physical hub. The next activation mints a fresh
+`hub-XXXXX` `public_id`, orphaning any retained `cmd/deact` on the old
+topic automatically.
 
 ---
 
@@ -175,7 +155,7 @@ dual-radio in firmware.
 ### B.2 Band selection from the dispatch envelope
 
 `cmd/transmit` carries `rf_code_hex`, `rf_code_bits`, and an explicit
-`band`. Per the Device Integration Plan §2.4 validation table:
+`band`. This transmitter contract pins the following width rules:
 
 - `RECEIVER_433M` and `RECEIVER_433M_PASSIVE`: `rf_code_bits ∈ [1, 32]`,
   `hex_len == 2 * ceil(bits / 8)`. The bytes are the application-layer
@@ -196,28 +176,30 @@ it on the backend.
 ### B.3 Transmit semantics
 
 - **433 MHz**: rebuild the integer plaintext from the hex (big-endian,
-  `byte_len = ceil(bits/8)`, only the bottom `bits` LSBs significant —
-  Device Integration Plan §3.1 schema comment), encode as a pulse train with the
+  `byte_len = ceil(bits/8)`, only the bottom `bits` are significant),
+  encode as a pulse train with the
   active RC-Switch-family protocol, repeat `TX_REPEAT_COUNT` times,
   release GPIO (§G.6). The rf_code bytes are an application-layer
-  match value — the receiver's MCU-side matcher compares the decoded
-  pulse-train value against its stored rf_code.
+  match value. There is no separate toggle payload on this path: the
+  transmitted 433 MHz frame itself is what the receiver's MCU-side
+  matcher decodes and compares against its stored rf_code.
 - **2.4 GHz**: the dispatch's `rf_code_hex` is the destination
-  receiver's 5-byte nRF24 address (Device Integration Plan §2.4 — `bits == 40`,
+  receiver's 5-byte nRF24 address (`bits == 40`,
   `byte_len == 5`). The hub writes those 5 bytes to **both** `TX_ADDR`
   and `RX_ADDR_P0` (auto-ACK requires `RX_ADDR_P0 == TX_ADDR`),
   loads the firmware-defined fixed `TOGGLE_MAGIC = {0xAA, 0x55}`
   payload into the TX FIFO with `W_TX_PAYLOAD`, pulses `CE` ≥ 10 µs
   (datasheet §6.1.7 Thce), waits for `TX_DS` or `MAX_RT` via IRQ, and
   returns the chip to Power-Down (§G.7). The address is per-dispatch;
-  no nRF24 address ever lives in hub firmware or hub Kconfig.
+  no nRF24 address ever lives in hub firmware or hub Kconfig. This
+  fixed payload exists only on the 2.4 GHz path.
 - Stop semantics: a `DEVICE_STOP_REQUESTED` event becomes another
   `cmd/transmit` carrying the same `rf_code_hex`. The receiver's
-  matcher (Receiver §G.8) toggles vibrator state on every qualifying
-  match — for 433M that means the same bitwise comparison; for 2.4G
-  that means another address-matched + magic-validated frame. The
-  hub never emits a distinct "stop" frame and does not vary the
-  payload by request kind.
+  firmware toggles its actuator on every qualifying match — for 433M
+  that means the same decoded-value comparison; for 2.4G that means
+  another address-matched + magic-validated frame. The hub never emits
+  a distinct "stop" frame and does not vary the payload by request
+  kind.
 
 The latency budget is band-specific. For nRF24, the firmware target is
 **< 250 ms from broker delivery to RF off-air**: signature verify
@@ -239,15 +221,15 @@ main/
 ├── config/
 │   └── device_config.[ch]   NVS I/O, schema, reprovision (TRANSMITTER variant)
 ├── network/
-│   ├── wifi.[ch]            STA + SoftAP + WPA3-Compat (reuses receiver §G.3)
-│   ├── mqtt.[ch]            mqtts client + topic router (reuses receiver §G.4)
+│   ├── wifi.[ch]            STA + SoftAP + WPA3-compatible handling
+│   ├── mqtt.[ch]            mqtts client + topic router + phase restart
 │   ├── heartbeat.[ch]       periodic 10 s publisher (§G.9)
 │   └── certs/mqtt_ca.pem    broker CA (embedded via EMBED_TXTFILES)
 ├── provision/
 │   ├── http_server.[ch]
 │   └── index.html[.gz]      embedded UI (gzip-embedded asset)
 ├── security/
-│   └── device_identity.[ch] device EC P-256 + pinned backend pubkey (reuses receiver §G.10)
+│   └── device_identity.[ch] device EC P-256 + pinned backend pubkey
 ├── dispatch/
 │   ├── dispatch.[ch]        cmd/transmit handler: verify, route, ack
 │   └── radio_supervisor.[ch] start/suspend/resume/deinit per radio (§G.2)
@@ -257,17 +239,17 @@ main/
 │   ├── rf_timer.c           unchanged
 │   └── rf_transmitter.c     unchanged
 └── nrf24/
-    ├── nrf24_regs.h         reused from receiver §G.7.2 with one PTX-only
-    │                        addition: `NRF_DYNPD_P0 (1U << 0)` for the
-    │                        ACK-receiving pipe (§G.7).
+    ├── nrf24_regs.h         local register + command definitions for the
+    │                        PTX driver, including `NRF_DYNPD_P0 (1U << 0)`
+    │                        for the ACK-receiving pipe (§G.7)
     ├── nrf24_transmitter.h  PTX-shaped public C API (§G.7)
     └── nrf24_transmitter.c  SPI driver in PTX mode (§G.7)
 ```
 
-The receiver's `trigger/`, `rf/rf_receiver.c`, `vibrator/`, and the
-matcher (`trigger/rf_trigger.c`) are absent — none of those modules
-have a transmitter analogue. `dispatch/` is new and replaces the
-receiver's `trigger/`.
+Modules intentionally absent on the hub: `trigger/`,
+`rf/rf_receiver.c`, `vibrator/`, and any local RF matcher. The hub
+never listens for RF and never actuates locally. `dispatch/` is the
+hub-side control entrypoint instead.
 
 Coupling rule:
 
@@ -280,14 +262,13 @@ Coupling rule:
 ### C.1 Pin map (default Kconfig)
 
 ESP32-C3 exposes 22 GPIO numbers (0–21), but board/module wiring and
-boot strapping still matter. Avoid GPIO18/19 when USB-Serial-JTAG is
-needed. Both radios are on the board simultaneously, so the pin map is
-the union of the receiver's two radio configurations, with one swap to
-free a GPIO:
+boot strapping still matter. Both radios are on the board
+simultaneously, so the default map keeps the 433 MHz and nRF24
+interfaces on separate pins without introducing a runtime mux:
 
 | Signal             | Default GPIO | Notes                                 |
 | ------------------ | ------------ | ------------------------------------- |
-| `RF433_TX_GPIO`    | 4            | push-pull out (was the receiver's RX) |
+| `RF433_TX_GPIO`    | 4            | push-pull 433 MHz data out            |
 | `NRF24_SPI_HOST`   | `SPI2_HOST`  | only general-purpose SPI host on C3   |
 | `NRF24_SCK`        | 6            | SPI clock                             |
 | `NRF24_MOSI`       | 7            | SPI MOSI                              |
@@ -296,11 +277,10 @@ free a GPIO:
 | `NRF24_CE`         | 3            | chip-enable                           |
 | `NRF24_IRQ`        | 1            | active-low TX_DS / MAX_RT IRQ         |
 
-Strapping-pin and USB-pin advisories from Receiver §C.1 still apply.
-GPIO2 is acceptable for SPI MISO only if the board keeps the boot
-strap at its required level and the nRF24 MISO line is high-impedance
-while CSN stays high at reset. No vibrator GPIO; the hub has no local
-actuator.
+Avoid GPIO18/19 when USB-Serial-JTAG is needed. GPIO2 is acceptable
+for SPI MISO only if the board keeps the required boot level and the
+nRF24 MISO line is high-impedance while CSN stays high at reset. No
+vibrator GPIO exists on this board; the hub has no local actuator.
 
 ### C.2 Radio gate
 
@@ -312,10 +292,9 @@ flash on a single-band board population, but v1 ships dual.
 
 ## D. NVS Schema
 
-Two namespaces, same NVS rules and 15-char key limit as the receiver.
+Two namespaces. Keys stay within the NVS 15-character limit.
 
 **Namespace `identity`** — device EC keypair; survives reprovision.
-Same shape as Receiver §D:
 
 | Key       | Type   | Notes                    |
 | --------- | ------ | ------------------------ |
@@ -323,8 +302,8 @@ Same shape as Receiver §D:
 | `privkey` | `blob` | DER EC P-256 private key |
 
 **Namespace `device_cfg`** — runtime config plus activation state;
-wiped on reprovision. The hub schema is **smaller than the receiver's**
-because there is no per-device RF code stored on the hub:
+wiped on reprovision. The hub schema omits any per-device RF-code
+storage:
 
 | Key             | Type  | Written by         | Notes                                                                |
 | --------------- | ----- | ------------------ | -------------------------------------------------------------------- |
@@ -334,18 +313,19 @@ because there is no per-device RF code stored on the hub:
 | `mqtt_uri`      | `str` | provisioning       | must be `mqtts://...`                                                |
 | `mqtt_user`     | `str` | provisioning       | shared broker credential                                             |
 | `mqtt_pwd`      | `str` | provisioning       | shared broker credential                                             |
-| `enroll_token`  | `str` | provisioning       | erased after successful activation or terminal bootstrap failure     |
+| `enroll_token`  | `str` | provisioning       | admin-issued single-use authorization; erased after activation or terminal bootstrap failure |
 | `public_id`     | `str` | activation         | backend-minted `hub-XXXXX`                                           |
 | `device_name`   | `str` | activation         | backend-assigned human label                                         |
 | `op_state`      | `u8`  | activation + MQTT  | `ACTIVE`, `SUSPENDED`, `DECOMMISSIONED`                              |
 | `last_deact_id` | `str` | `cmd/deact` MQTT   | most recent applied lifecycle `command_id` for replay suppression    |
 
-Removed compared to Receiver §D: `rx_type`, `rf_code`, `rf_code_bits`,
-`rf_code_ver`. The hub never stores a code.
+Not present on the hub: `rx_type`, `rf_code`, `rf_code_bits`,
+`rf_code_ver`. The hub never stores a per-device RF code.
 
-`last_deact_id` keeps the same semantics as on the receiver: rules
-from Receiver §F.2 ("If `command_id == last_deact_id`, republish the
-prior ack and skip side effects") apply unchanged.
+`last_deact_id` suppresses lifecycle-command replays: if an inbound
+`cmd/deact` carries the same `command_id` as the persisted
+`last_deact_id`, the hub republishes the prior lifecycle ack and skips
+all state changes.
 
 **Dispatch-replay rule.** The hub does **not** persist `dispatch_id`s
 to NVS — they are bursty and ephemeral. Replay suppression for
@@ -357,8 +337,17 @@ the ring; this is acceptable because broker reconnection re-delivers
 only un-acked QoS 1 messages and `cmd/transmit` is **not retained**
 (§E.1), so a stale broadcast cannot replay across a reboot.
 
-Encryption-at-rest, atomic-commit, and "never log secrets" rules from
-Receiver §D apply verbatim.
+Implementation rules:
+
+- `public_id`, `device_name`, `op_state`, and `enroll_token` changes
+  committed during activation must land in one `nvs_commit()`.
+- `last_deact_id` must be committed before the lifecycle ack is
+  published.
+- Never log `mqtt_pwd`, `enroll_token`, private-key material, or signed
+  dispatch plaintext.
+- The checked-in config enables NVS encryption and HMAC-backed key
+  protection; the namespace layout above does not change when encryption
+  is on.
 
 ---
 
@@ -386,8 +375,6 @@ state before processing fresh transmits.
 
 ### E.2 Security
 
-Same model as Receiver §E.2:
-
 - All MQTT traffic is `mqtts://` only; provisioning rejects non-TLS
   URIs and firmware refuses to connect if `mqtt_uri` does not start
   with `mqtts://`.
@@ -401,7 +388,20 @@ Same model as Receiver §E.2:
 
 All wire payloads carry `"schema_version": 1`.
 
-**Provisioning** (`POST /api/provision`): identical to Receiver §E.3.
+**Provisioning** (`POST /api/provision`):
+
+```json
+{
+  "schema_version": 1,
+  "wifi": { "ssid": "OfficeWiFi", "password": "super-secret" },
+  "mqtt": {
+    "broker_uri": "mqtts://broker.example.com:8883",
+    "username": "shared-transmitter-user",
+    "password": "shared-transmitter-password"
+  },
+  "enrollment": { "token": "<opaque string>" }
+}
+```
 
 **Registration** (`transmitter/bootstrap/register`):
 
@@ -418,15 +418,86 @@ All wire payloads carry `"schema_version": 1`.
 ```
 
 The discriminator field is `"kind"`, set to the literal
-`TRANSMITTER_HUB`. The receiver-plan generalisation in §H.7.1 routes
-this through the same `DeviceRegistrationService` with a
-`DeviceFamily = TRANSMITTER` discriminator inferred from the topic;
-the firmware does not need to know about that.
+`TRANSMITTER_HUB`.
 
-**Bootstrap envelopes** (`pending`, `challenge`, `rejected`,
-`response`, `result`): byte-identical to Receiver §E.3, including the
-canonical `activate-v1|...` (Receiver §2.3, reused unchanged here —
-see §H.3). Only the topic namespace changes.
+All bootstrap envelopes share the topic
+`transmitter/bootstrap/{challenge_id}`. Direction is inferred from
+`type`: `pending`, `challenge`, `rejected`, and `result` are
+backend-originated; `response` is hub-originated. Both sides ignore
+any envelope whose `type` they own.
+
+**Pending** (`type: "pending"`):
+
+```json
+{
+  "schema_version": 1,
+  "type": "pending",
+  "challenge_id": "6b99a4cb-2fc0-4559-8ae4-4ad65f8f8e0d",
+  "registration_nonce": "hG7aK2pQcR",
+  "issued_at": "2026-04-29T12:00:00Z"
+}
+```
+
+**Rejected** (`type: "rejected"`):
+
+```json
+{
+  "schema_version": 1,
+  "type": "rejected",
+  "challenge_id": "6b99a4cb-2fc0-4559-8ae4-4ad65f8f8e0d",
+  "reason": "admin_rejected"
+}
+```
+
+**Challenge** (`type: "challenge"`):
+
+```json
+{
+  "schema_version": 1,
+  "type": "challenge",
+  "challenge_id": "6b99a4cb-2fc0-4559-8ae4-4ad65f8f8e0d",
+  "registration_nonce": "hG7aK2pQcR",
+  "nonce": "QzZ3eUNhWmVQWGhJd0V1TQ",
+  "issued_at": "2026-04-29T12:00:00Z",
+  "expires_at": "2026-04-29T12:05:00Z",
+  "purpose": "activate-v1"
+}
+```
+
+Canonical string signed by the hub:
+
+```text
+activate-v1|<challenge_id>|<nonce>|<issued_at>|<expires_at>
+```
+
+**Response** (`type: "response"`):
+
+```json
+{
+  "schema_version": 1,
+  "type": "response",
+  "challenge_id": "6b99a4cb-2fc0-4559-8ae4-4ad65f8f8e0d",
+  "signature_b64": "BASE64_SIGNATURE"
+}
+```
+
+**Activation result** (`type: "result"`):
+
+```json
+{
+  "schema_version": 1,
+  "type": "result",
+  "challenge_id": "6b99a4cb-2fc0-4559-8ae4-4ad65f8f8e0d",
+  "status": "active",
+  "public_id": "hub-7Q4KZ",
+  "assigned_device_name": "Front Desk Transmitter Hub"
+}
+```
+
+The hub persists `public_id`, stores `assigned_device_name` into the
+local `device_name` field, sets `op_state = ACTIVE`, clears
+`enroll_token`, then restarts MQTT so the operational session comes up
+with `client_id = public_id`.
 
 **Dispatch** (`transmitter/hub/{public_id}/cmd/transmit`, **not
 retained**, signed by the backend with the pinned EC key):
@@ -444,7 +515,7 @@ retained**, signed by the backend with the pinned EC key):
 }
 ```
 
-Canonical string for signing (the §H.4 amendment):
+Canonical string for signing:
 
 ```text
 transmit-v1|<hub_public_id>|<dispatch_id>|<receiver_public_id>|<band>|<rf_code_hex>|<rf_code_bits>|<issued_at>
@@ -454,7 +525,7 @@ Validation order on the hub:
 
 1. JSON shape, `schema_version == 1`, all required fields present.
 2. `band ∈ { "433M", "2_4G" }`.
-3. Width per band (mirrors Device Integration Plan §2.4 exactly):
+3. Width per band:
    - `433M`: `bits ∈ [1, 32]`, `hex_len == 2 * ceil(bits/8)`.
    - `2_4G`: `bits == 40`, `hex_len == 10` — the bytes are the
      destination receiver's `RX_ADDR_P1`. The hub does not own a
@@ -470,10 +541,26 @@ Validation order on the hub:
    or width mismatch — `ack_for = "transmit"`, no RF emission.
 
 **Deactivation** (`transmitter/hub/{public_id}/cmd/deact`, retained):
-byte-identical to Receiver §E.3 — same `deact-v1|public_id|command_id|action|issued_at`
-canonical, same `action ∈ {suspend, resume, decommission}`. The
-firmware applies the action to its own persistent state; there is no
-RF impact.
+
+```json
+{
+  "schema_version": 1,
+  "action": "suspend",
+  "command_id": "2f1c4b40-8b6b-4d17-9c43-2d4b98c7ce71",
+  "issued_at": "2026-04-29T12:20:00Z",
+  "signature_b64": "BACKEND_ECDSA_SIGNATURE"
+}
+```
+
+Canonical string for lifecycle signing:
+
+```text
+deact-v1|<public_id>|<command_id>|<action>|<issued_at>
+```
+
+Legal actions are `suspend`, `resume`, and `decommission`. The firmware
+applies the action to its own persistent state; there is no RF side
+effect.
 
 **Heartbeat** (`transmitter/hub/{public_id}/heartbeat`, QoS 0, not
 retained):
@@ -506,11 +593,25 @@ Status values:
 
 ### E.4 Cryptography
 
-Same as Receiver §E.4: device EC P-256 keypair on first boot, signed
-with `SHA256withECDSA`; backend pins its EC P-256 public half via
-`CONFIG_TRANSMITTER_BACKEND_PUBKEY_B64`. §H.7.0 confirms one signing
-key covers both fleets, so the dev-time PEM workflow from Receiver
-§I.2 is reused unchanged.
+Two EC P-256 keypairs are in play:
+
+1. **Hub keypair** — generated on first boot, stored in the `identity`
+   NVS namespace, used only to sign the activation challenge. Public
+   half is sent in the registration envelope.
+2. **Backend command-signing keypair** — generated offline. The private
+   half stays on the backend and signs every operational command. The
+   public half is pinned in firmware via
+   `CONFIG_TRANSMITTER_BACKEND_PUBKEY_B64`.
+
+Common settings:
+
+- Curve: `secp256r1` / `MBEDTLS_ECP_DP_SECP256R1`
+- Signature algorithm: `SHA256withECDSA`
+- Hub key storage: DER blobs in NVS
+- Hub public key on wire: DER → base64
+- Backend public key in firmware: base64-encoded DER, parsed once at
+  boot
+- Activation nonce: at least 16 random bytes before base64url
 
 ### E.5 Heartbeat cadence and backoff
 
@@ -551,7 +652,8 @@ key covers both fleets, so the dev-time PEM workflow from Receiver
        on matching pending: narrow to transmitter/bootstrap/{challenge_id}
        on challenge: sign and publish response
        on result:
-         persist public_id, device_name, op_state=ACTIVE
+         persist public_id, assigned_device_name -> device_name,
+         op_state=ACTIVE
          erase enroll_token
          restart MQTT with client_id=public_id
 9. after IP_EVENT_STA_GOT_IP:
@@ -567,7 +669,7 @@ key covers both fleets, so the dev-time PEM workflow from Receiver
 Step 6 brings both radios up to **idle** (433 GPIO low, nRF24 powered
 down with `PWR_UP=0`). Each `cmd/transmit` then briefly raises the
 chosen radio out of idle, emits, returns it to idle. This avoids the
-receiver's continuous-RX power profile and keeps the chips cool when
+power draw of any always-on receive mode and keeps the chips cool when
 no dispatches are in flight.
 
 ### F.2 `cmd/transmit` handling
@@ -601,8 +703,10 @@ purposes — operations triage it via the device-detail page.
 
 ### F.3 `cmd/deact` handling
 
-Mirrors Receiver §F.2 deactivation block exactly; the only differences
-are the topic namespace and the side-effects on the heartbeat task:
+Lifecycle handling is simple on the hub because there is no RF-code
+state to preserve. The topic namespace is `transmitter/hub/{public_id}`
+and the only runtime side-effect beyond persistence is heartbeat
+start/stop:
 
 - `suspend` → `op_state = SUSPENDED`, `heartbeat_stop()`,
   persist `last_deact_id`, ack `ok`.
@@ -614,8 +718,7 @@ are the topic namespace and the side-effects on the heartbeat task:
 - `command_id == last_deact_id` → ack the prior result, no state
   change.
 
-All NVS commits happen **before** the ack publish (Receiver §F.2
-invariant kept).
+All NVS commits happen **before** the ack publish.
 
 ### F.4 Heartbeat task
 
@@ -628,10 +731,34 @@ deletes the task and closes the publish path.
 
 ### F.5 Failure and recovery cases
 
-Cases shared with the receiver — Wi-Fi repeatedly fails, pending
-envelope received, rejected envelope received, challenge or result
-timeout — apply unchanged from Receiver §F.3. The hub's transmit
-path adds two:
+**Wi-Fi repeatedly fails**
+
+- After the configured retry budget is exhausted, stop the STA attempt
+  and return to SoftAP recovery with the existing credentials still
+  intact. The recovery UI can then either retry or accept fresh Wi-Fi /
+  MQTT / enrollment data.
+
+**Pending envelope received**
+
+- Confirm `registration_nonce` matches the in-RAM bootstrap session.
+- Narrow the subscription from `transmitter/bootstrap/+` to the exact
+  `transmitter/bootstrap/{challenge_id}` topic.
+- Do not write NVS yet.
+
+**Rejected envelope received**
+
+- Wipe the in-RAM bootstrap session.
+- Erase `enroll_token`.
+- Unsubscribe from bootstrap and return to SoftAP recovery in place.
+
+**Challenge or result timeout**
+
+- Do not blindly republish registration because the token may already
+  be consumed.
+- After the bootstrap timeout expires, erase `enroll_token` and return
+  to SoftAP recovery, requiring a fresh token or factory reset.
+
+The hub's transmit path adds two more cases:
 
 **`cmd/transmit` while suspended or decommissioned**
 
@@ -651,25 +778,35 @@ path adds two:
   `nrf_probe_chip` returns `NRF_CHIP_UNKNOWN`) is **not** fatal: the
   hub continues in 433-only mode and acks `rejected` with
   `reason = "no_2_4g_radio"` for any `band=2_4G` dispatch. Logged
-  once at `ERROR`. (Surfacing this into the heartbeat is deferred —
-  see §J.4.)
+  once at `ERROR`. Surfacing this into the heartbeat is deferred
+  (§H.10).
 
 ### F.6 SoftAP and local provisioning
 
-Reused from Receiver §F.4 verbatim. Only renames:
+- SSID: `TRANSMITTER-SETUP-<last_3_mac_bytes_hex>`
+- `max_connection = 1`
+- channel: `CONFIG_TRANSMITTER_AP_CHANNEL`
+- password: `CONFIG_TRANSMITTER_AP_PASSWORD`
+- auth mode: WPA3-compatible SoftAP (`authmode = WIFI_AUTH_WPA2_PSK`,
+  `wpa3_compatible_mode = 1`)
+- HTTP server runs only in SoftAP mode
+- Endpoints:
+  - `GET /` — provisioning UI
+  - `GET /api/status` — local status summary
+  - `POST /api/provision`
+  - `POST /api/retry`
+  - `POST /api/reset`
 
-- SSID prefix: `TRANSMITTER-SETUP-<last_3_mac_bytes_hex>`
-- Kconfig prefix: `CONFIG_TRANSMITTER_*` instead of `CONFIG_RECEIVER_*`
-
-Endpoints, payload shapes (`POST /api/provision`, `/api/retry`,
-`/api/reset`), and SoftAP security (WPA2-PSK with WPA3-compat) are
-unchanged.
+On successful `POST /api/provision`: validate fields, write NVS, return
+HTTP 200, set the `PROV_DONE` event, and restart after a short delay.
 
 ### F.7 Power management
 
-Same rules as Receiver §F.5: `WIFI_PS_MIN_MODEM` only after
-`IP_EVENT_STA_GOT_IP`, MQTT keepalive 120 s, no deep sleep, never
-`esp_wifi_stop()` in `ACTIVE`/`SUSPENDED`/`DECOMMISSIONED`.
+- `esp_wifi_set_ps(WIFI_PS_MIN_MODEM)` only after `IP_EVENT_STA_GOT_IP`
+- MQTT keepalive stays at 120 seconds
+- No deep sleep in v1; it breaks the low-latency control session model
+- Do not call `esp_wifi_stop()` in the steady operational states
+  `ACTIVE`, `SUSPENDED`, or `DECOMMISSIONED`
 
 The hub adds one rule: nRF24 stays in `Power-Down` (`PWR_UP = 0`)
 between dispatches. Each `band=2_4G` transmit walks the chip
@@ -683,26 +820,26 @@ budget in §B.3.
 
 ## G. ESP-IDF v6 Code Guide
 
-Snippets elide error handling. ESP-IDF API surfaces match those used
-by the receiver firmware in `receiver-esp32/main/`, validated against
-`docs/walkthrough/ESP_IDF_SDK_REFERENCE.md` (and Context7 for upstream
-docs that postdate the in-repo snapshot).
+Snippets elide error handling. ESP-IDF API surfaces were validated
+against `docs/walkthrough/ESP_IDF_SDK_REFERENCE.md`, the checked-in
+ESP-MQTT header under `transmitter/managed_components/`, and Context7
+for the current upstream v6 guidance.
 
 ### G.1 NVS
 
-Same as Receiver §G.1: `nvs_open("device_cfg", NVS_READWRITE, &h)`,
-`nvs_set_str / set_u8 / commit`. First boot: `nvs_flash_init()` →
-on `ESP_ERR_NVS_NO_FREE_PAGES` / `_NEW_VERSION_FOUND` →
-`nvs_flash_erase()` + retry. The final firmware config must enable
-`CONFIG_NVS_ENCRYPTION=y` and
-`CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y` through `sdkconfig.defaults`
-or `menuconfig`; this checkout does not currently include a
-`transmitter/sdkconfig` file.
+The transmitter uses the normal ESP-IDF NVS pattern:
+`nvs_open("device_cfg", NVS_READWRITE, &h)`, `nvs_set_str`,
+`nvs_set_u8`, `nvs_set_blob`, and `nvs_commit()`. First boot follows
+the standard recovery path: `nvs_flash_init()` and, on
+`ESP_ERR_NVS_NO_FREE_PAGES` or `_NEW_VERSION_FOUND`,
+`nvs_flash_erase()` plus one retry. The checked-in `transmitter/sdkconfig`
+already enables `CONFIG_NVS_ENCRYPTION=y` and
+`CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y`; if this project later adds
+`sdkconfig.defaults`, keep those settings pinned there too.
 
 ### G.2 Radio supervisor — dual-radio dispatch
 
-Unlike the receiver's Kconfig-gated supervisor (Receiver §G.2), the
-hub supervisor is a **switch on `band`**, not a `#if`:
+The hub supervisor is a **switch on `band`**, not a Kconfig gate:
 
 ```c
 // dispatch/radio_supervisor.h
@@ -720,8 +857,8 @@ esp_err_t radio_supervisor_deinit(void);
 //                      that the receiver MCU matches at app layer.
 //                      `bits` is the significant width.
 //   RADIO_BAND_2_4G : `payload` = the destination receiver's 5-byte
-//                      nRF24 address (Device Integration Plan §2.4 fixes
-//                      bits == 40, byte_len == 5). `bits` is 40.
+//                      nRF24 address. `bits` is always 40 and
+//                      `byte_len` is always 5.
 typedef enum { RADIO_BAND_433M = 0, RADIO_BAND_2_4G = 1 } radio_band_t;
 
 esp_err_t radio_tx_send(radio_band_t band,
@@ -751,10 +888,10 @@ esp_err_t radio_tx_send(radio_band_t band, const uint8_t *p, size_t n, uint8_t b
     if (band == RADIO_BAND_433M) {
         r = rf433_tx_send_bits(&s_rf, p, n, bits);
     } else {
-        // Width must be 40 / 5 bytes (Device Integration Plan §2.4) — caller is
-        // expected to have pre-validated this against the §E.3 width
-        // table. nrf24_tx_send writes the address to TX_ADDR +
-        // RX_ADDR_P0 internally and sends the fixed TOGGLE_MAGIC.
+        // Width must be 40 / 5 bytes. Caller is expected to have
+        // pre-validated this against the §E.3 width table.
+        // nrf24_tx_send writes the address to TX_ADDR + RX_ADDR_P0
+        // internally and sends the fixed TOGGLE_MAGIC.
         if (n != 5 || bits != 40) {
             r = ESP_ERR_INVALID_ARG;
         } else if (!s_have_nrf) {
@@ -773,46 +910,282 @@ nRF24 emissions never overlap and peak current stays bounded. It does
 not coordinate with the ESP32-C3 Wi-Fi radio; nRF24/Wi-Fi coexistence
 is handled by channel choice, short airtime, and normal retry behavior.
 
-### G.3 Wi-Fi
+### G.3 Wi-Fi — STA + SoftAP + WPA3-Compatible
 
-Reuse Receiver §G.3 verbatim (STA + SoftAP + WPA3-Compatible Mode).
-Only renames: `CONFIG_TRANSMITTER_AP_*`, SSID prefix
-`TRANSMITTER-SETUP-`. The functions `wifi_start_sta`,
-`wifi_start_softap`, the event handler split (`WIFI_EVENT` vs
-`IP_EVENT`), the `failure_retry_cnt` + `WIFI_ALL_CHANNEL_SCAN`
-pairing, the `pmf_cfg.capable` deprecation, and the post-STA-GOT_IP
-power-save rule all carry over. No changes.
+ESP-IDF v6 requires `esp_netif` and separate event bases. The STA path
+below uses the v6 WPA3-compatible flags explicitly: the current config
+keeps `disable_wpa3_compatible_mode = 0`, so a WPA3-capable AP can
+negotiate SAE while WPA2-only networks still work. PMF is still
+configured through `pmf_cfg`; this guide treats it as the live control
+surface and does not rely on any receiver-side shorthand.
+
+```c
+#include "esp_wifi.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+
+static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data) { /* ... */ }
+static void on_ip  (void *arg, esp_event_base_t base, int32_t id, void *data) { /* ... */ }
+
+static esp_netif_t *s_sta_netif;
+static esp_netif_t *s_ap_netif;
+static bool        s_wifi_stack_ready;
+
+static void wifi_init_common(void) {
+    if (s_wifi_stack_ready) return;
+    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP, on_ip, NULL));
+    s_wifi_stack_ready = true;
+}
+
+void wifi_start_sta(const device_config_t *cfg) {
+    if (!s_sta_netif) s_sta_netif = esp_netif_create_default_wifi_sta();
+    wifi_init_common();
+
+    wifi_config_t sta_cfg = {
+        .sta = {
+            .scan_method        = WIFI_ALL_CHANNEL_SCAN,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .sae_pwe_h2e        = WPA3_SAE_PWE_BOTH,
+            .pmf_cfg            = { .required = false },
+            .disable_wpa3_compatible_mode = 0,
+            .failure_retry_cnt  = CONFIG_TRANSMITTER_WIFI_MAX_RETRY,
+        },
+    };
+    strlcpy((char*)sta_cfg.sta.ssid,     cfg->wifi_ssid, sizeof sta_cfg.sta.ssid);
+    strlcpy((char*)sta_cfg.sta.password, cfg->wifi_pwd,  sizeof sta_cfg.sta.password);
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    // Caller waits for IP_EVENT_STA_GOT_IP, then calls
+    // esp_wifi_set_ps(WIFI_PS_MIN_MODEM) per §F.1 step 9.
+}
+
+void wifi_start_softap(void) {
+    if (!s_ap_netif) s_ap_netif = esp_netif_create_default_wifi_ap();
+    wifi_init_common();
+
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .channel              = CONFIG_TRANSMITTER_AP_CHANNEL,
+            .password             = CONFIG_TRANSMITTER_AP_PASSWORD,
+            .max_connection       = 1,
+            .authmode             = WIFI_AUTH_WPA2_PSK,
+            .sae_pwe_h2e          = WPA3_SAE_PWE_BOTH,
+            .pmf_cfg              = { .required = false },
+            .wpa3_compatible_mode = 1,
+        },
+    };
+    int n = snprintf((char*)ap_cfg.ap.ssid, sizeof ap_cfg.ap.ssid,
+                     "TRANSMITTER-SETUP-%02X%02X%02X", mac[3], mac[4], mac[5]);
+    ap_cfg.ap.ssid_len = n;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+```
+
+Notes:
+
+- `WIFI_IF_STA` / `WIFI_IF_AP` replace the legacy `ESP_IF_WIFI_*`.
+- The STA and SoftAP helpers share one Wi-Fi driver instance.
+  `esp_wifi_init()`, default netif creation, and event-handler
+  registration are guarded so a same-boot STA→SoftAP fallback reuses
+  the existing stack instead of initializing it twice.
+- `failure_retry_cnt` only takes effect with `WIFI_ALL_CHANNEL_SCAN`;
+  keep those two fields paired.
+- `threshold.authmode = WIFI_AUTH_WPA2_PSK` is a minimum: WPA3 and
+  mixed WPA2/WPA3 networks still qualify, while open/WEP do not.
+- `esp_wifi_set_ps(WIFI_PS_MIN_MODEM)` is applied after association and
+  IP acquisition.
+- Do not call `esp_wifi_stop()` during `ACTIVE`, `SUSPENDED`, or
+  `DECOMMISSIONED`; the hub must stay reachable for lifecycle commands.
 
 ### G.4 MQTT
 
-Reuse Receiver §G.4 verbatim, including the post-activation MQTT
-restart pattern (Receiver §G.4.1) for switching
-`client_id = ESP32_%CHIPID%` → `client_id = public_id`. Two
-firmware-side changes only:
+The `esp_mqtt_client_config_t` fields are nested in ESP-MQTT 1.0.0, and
+ESP-IDF v6 ships ESP-MQTT as a managed component. The CA PEM is
+embedded via `EMBED_TXTFILES` and exposed as a NUL-terminated C string.
 
-1. The topic-router dispatch list points at three handlers instead of
-   two:
-   - `transmitter/bootstrap/+` → `bootstrap_listener` (drops backend-
-     owned envelope types — same self-echo rule as the receiver).
-   - `transmitter/hub/{public_id}/cmd/transmit` → `dispatch_handler`
-     (§G.8).
-   - `transmitter/hub/{public_id}/cmd/deact` → `lifecycle_handler`
-     (mirrors Receiver §F.2 deact path; namespace renamed).
-2. The post-activation `subscribe_current_phase()` subscribes to
-   `transmitter/hub/{public_id}/cmd/#` and starts the heartbeat task
-   (§G.9). On disconnect, the heartbeat task drops ticks but does not
-   exit; on reconnect, ticks resume.
+```c
+#include "mqtt_client.h"
 
-`MQTT_EVENT_DATA` fragment handling (`e->total_data_len > e->data_len`
-buffer-and-reassemble) is mandatory and applies unchanged.
+extern const uint8_t ca_pem_start[] asm("_binary_mqtt_ca_pem_start");
+
+static esp_mqtt_client_handle_t s_client;
+
+static void on_mqtt(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    esp_mqtt_event_handle_t e = data;
+    switch ((esp_mqtt_event_id_t)id) {
+    case MQTT_EVENT_CONNECTED:
+        subscribe_current_phase();
+        break;
+    case MQTT_EVENT_DATA:
+        // Check total_data_len/current_data_offset/data_len and reassemble
+        // long payloads before JSON parsing.
+        topic_router_dispatch(e);
+        break;
+    default:
+        break;
+    }
+}
+
+void mqtt_start(const device_config_t *cfg) {
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker = {
+            .address = {
+                .uri = cfg->mqtt_uri,
+            },
+            .verification = {
+                .certificate = (const char*)ca_pem_start,
+                .certificate_len = 0,
+            },
+        },
+        .credentials = {
+            .username = cfg->mqtt_user,
+            .client_id = cfg->has_public_id ? cfg->public_id : NULL,
+            .set_null_client_id = false,
+            .authentication = {
+                .password = cfg->mqtt_pwd,
+            },
+        },
+        .session = {
+            .keepalive = 120,
+            .protocol_ver = MQTT_PROTOCOL_V_5,
+            .message_retransmit_timeout = 1000,
+        },
+        .network = {
+            .reconnect_timeout_ms = 5000,
+            .timeout_ms = 15000,
+            .refresh_connection_after_ms = 5 * 60 * 1000,
+        },
+        .task = {
+            .priority = 7,
+            .stack_size = 8192,
+        },
+        .buffer = {
+            .size = 2048,
+        },
+    };
+    s_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, on_mqtt, NULL);
+    esp_mqtt_client_start(s_client);
+}
+```
+
+Notes:
+
+- Reject `mqtt_uri` that does not start with `mqtts://` at config-load
+  time.
+- Keep the TCP port inside `mqtt_uri`; `broker.address.uri` takes
+  precedence over host/port split fields.
+- With `set_null_client_id = false`, a pre-activation `client_id = NULL`
+  lets ESP-MQTT synthesize its default `ESP32_%CHIPID%`. After
+  activation, reconnect with the minted `public_id`.
+- For PEM data, keep `certificate_len = 0`; the managed component
+  treats zero length plus NUL termination as the PEM/string form.
+- `MQTT_EVENT_DATA` may fragment one message across multiple events;
+  always check `total_data_len`, `current_data_offset`, and `data_len`
+  before parsing.
+- `esp_mqtt_client_publish` is thread-safe, and the managed-component
+  header documents the MQTT APIs as callable from either a user task or
+  the MQTT event callback where noted.
+- The topic router has three transmitter-specific consumers:
+  `transmitter/bootstrap/+` → `bootstrap_listener`,
+  `transmitter/hub/{public_id}/cmd/transmit` → `dispatch_handler`,
+  and `transmitter/hub/{public_id}/cmd/deact` → `lifecycle_handler`.
+
+#### G.4.1 Post-activation MQTT restart
+
+Do not switch from the bootstrap session to the operational session
+with `esp_mqtt_client_reconnect()` alone: the broker URI and shared
+credentials stay the same, but the `client_id` changes from the
+pre-activation default to the backend-minted `public_id`. In ESP-MQTT
+1.0 that means stop + destroy + init/start with the updated config.
+
+The managed-component header also documents that
+`esp_mqtt_client_stop()` cannot be called from the MQTT event handler,
+so defer the restart to a control task or application event.
+
+```c
+typedef struct {
+    char public_id[32];
+    char assigned_device_name[64];
+} activation_result_t;
+
+static TaskHandle_t s_mqtt_ctl_task;
+
+static void mqtt_restart_with_identity(const device_config_t *cfg) {
+    if (s_client) {
+        ESP_ERROR_CHECK(esp_mqtt_client_stop(s_client));
+        esp_mqtt_client_destroy(s_client);
+        s_client = NULL;
+    }
+    mqtt_start(cfg);
+}
+
+static void handle_activation_result(const activation_result_t *r) {
+    strlcpy(g_cfg.public_id,   r->public_id, sizeof g_cfg.public_id);
+    strlcpy(g_cfg.device_name, r->assigned_device_name, sizeof g_cfg.device_name);
+    g_cfg.op_state = OP_STATE_ACTIVE;
+    device_config_commit_activation(&g_cfg);
+
+    xTaskNotifyGive(s_mqtt_ctl_task);
+}
+
+static void mqtt_ctl_task(void *arg) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        mqtt_restart_with_identity(&g_cfg);
+    }
+}
+```
+
+Right after activation, the hub drops the bootstrap session,
+reconnects with `client_id = public_id`, and `subscribe_current_phase()`
+switches from `transmitter/bootstrap/+` to
+`transmitter/hub/{public_id}/cmd/#`. In the operational phase,
+`subscribe_current_phase()` also starts or stops the heartbeat task
+according to `op_state`.
 
 ### G.5 HTTP provisioning
 
-Reuse Receiver §G.5. The component registration step in
-`main/CMakeLists.txt` (§I.2) replaces `EMBED_TXTFILES` for the CA and
-`EMBED_FILES` for the gzipped UI; the existing transmitter
-`CMakeLists.txt` already declares `esp_http_server` in
-`PRIV_REQUIRES`, so no extra component is needed.
+The provisioning server is a normal ESP-IDF component. Its HTTP
+contract is the one defined in §F.6: `GET /`, `GET /api/status`,
+`POST /api/provision`, `POST /api/retry`, and `POST /api/reset`. The
+full `idf_component_register(...)` call — including `EMBED_TXTFILES`,
+`EMBED_FILES`, and `PRIV_REQUIRES` — is in §I.2.
+
+`main.c` stays a plain ESP-IDF `app_main` entry point:
+
+```c
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "config/device_config.h"
+#include "network/wifi.h"
+#include "network/mqtt.h"
+#include "dispatch/radio_supervisor.h"
+
+void app_main(void) {
+    ESP_ERROR_CHECK(nvs_init_or_recover());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    device_config_load(&g_cfg);
+    // ... §F orchestration ...
+}
+```
+
+Here `nvs_init_or_recover()` is the thin §G.1 wrapper around
+`nvs_flash_init()` plus the erase-and-retry path for
+`ESP_ERR_NVS_NO_FREE_PAGES` / `_NEW_VERSION_FOUND`.
 
 ### G.6 433 MHz transmitter — extend the existing `rf/` module
 
@@ -823,10 +1196,18 @@ production-shaped; what's missing for backend dispatch is a **bits-
 oriented** encoder that complements the existing `tristate_to_pulses`
 (PT2272 remote emulation).
 
+Within that existing `proto[]` table, protocol IDs **1..4** are the
+PT2272 / pin-compatible subset: all four are non-inverted and keep the
+same waveform shape (`sync 1:31`, `zero 1:3`, `one 3:1`), differing
+only by base pulse length (`350`, `320`, `240`, `150` µs). `PROTO_ID`
+defaults to `1` today. Protocol 5+ remain available in the RF engine
+for other 433 MHz families but are outside the PT2272-compatible
+contract this guide assumes for passive receivers.
+
 `rf_data.c`'s `tristate_to_pulses` represents each tri-state symbol
 ('0', '1', 'F') as **two** pulse-pairs — the PT2272 wire format.
 Backend `cmd/transmit` for `band=433M` carries a flat `uint32_t` of
-`bits ∈ [1, 32]` (Device Integration Plan §3.1 schema comment). Encoding it as
+`bits ∈ [1, 32]`. Encoding it as
 PT2272 tri-state would only work for codes whose 2-bit groups are in
 `{00, 01, 11}` and would silently misencode `10` groups. Don't go
 through tri-state; emit one pulse-pair per logic bit:
@@ -918,18 +1299,83 @@ table) carry over unchanged. Existing
 they are useful for bench-side remote emulation tooling and have no
 runtime cost when unused.
 
-### G.7 nRF24L01 / nRF24L01+ transmitter — adapt receiver §G.7
+### G.7 nRF24L01 / nRF24L01+ transmitter — native ESP-IDF SPI driver
 
-The register/command defines in Receiver §G.7.2 (`nrf24_regs.h`) are
-band-agnostic and reused as-is, with **one PTX-only addition** the
-receiver doesn't need: `NRF_DYNPD_P0 (1U << 0)` for enabling DPL on
-the ACK-receiving pipe (the receiver header already defines
-`NRF_DYNPD_P1` for its data pipe; pipes 2–5 stay unused). The
-chip-probe sequence in Receiver §G.7.6 is reused unchanged. What
-changes is the role: the hub is a **PTX**, not a PRX, so
-`CONFIG.PRIM_RX = 0` and the address set moves to `TX_ADDR` +
-`RX_ADDR_P0` (Receiver §G.7.7 explicitly calls out the address
-ownership table for the transmitter side).
+The hub uses the same low-level substrate on both nRF24L01 and
+nRF24L01+: SPI mode 0, MSB-first within each byte, LSByte-first for
+multi-byte address registers on the wire, one STATUS byte shifted out
+during every command, and a small FEATURE-register probe that
+distinguishes legacy vs plus silicon while unlocking FEATURE/DPL on the
+legacy part.
+
+Minimal shared definitions that must exist in `nrf24_regs.h` and the
+driver's private helpers:
+
+```c
+typedef enum {
+    NRF_CHIP_UNKNOWN = 0,
+    NRF_CHIP_LEGACY,
+    NRF_CHIP_PLUS,
+} nrf24_variant_t;
+
+#define NRF_REG_CONFIG      0x00
+#define NRF_REG_EN_AA       0x01
+#define NRF_REG_EN_RXADDR   0x02
+#define NRF_REG_SETUP_AW    0x03
+#define NRF_REG_SETUP_RETR  0x04
+#define NRF_REG_RF_CH       0x05
+#define NRF_REG_RF_SETUP    0x06
+#define NRF_REG_STATUS      0x07
+#define NRF_REG_RX_ADDR_P0  0x0A
+#define NRF_REG_TX_ADDR     0x10
+#define NRF_REG_DYNPD       0x1C
+#define NRF_REG_FEATURE     0x1D
+
+#define NRF_CMD_W_TX_PAYLOAD 0xA0
+#define NRF_CMD_FLUSH_TX     0xE1
+#define NRF_CMD_FLUSH_RX     0xE2
+#define NRF_CMD_ACTIVATE     0x50
+#define NRF_ACTIVATE_MAGIC   0x73
+
+#define NRF_CFG_PWR_UP      (1U << 1)
+#define NRF_CFG_CRCO        (1U << 2)
+#define NRF_CFG_EN_CRC      (1U << 3)
+#define NRF_CFG_MASK_MAX_RT (1U << 4)
+#define NRF_CFG_MASK_TX_DS  (1U << 5)
+#define NRF_CFG_MASK_RX_DR  (1U << 6)
+
+#define NRF_RF_DR_1M        0x00
+#define NRF_RF_DR_2M        (1U << 3)
+#define NRF_RF_PWR_0        (3U << 1)
+#define NRF_RF_LNA_HCURR    (1U << 0)
+
+#define NRF_FEATURE_EN_DPL  (1U << 2)
+#define NRF_DYNPD_P0        (1U << 0)
+
+#define NRF_ST_RX_DR        (1U << 6)
+#define NRF_ST_TX_DS        (1U << 5)
+#define NRF_ST_MAX_RT       (1U << 4)
+
+#define NRF_TPOR_MS         100
+#define NRF_TPD2STBY_MS     10
+```
+
+`nrf_probe_chip()` must follow this sequence:
+
+1. Write `FEATURE := EN_DPL`.
+2. Read `FEATURE` back.
+3. If it sticks, classify the chip as `NRF_CHIP_PLUS` and restore
+   `FEATURE := 0`.
+4. If it does not stick, issue `ACTIVATE` with magic byte `0x73`,
+   retry the FEATURE write/read, and classify as `NRF_CHIP_LEGACY` if
+   the second attempt succeeds.
+5. If the second attempt still fails, return `NRF_CHIP_UNKNOWN`.
+
+Private SPI helpers stay small and polling-based: `nrf_xfer()`,
+`nrf_cmd()`, `nrf_rreg()`, `nrf_wreg()`, `nrf_rreg8()`, and
+`nrf_wreg8()`. Every bringup/send snippet below assumes those helpers
+already exist, and the IRQ ISR remains minimal: it only gives the
+`tx_done` semaphore and leaves all SPI work to task context.
 
 Public API:
 
@@ -955,21 +1401,20 @@ esp_err_t nrf24_tx_init(nrf24_tx_t *h);
 esp_err_t nrf24_tx_send(nrf24_tx_t *h, const uint8_t addr[5]);
 esp_err_t nrf24_tx_deinit(nrf24_tx_t *h);
 
-// Two-byte payload the hub sends to every 2.4G dispatch. Mirrors the
-// receiver's RF_TRIGGER_TOGGLE_MAGIC_HI / _LO. Stored as a static
+// Two-byte payload the hub sends to every 2.4G dispatch. Stored as a static
 // const so the byte order on the wire is byte 0 = HI = 0xAA, then
 // byte 1 = LO = 0x55.
 #define NRF_TX_TOGGLE_MAGIC_HI 0xAA
 #define NRF_TX_TOGGLE_MAGIC_LO 0x55
 ```
 
-Bringup deltas vs Receiver §G.7.4:
+Bringup core:
 
 ```c
-// nrf24/nrf24_transmitter.c — bringup (deltas only; everything else mirrors §G.7.4)
+// nrf24/nrf24_transmitter.c — shared SPI/probe helpers omitted for brevity
 static esp_err_t nrf_tx_bringup(nrf24_tx_t *h) {
     // CE low; power-on settle; SETUP_AW liveness probe + chip probe.
-    // (Same as receiver §G.7.4 nrf_bringup — copy verbatim.)
+    // Shared with the receiver-side substrate; keep the sequence identical.
 
     // Configure for PTX with auto-ACK enabled on pipe 0 so the chip can
     // accept the ACK frame the PRX returns (the receiver firmware has
@@ -979,16 +1424,17 @@ static esp_err_t nrf_tx_bringup(nrf24_tx_t *h) {
     // unmasked: the ISR releases tx_done on either, and the send path
     // reads STATUS afterwards to disambiguate (datasheet PS v1.0 §6.5).
     nrf_wreg8(NRF_REG_CONFIG,
-              NRF_CFG_MASK_RX_DR                          // PTX has no RX path
-              | NRF_CFG_EN_CRC | NRF_CFG_CRCO);           // PRIM_RX = 0, PWR_UP = 0
+              NRF_CFG_MASK_RX_DR                          // mask RX_DR: PTX only receives
+              | NRF_CFG_EN_CRC | NRF_CFG_CRCO);           // empty ACKs, no RX_DR needed
+                                                           // PRIM_RX = 0, PWR_UP = 0
 
     nrf_wreg8(NRF_REG_EN_AA,      0x01);                   // pipe 0 auto-ACK only
     nrf_wreg8(NRF_REG_EN_RXADDR,  0x01);                   // pipe 0 enabled (for ACK)
     nrf_wreg8(NRF_REG_SETUP_AW,   0x03);                   // 5-byte addresses
     // ARD = 750 µs (datasheet ARD field 0010), ARC = 3 retransmits.
-    // The 750 µs floor satisfies the ACK-without-payload requirement on
-    // 1 Mbps and 2 Mbps (datasheet PS v1.0 §7.4.2 ACK-payload note); we
-    // intentionally don't expose 250 kbps, which would force ARD ≥ 500 µs.
+    // 250 µs already satisfies empty-ACK at 1/2 Mbps; 750 µs provides
+    // margin and headroom if ACK payloads are ever enabled (datasheet
+    // PS v1.0 §7.4.2). We intentionally omit 250 kbps.
     nrf_wreg8(NRF_REG_SETUP_RETR, (2 << 4) | 3);
     nrf_wreg8(NRF_REG_RF_CH,      CONFIG_TRANSMITTER_NRF24_CHANNEL);
 
@@ -996,7 +1442,7 @@ static esp_err_t nrf_tx_bringup(nrf24_tx_t *h) {
     // NRF_RF_LNA_HCURR is documented as obsolete on the nRF24L01+ (writes
     // ignored) and helps RX sensitivity by ~+1.5 dB on the legacy
     // nRF24L01. We OR it into RF_SETUP so the ACK reception path benefits
-    // on whichever silicon is populated. See receiver §G.7.6 compat table.
+    // on whichever silicon is populated.
     nrf_wreg8(NRF_REG_RF_SETUP, NRF_RF_DR_2M | NRF_RF_PWR_0 | NRF_RF_LNA_HCURR);
 #else
     nrf_wreg8(NRF_REG_RF_SETUP, NRF_RF_DR_1M | NRF_RF_PWR_0 | NRF_RF_LNA_HCURR);
@@ -1005,8 +1451,6 @@ static esp_err_t nrf_tx_bringup(nrf24_tx_t *h) {
 #if CONFIG_TRANSMITTER_NRF24_ENABLE_DPL
     nrf_wreg8(NRF_REG_FEATURE, NRF_FEATURE_EN_DPL);
     // PTX-only: DPL must be enabled on the ACK-receiving pipe (pipe 0).
-    // `NRF_DYNPD_P0` is the one extension this firmware adds to the
-    // shared `nrf24_regs.h` from receiver §G.7.2 — see §G.7 intro.
     nrf_wreg8(NRF_REG_DYNPD,   NRF_DYNPD_P0);
 #else
     nrf_wreg8(NRF_REG_FEATURE, 0x00);
@@ -1014,11 +1458,11 @@ static esp_err_t nrf_tx_bringup(nrf24_tx_t *h) {
 #endif
 
     // PTX address ownership: TX_ADDR == RX_ADDR_P0 == destination
-    // receiver's RX_ADDR_P1 (= the receiver's rf_code, Device
-    // Integration Plan §2.4). Per-dispatch addressing — the hub does not bake any
+    // receiver's RX_ADDR_P1 (= the destination receiver's 5-byte
+    // rf_code). Per-dispatch addressing — the hub does not bake any
     // address at boot. `nrf24_tx_send` writes both registers from the
-    // 5 bytes carried in `cmd/transmit.rf_code_hex` immediately
-    // before each W_TX_PAYLOAD.
+    // 5 bytes carried in `cmd/transmit.rf_code_hex` immediately before
+    // each W_TX_PAYLOAD.
 
     nrf_cmd(NRF_CMD_FLUSH_TX);
     nrf_cmd(NRF_CMD_FLUSH_RX);
@@ -1041,7 +1485,7 @@ esp_err_t nrf24_tx_send(nrf24_tx_t *h, const uint8_t addr[5]) {
     // Power-Down → Standby-I. The chip idles in Power-Down between
     // dispatches (§F.7); `Tpd2stby` is bounded by NRF_TPD2STBY_MS, which
     // is set to a value generous enough to cover both PS v2.0 (1.5 ms)
-    // and PS v1.0 (4.5 ms with Ls = 90 mH) — see receiver §G.7.2.
+    // and PS v1.0 (4.5 ms with Ls = 90 mH).
     uint8_t cfg = nrf_rreg8(NRF_REG_CONFIG) | NRF_CFG_PWR_UP;
     nrf_wreg8(NRF_REG_CONFIG, cfg);
     vTaskDelay(pdMS_TO_TICKS(NRF_TPD2STBY_MS));
@@ -1093,30 +1537,25 @@ esp_err_t nrf24_tx_send(nrf24_tx_t *h, const uint8_t addr[5]) {
 }
 ```
 
-ISR is the same shape as the receiver's (`nrf_isr` in Receiver §G.7.4)
-with one change: it gives the `tx_done` semaphore instead of
-unblocking an RX task. The `MASK_RX_DR` bit in `CONFIG` ensures the
-IRQ pin only asserts on `TX_DS` or `MAX_RT`, so a single ISR body
-covers both events; the send path inspects `STATUS` to disambiguate.
+The IRQ ISR gives the `tx_done` semaphore and does nothing else.
+`MASK_RX_DR` in `CONFIG` ensures the IRQ pin only asserts on `TX_DS` or
+`MAX_RT`, so one ISR body covers both outcomes; the send path inspects
+`STATUS` afterwards to disambiguate.
 
-DPL on the **TX side** is symmetric: with
+DPL on the **TX side** is bilateral: with
 `CONFIG_TRANSMITTER_NRF24_ENABLE_DPL=y`, the chip sends a
 variable-length frame whose length matches the `W_TX_PAYLOAD` write.
-Receiver §G.7.5 already documents that DPL is bilateral — the receiver
-must also have DPL on, or it CRC-rejects the frame silently.
-Deployments should keep both `CONFIG_RECEIVER_NRF24_ENABLE_DPL` and
-`CONFIG_TRANSMITTER_NRF24_ENABLE_DPL` defaulted to `y`.
+The destination receiver must also have DPL enabled or it silently
+CRC-rejects the frame. Deployments should therefore keep transmitter
+and receiver DPL settings aligned.
 
-Address byte order is the same convention as Receiver §G.7.7: byte
-index 0 is the LSByte on the wire, byte 4 is the MSByte. The hub
-copies the 5 bytes from `cmd/transmit.rf_code_hex` (decoded
-big-endian-textually but laid out as wire-order bytes) directly into
-the SPI payload of `W_REGISTER(TX_ADDR, …)` and
-`W_REGISTER(RX_ADDR_P0, …)` per dispatch — no in-firmware swap, no
-Kconfig involvement. The receiver firmware applies the same bytes
-to its `RX_ADDR_P1`, so a frame transmitted to address `A` is
-silicon-matched by exactly one receiver in the global 2.4G uniqueness
-namespace (Device Integration Plan §D5.0).
+Address byte order is fixed: byte index 0 is the LSByte on the wire,
+byte 4 is the MSByte. The hub copies the 5 bytes from
+`cmd/transmit.rf_code_hex` directly into the SPI payload of
+`W_REGISTER(TX_ADDR, …)` and `W_REGISTER(RX_ADDR_P0, …)` per dispatch
+with no in-firmware swap and no Kconfig involvement. The destination
+receiver writes the same bytes into `RX_ADDR_P1`, so those registers
+describe one shared on-air identity.
 
 ### G.8 Dispatch executor
 
@@ -1204,7 +1643,7 @@ Notes:
 - `parse_transmit_json` uses `cJSON` from `espressif__cjson` (already
   in `transmitter/main/idf_component.yml`).
 - Signature verify reuses the same `device_identity_verify(...)`
-  helper as the receiver's `cmd/rf_code` and `cmd/deact` paths.
+  helper as the activation and lifecycle paths defined in this guide.
 
 ### G.9 Heartbeat publisher
 
@@ -1226,14 +1665,14 @@ static void hb_task(void *arg) {
     while (s_hb_run) {
         char payload[64];
         char ts[32];
-        iso8601_now(ts, sizeof ts);                // helper in security/utils
+        iso8601_now(ts, sizeof ts);
         int n = snprintf(payload, sizeof payload,
                          "{\"schema_version\":1,\"issued_at\":\"%s\"}", ts);
         (void)mqtt_publish(topic, payload, n, /*qos=*/0, /*retain=*/0);
-        // ±500 ms jitter
         int jitter = (esp_random() % (2 * HB_JITTER_MS + 1)) - HB_JITTER_MS;
         vTaskDelay(pdMS_TO_TICKS(HB_INTERVAL_MS + jitter));
     }
+    s_hb = NULL;
     vTaskDelete(NULL);
 }
 
@@ -1245,30 +1684,40 @@ esp_err_t heartbeat_start(void) {
 }
 
 esp_err_t heartbeat_stop(void) {
+    if (!s_hb) return ESP_OK;
     s_hb_run = false;
-    s_hb = NULL;
+    // Task self-deletes after the current delay tick; s_hb is NULLed
+    // by the task itself before vTaskDelete so heartbeat_start sees a
+    // clean state.
     return ESP_OK;
 }
 ```
 
 `mqtt_publish` is a thin wrapper around `esp_mqtt_client_publish`
 that returns silently when `s_client == NULL` or the queue is full —
-the same pattern the receiver uses for ack publishes. A dropped tick
+the same pattern used for transmitter ack publishes. A dropped tick
 is a non-event; only sustained silence (≥ 30 s, §H.6) has operational
 meaning.
 
 ### G.10 Device identity
 
-Reuse Receiver §G.10 verbatim. The pinned backend public key Kconfig
-key is renamed `CONFIG_TRANSMITTER_BACKEND_PUBKEY_B64`. The signing
-key is shared with the receiver fleet (§H.7.0 / Device Integration Plan §6: one
-signing key covers both families), so the dev `.pem` generated for
-receivers can be reused for hubs without rotation.
+The device-identity flow from §E.4 maps directly onto ESP-IDF's
+mbedTLS APIs. Hardware SHA-256 and big-int acceleration are enabled by
+default on ESP32-C3. Default Kconfig gates:
+
+```kconfig
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+CONFIG_MBEDTLS_HARDWARE_MPI=y
+CONFIG_MBEDTLS_ECDSA_C=y
+CONFIG_MBEDTLS_ECP_DP_SECP256R1_ENABLED=y
+```
+
+The pinned backend command-signing public key is supplied through
+`CONFIG_TRANSMITTER_BACKEND_PUBKEY_B64`.
 
 Performance budget (C3 @ 160 MHz):
 
-- ECDSA verify on a `transmit-v1|...` canonical: 70–100 ms (Receiver
-  §G.10 figure, validated for SHA-256 + ECDSA on EC P-256).
+- ECDSA verify on a `transmit-v1|...` canonical: 70–100 ms.
 - ECDSA sign on the activation challenge: 100–150 ms (one-shot per
   activation).
 
@@ -1277,23 +1726,12 @@ Both are bounded by mbedTLS hardware acceleration and well within the
 
 ---
 
-## H. Backend Implementation Plan (DUPLICATE — see Device Integration Implementation Plan)
+## H. Backend Implementation Context
 
-> **Status (2026-04-27):** This section originated the backend slice
-> for the transmitter hub and has been folded into
-> `docs/planned/Device Integration Implementation Plan.md` (Phases F0,
-> T1–T7). That plan is now the source of truth for backend work and
-> covers receivers and transmitters together. The text below is kept
-> in place for firmware-side cross-references (§A–§G refer to §H.x
-> anchors); when the two diverge, fix the implementation plan first
-> and refresh §H here.
-
-This section is the backend slice of the transmitter hub plan: the
-package additions, configuration, and phased rollout that turn the
-firmware contract above into a working server. It builds on top of
-the unified `device` domain established by the
-`Device Integration Implementation Plan.md` and reuses receiver-
-domain code wherever the contracts overlap.
+This section records the backend behavior the transmitter firmware
+expects to exist around it: package additions, configuration, and the
+phased rollout that turn the firmware contract above into a working
+server.
 
 ### H.1 Topology (the contract pinned for firmware)
 
@@ -1331,8 +1769,7 @@ anchors instead of restating.
   dispatch event, RF collisions between peer hubs are not a concern
   and the hubs need no inter-hub coordination protocol.
 
-What the **receiver plan already covers** (no schema retrofit when
-this slice lands):
+Shared backend assumptions already in place:
 
 - `device_kind` reserves `TRANSMITTER_HUB`.
 - `device.last_seen_at` carries the heartbeat timestamp.
@@ -1381,15 +1818,13 @@ hygiene as the receiver path. The `publishTransmit` overload is
 ### H.3 Canonical strings (backend builders)
 
 Three canonical strings the backend builds and signs. Builders live
-in `core/device/DeviceCanonical.kt` next to the receiver-side ones.
+in `core/device/DeviceCanonical.kt`.
 UTF-8, no trailing newline, exact field order:
 
 - `activate-v1|<challenge_id>|<nonce>|<issued_at>|<expires_at>` —
-  reused verbatim from the Device Integration Plan §2.3. The transmitter
-  activation path differs only in the topic namespace.
+  reused unchanged for the transmitter bootstrap flow.
 - `deact-v1|<public_id>|<command_id>|<action>|<issued_at>` — reused
-  verbatim from the Device Integration Plan §2.3. Applied to the hub topic
-  namespace via the `DeviceMqttPublisher` route.
+  unchanged for the transmitter lifecycle topic family.
 - `transmit-v1|<hub_public_id>|<dispatch_id>|<receiver_public_id>|<band>|<rf_code_hex>|<rf_code_bits>|<issued_at>`
   — new, with the `band` field per §H.4.
 
@@ -1406,7 +1841,7 @@ test pinned against the example at the end of §E.3.
 
 ### H.4 Required `transmit-v1` band field
 
-The §2.4 width rules now make `bits` disjoint per band (40 only on
+The §B.2 width rules now make `bits` disjoint per band (40 only on
 2.4G; 1..32 only on 433M), so `band` is no longer required for
 disambiguation. It stays on the wire because:
 
@@ -1436,10 +1871,10 @@ This is not a contract break against an existing firmware: no
 transmitter firmware is in production yet, so `band` lands as part
 of `transmit-v1` from day one rather than a future `transmit-v2`.
 
-### H.5 Package additions to the unified `device` domain
+### H.5 Backend package additions
 
-Add the following to the unified `device` domain established by the
-Device Integration Plan §5:
+Add the following transmitter-specific pieces to the backend's shared
+`device` domain:
 
 ```text
 backend/src/main/kotlin/com/thomas/notiguide/domain/device/
@@ -1451,22 +1886,21 @@ backend/src/main/kotlin/com/thomas/notiguide/domain/device/
     └── TransmitterElectionService.kt      # active-hub election, Redis-cached      (§H.7.4)
 ```
 
-Existing receiver-domain code is reused verbatim:
+Existing shared device-domain code is reused:
 
-| Concern                                                              | Reused from Device Integration Plan                                                       |
+| Concern                                                              | Existing shared service                                                       |
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| Enrollment tokens                                                    | `EnrollmentTokenService` (D1)                                                   |
-| Bootstrap intake (validation, token consume, upsert, challenge mint) | `DeviceRegistrationService` (D2)                                                |
-| Approval / activation                                                | `DeviceApprovalService` (D3), `DeviceActivationService` (D4)                    |
-| Lifecycle commands                                                   | `DeviceLifecycleService` (D6)                                                   |
+| Enrollment tokens                                                    | `EnrollmentTokenService`                                                        |
+| Bootstrap intake (validation, token consume, upsert, challenge mint) | `DeviceRegistrationService`                                                     |
+| Approval / activation                                                | `DeviceApprovalService`, `DeviceActivationService`                              |
+| Lifecycle commands                                                   | `DeviceLifecycleService`                                                        |
 | MQTT publish                                                         | `DeviceMqttPublisher` (gains `publishTransmit` and a hub variant of `publishDeact` / `clearRetained`) |
 | Public ID minting                                                    | `DevicePublicIdMinter` (mints `hub-XXXXX` based on `kind`)                      |
 | Command signing                                                      | `DeviceCommandSigner` (one signing key covers both families)                    |
 
 ### H.6 Backend configuration
 
-Add to `application.yaml`, next to the `device:` block from the
-Device Integration Plan §6:
+Add to `application.yaml` under the `device:` block:
 
 ```yaml
 device:
@@ -1500,9 +1934,7 @@ exactly one `name`, the AND/OR distinction does not bite here.
 
 ### H.7 Implementation phases
 
-Each phase is a standalone slice — audit between phases per the
-project convention. Every phase updates `docs/CHANGELOGS.md` with
-every file touched and any skipped item.
+Each phase is independently shippable and lands in order.
 
 #### H.7.0 Phase T0 — Foundation
 
@@ -1524,15 +1956,14 @@ every file touched and any skipped item.
    `@ConditionalOnProperty(prefix = "device.transmitter", name = "enabled", havingValue = "true")`
    so the feature gate is real.
 
-The signing key, `DeviceCommandSigner`, and the
-`DeviceCommandSigningProperties` config from the Device Integration Plan §6 are
-reused unchanged. One signing key covers both fleets.
+The signing key and `DeviceCommandSigningProperties` are reused
+unchanged. One signing key covers both fleets.
 
 #### H.7.1 Phase T1 — Bootstrap intake
 
 - `TransmitterBootstrapListener` subscribes to
   `transmitter/bootstrap/register` and `transmitter/bootstrap/+`,
-  with the same self-echo drop rule as the receiver listener (§H.2).
+  with the self-echo drop rule described in §H.2.
 - Generalise `DeviceRegistrationService.onRegister` to accept a
   `DeviceFamily` discriminator (`RECEIVER` / `TRANSMITTER`) inferred
   from the topic. Receiver registration rejects `TRANSMITTER_HUB`;
@@ -1545,8 +1976,9 @@ reused unchanged. One signing key covers both fleets.
 
 #### H.7.2 Phase T2 — Activation
 
-- Reuse `DeviceActivationService.onResponse` verbatim — the canonical
-  `activate-v1` string and the ECDSA verify path are family-agnostic.
+- `DeviceActivationService.onResponse` can stay family-agnostic — the
+  `activate-v1` string and the ECDSA verify path do not change for
+  transmitter hubs.
 - `DevicePublicIdMinter` mints `hub-XXXXX` instead of `rcv-XXXXX`
   based on `device.kind`.
 - After a hub activates, `status` goes straight to `ACTIVE` (not
@@ -1572,10 +2004,9 @@ reused unchanged. One signing key covers both fleets.
   automatically.
 - For each `ack_for = "transmit"` frame: update `device.last_seen_at`,
   match on `dispatch_id`, and log/drop stale or out-of-order acks.
-- For each `ack_for = "deact"` frame: reuse the receiver-plan
-  lifecycle-ack handling keyed by `command_id` / `public_id`; the
-  transmitter path differs only by topic namespace and
-  `TRANSMITTER_HUB` routing.
+- For each `ack_for = "deact"` frame: reuse the existing lifecycle-ack
+  handling keyed by `command_id` / `public_id`; the transmitter path
+  differs only by topic namespace and `TRANSMITTER_HUB` routing.
 
 #### H.7.4 Phase T4 — Active-hub election
 
@@ -1598,16 +2029,17 @@ reused unchanged. One signing key covers both fleets.
 #### H.7.5 Phase T5 — Dispatch consumer
 
 - `TransmitterDispatchService` subscribes to
-  `DeviceDispatchEventBroadcaster`. The broadcaster shape is
-  documented by the Device Integration Plan §D7a alongside the queue-side
-  publisher; the Reactor underpinning is `Sinks.many().multicast().directBestEffort()`
+  `DeviceDispatchEventBroadcaster`. The broadcaster uses
+  `Sinks.many().multicast().directBestEffort()`
   — fan out to coroutine-side consumers, drop on slow subscriber so
   one stuck listener never stalls dispatch.
 - On `DEVICE_CALL_REQUESTED`:
-  1. `electActive(event.storeId)`. If null, mark the queue-side
-     dispatch as failed through the same admin-visible queue-dispatch
-     failure path owned by Device Integration Plan §D7a; this guide does not pin
-     a separate transmitter-specific SSE event name.
+  1. `electActive(event.storeId)`. If null, emit
+     `DEVICE_DISPATCH_FAILED` through the queue-event path used by the
+     queue page: widen backend `MqttPublisher.QueueEventType`, publish
+     the queue MQTT event, and also broadcast the local SSE event so
+     multi-instance and single-instance admin sessions behave the
+     same.
   2. Decrypt the receiver's RF code (only point in the system that
      does so on the dispatch hot path).
   3. Build `transmit-v1|hub_public_id|dispatch_id|receiver_public_id|band|rf_code_hex|rf_code_bits|issued_at`,
@@ -1619,10 +2051,13 @@ reused unchanged. One signing key covers both fleets.
   - For the receiver vibrator-toggle model, the firmware design has
     the next matching RF frame toggle the vibrator off. So "stop" is
     just another `transmit-v1` with the same RF code — no new
-    canonical string needed. Re-elect, sign, publish.
+    canonical string needed. Re-elect, sign, publish. If no active
+    hub is available at dispatch time, emit the same
+    `DEVICE_DISPATCH_FAILED` signal and leave queue-side reservation
+    handling fail-closed until the operator retries.
 - Transmit-ack ingestion lives in §H.7.3's operational-listener path.
 
-#### H.7.6 Phase T6 — Lifecycle (reuse from Device Integration Plan §D6)
+#### H.7.6 Phase T6 — Lifecycle
 
 - `DeviceLifecycleService` already publishes `cmd/deact` with
   `deact-v1`. Hub case routes via the extended `DeviceMqttPublisher`
@@ -1649,13 +2084,13 @@ through the existing admin UI cleanly:
 
 - Hub firmware (this guide §A–§G; not a backend concern).
 - Web Serial bridge.
-- Dedicated transmitter admin-web screens beyond the unified Device
-  tab from the Device Integration Plan.
+- Dedicated transmitter admin-web screens beyond the shared device
+  admin surface.
 - Per-device MQTT credentials and broker ACLs.
 
 ### H.8 Suggested execution order
 
-Land this slice **after** the receiver plan stabilises end-to-end:
+Land this slice after the shared device-domain groundwork is stable:
 
 1. **H.7.0** — canonical helper, publisher extension, properties,
    feature gate.
@@ -1665,7 +2100,7 @@ Land this slice **after** the receiver plan stabilises end-to-end:
 3. **H.7.3 + H.7.4** — heartbeat listener + election service.
    Verifiable by simulated heartbeats and `electActive` unit tests.
 4. **H.7.5** — dispatch consumer. End-to-end test: issue a
-   device-ticket via the receiver plan's queue dispatch UI, confirm
+   device-ticket via the queue dispatch UI, confirm
    `cmd/transmit` lands on the broker.
 5. **H.7.6 + H.7.7** — lifecycle wiring, cap enforcement, admin-list
    count surface.
@@ -1673,15 +2108,24 @@ Land this slice **after** the receiver plan stabilises end-to-end:
 The feature flag stays `false` in dev/prod profiles until firmware
 exists.
 
-### H.9 Cross-domain dependencies
+### H.9 Queue/admin integration surface
 
-- The Device Integration Implementation Plan owns the unified
-  `device` domain, the `DeviceDispatchEventBroadcaster` producer, the
-  RF-code shape, and the queue-side D7a plumbing. This guide consumes
-  all of it; nothing here re-implements receiver-domain code.
-- Until the firmware in §A–§G ships and a hub is `ACTIVE` for a store,
-  the receiver plan's D7a preflight returns `no_active_transmitter`
-  and the queue UI dispatch surface (D7b) stays unrendered.
+- The backend side exposes a shared `device` domain, a
+  `DeviceDispatchEventBroadcaster` producer, the receiver RF-code
+  shape consumed on the dispatch hot path, and the queue/admin routes
+  that issue device-bound tickets.
+- `GET /api/queue/admin/{storeId}/available-devices` returns a
+  preflight envelope rather than a bare list:
+  `devices`, `dispatchReady`, and optional `error`.
+- When no live `ACTIVE` hub is available for the store, the preflight
+  returns `dispatchReady = false` and `error = "no_active_transmitter"`.
+  The queue page renders the dispatch action in a disabled state with
+  that reason instead of posting blindly or hiding the surface.
+- When dispatch cannot be completed after the ticket is already in a
+  device-bound state, the queue page receives
+  `DEVICE_DISPATCH_FAILED` through the same queue-event path used by
+  the rest of the admin flow and leaves ticket state unchanged until
+  an operator triages the failure.
 
 ### H.10 Deferred (backend-specific)
 
@@ -1690,11 +2134,10 @@ exists.
   trace.
 - Transmit ack analytics emission (how many dispatches actually fired
   vs. failed silently).
-- In-field rotation of the backend command-signing key — shared with
-  the Device Integration Plan's deferred list.
+- In-field rotation of the backend command-signing key.
 - Surfacing `nrf24` probe failures into the heartbeat envelope as a
   capability bitmap so admin can flag a 433-only hub before it tries
-  to dispatch a 2.4 G code (related: §J.4).
+  to dispatch a 2.4 G code (the runtime fallback is in §F.5).
 
 ---
 
@@ -1702,9 +2145,9 @@ exists.
 
 ### I.1 `main/idf_component.yml`
 
-The current file already declares `idf >= 4.1.0`, `espressif/mqtt`,
-and `espressif/cjson`. Tighten the IDF floor to the v6 baseline used
-by the receiver and pin the MQTT range:
+The checked-in file already declares `idf >= 4.1.0`,
+`espressif/mqtt`, and `espressif/cjson`. Tighten the IDF floor to the
+v6 baseline used by the receiver and pin the MQTT range:
 
 ```yaml
 dependencies:
@@ -1810,8 +2253,8 @@ config TRANSMITTER_NRF24_ENABLE_DPL
     default y
 
 # TX address is NOT a Kconfig — every dispatch carries its own
-# destination address in `cmd/transmit.rf_code_hex` (= the receiver's
-# rf_code, see Device Integration Plan §2.4). The hub writes TX_ADDR +
+# destination address in `cmd/transmit.rf_code_hex` (= the destination
+# receiver's 5-byte rf_code). The hub writes TX_ADDR +
 # RX_ADDR_P0 from those 5 bytes immediately before W_TX_PAYLOAD;
 # nothing about the address is built into the firmware image.
 
@@ -1835,10 +2278,10 @@ config TRANSMITTER_BACKEND_PUBKEY_B64
     default ""
     help
         Base64-encoded DER-form EC P-256 public key used to verify
-        backend-signed cmd/* payloads. Generate with the same OpenSSL
-        recipe documented in the receiver's
-        CONFIG_RECEIVER_BACKEND_PUBKEY_B64 help text; one signing key
-        covers both fleets per §H.7.0.
+        backend-signed cmd/* payloads. Generate from the backend
+        signing key with:
+        openssl pkey -in signing-key.pem -pubout -outform DER | base64 -w0
+        One signing key covers both fleets per §H.7.0.
 
 endmenu
 ```
@@ -1854,230 +2297,7 @@ idf.py menuconfig       # set GPIOs, channel, address bytes, paste backend pubke
 idf.py build flash monitor
 ```
 
-The current checkout has no `transmitter/sdkconfig`; `dependencies.lock`
-records `target: esp32c3`, and `idf.py set-target esp32c3` is still
-required for a fresh local config before menuconfig/build.
-
----
-
-## J. Audit & Open Questions
-
-A self-review pass. Each item is either **resolved** in the text
-above or is an **accepted** trade-off noted for visibility.
-
-1. **Band field on `transmit-v1` (resolved, §B.2 / §H.4).** Without
-   an explicit band, `bits ∈ {8,16,24,32}` is ambiguous between
-   433 MHz and 2.4 GHz. This guide pins the canonical and JSON
-   extensions and makes them a hard prerequisite for §H.7.5.
-2. **Signing-key reuse (resolved, §G.10 / §H.7.0).** One EC P-256
-   signing key covers both fleets, so the hub pins the same key the
-   receiver firmware does.
-3. **No `PENDING_RF_CODE` for hubs (resolved, §A.1 / §A.2 / §H.7.2).**
-   Backend sends a hub straight to `ACTIVE` after activation. The
-   firmware's NVS `op_state` enum drops the receiver's intermediate
-   state and the bootstrap flow never waits for a first
-   `cmd/rf_code`.
-4. **Radio probe failure surfacing (accepted, §F.5 / §H.10).** A
-   boot-time nRF24 probe failure leaves the hub in 433-only mode and
-   acks `band=2_4G` dispatches with `reason=no_2_4g_radio`. Surfacing
-   the condition into the heartbeat (e.g. a `flags` bitfield) would
-   let the admin UI flag a hardware fault without waiting for the
-   first 2.4G dispatch attempt — deferred; the wire change is small
-   but the backend has nowhere to put it today.
-5. **Dispatch replay across reboots (resolved, §D / §G.8).** The
-   replay ring is RAM-only because `cmd/transmit` is **not retained**
-   (§E.1) and the broker re-delivers only un-acked QoS 1 messages on
-   reconnect — so a reboot cannot resurrect a stale `dispatch_id`
-   from broker state alone. Persisting the ring would buy nothing
-   and add a wear-amplifying NVS write per dispatch. The ring records
-   only signature-verified commands that reached a terminal ack
-   outcome; invalid frames cannot reserve an ID, and ambiguous nRF24
-   `tx_failed` duplicates cannot double-toggle a receiver.
-6. **`cmd/transmit` while `SUSPENDED` / `DECOMMISSIONED` (resolved,
-   §F.5).** The hub still parses + signature-verifies and acks
-   `rejected` with a state-specific reason, instead of silently
-   dropping. Keeps admin UX honest.
-7. **No vibrator on the hub (resolved, §C / §C.1).** The hub never
-   actuates anything locally; the vibrator-toggle behaviour belongs
-   to the *receiver* on the other end. The hub's only output is RF.
-8. **Mutex ordering (resolved, §G.2 / §G.8).** `dispatch_mtx` does
-   not exist as a separate lock — `radio_mtx` in the supervisor is
-   the single TX serialiser. Acks are always published *outside* the
-   lock so broker latency never stretches the radio-busy window.
-9. **DPL bilateral wire-format setting (resolved, §G.7 / §I.3).**
-   Same constraint as Receiver §G.7.5. Defaulting
-   `CONFIG_TRANSMITTER_NRF24_ENABLE_DPL=y` to match the receiver's
-   `CONFIG_RECEIVER_NRF24_ENABLE_DPL=y` keeps pairs operating out of
-   the box; flip both together to disable.
-10. **`SETUP_RETR` ARD = 750 µs / ARC = 3 (resolved, §G.7).** The
-    register write is `(2 << 4) | 3`, which encodes ARD field
-    `0010` per the datasheet PS v1.0 SETUP_RETR table — i.e.
-    750 µs, not 1000 µs. Three retransmits at 750 µs each add at
-    most ~3 ms over a single shot, well under the 50 ms send-path
-    timeout in `nrf24_tx_send`. The 750 µs floor satisfies the
-    ACK-without-payload requirement at 1 Mbps and 2 Mbps; 250 kbps
-    is intentionally not exposed (would require ARD ≥ 500 µs and is
-    legacy-incompatible).
-11. **Per-dispatch TX_ADDR + RX_ADDR_P0 (resolved, §B.3 / §G.7).**
-    The rf_code-as-address model means the destination address is
-    different per dispatch. `nrf24_tx_send` takes the 5-byte address
-    from the caller and writes it to **both** `TX_ADDR` and
-    `RX_ADDR_P0` immediately before `W_TX_PAYLOAD`. PTX auto-ACK
-    requires the equality (Receiver §G.7.7), and the per-dispatch
-    rewrite costs ~24 µs of SPI bus time — negligible against the
-    `Tpd2stby` walk already in the budget. No address ever lives in
-    hub firmware or hub Kconfig.
-12. **Heartbeat QoS 0 (resolved, §E.3 / §E.5).** Liveness is a
-    sliding window, not a fact. QoS 1 here would amplify broker
-    write load without making the 30 s TTL more accurate.
-13. **Per-store cap enforcement is backend-only (resolved, §H.1 /
-    §H.7.1 / §H.7.7).** The backend pre-counts non-terminal hubs at
-    registration and rejects with `hub_cap_reached` if `count >= 3`.
-    The firmware surfaces that envelope as a clear local error and
-    goes back into provisioning — no firmware change needed for the
-    cap itself.
-14. **Existing `tristate_to_*` kept (resolved, §G.6).** The PT2272
-    tri-state encoder lives next to the bits encoder. Both are pure
-    functions; carrying tri-state has no runtime cost when unused
-    and avoids deleting working bench tooling.
-15. **No HMAC eFuse path documented (accepted).** The final
-    transmitter config must enable `CONFIG_NVS_ENCRYPTION=y` /
-    `CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y`, but this checkout has
-    no `transmitter/sdkconfig` yet. The eFuse HMAC key block must be
-    programmed before the first write — same operator step as the
-    receiver fleet.
-16. **Power management for the nRF24 (resolved, §F.7).** The chip
-    stays in Power-Down between dispatches; each `band=2_4G` send
-    pays the `Tpd2stby` (≤ 4.5 ms) + `Tstby2a` (130 µs) walk once.
-    Worst-case dispatch budget §B.3 absorbs this.
-17. **`@ConditionalOnProperty` semantics (resolved, §H.6).** The
-    feature gate uses a single `name` so the only load-bearing fact
-    here is Spring Boot's documented rule that multiple entries in one
-    `name` array are ANDed.
-18. **MQTT v5 `noLocal` plus envelope guard (resolved, §H.2).** Paho
-    v5 Java exposes `MqttSubscription.setNoLocal(true)`, so the
-    transmitter bootstrap subscription can ask the broker not to loop
-    back backend self-publishes. The explicit envelope-type drop stays
-    in place as defensive validation if those backend-owned types ever
-    arrive on the wildcard.
-19. **Sinks.Many strategy for the dispatch broadcaster (resolved,
-    §H.7.5).** `multicast().directBestEffort()` drops `onNext` only
-    for slow subscribers, so one stuck listener never stalls
-    dispatch. The receiver plan §D7a defines the broadcaster shape;
-    this guide consumes it.
-20. **No SSE / streaming acks (deferred).** v1 acks are single
-    publishes per outcome. A future "transmit progress" stream is
-    out of scope.
-21. **No flash size / OTA pinning (deferred).** OTA / `app_update`
-    is out of scope for v1; same trade-off the receiver guide
-    accepts.
-22. **Receiver `assigned_device_name` parity (resolved, §A.1).** The
-    firmware persists `device_name` from the activation `result`
-    payload (same field name as the receiver, same persistence
-    pattern). Backend-side the field is `assigned_name`
-    (Device Integration Plan §3.1); the wire field stays `assigned_device_name`
-    for cross-fleet symmetry.
-23. **Single-instance globals (accepted, §G.7).** The nRF24 driver
-    keeps file-static `s_spi` / single-handle state, matching the
-    receiver. Multi-radio HATs are not a v1 target.
-24. **nRF24 channel bounds (resolved, §I.3).** The transmitter keeps
-    the receiver's `97..125` range so paired devices share the same
-    RF channel and sit above Wi-Fi channel 14's upper edge. The
-    nRF24L01+ datasheet supports `RF_CH` through 125
-    (`2400 + RF_CH` MHz, up to 2525 MHz), while the common 2.4 GHz ISM
-    band statement is 2.400–2.4835 GHz; deployment therefore needs a
-    local regulatory decision rather than a silent downgrade into the
-    Wi-Fi band.
-25. **433 MHz completion budget (resolved, §B.3 / §G.6).** The
-    previous blanket `<250 ms to RF off-air` target only fits the nRF24
-    path. 433 MHz off-air time is a function of protocol timing,
-    bit-width, and `TX_REPEAT_COUNT`; the wrapper now waits on a
-    calculated timeout derived from the generated pulse train.
-
----
-
-## K. Self-Verification
-
-Cross-checks performed during drafting and subsequent audit passes.
-
-- **Backend topics, cadence, and cap.** `transmitter/...` topic list,
-  QoS, retain flags, heartbeat interval (10 s) and liveness TTL
-  (30 s), per-store cap (3) all match what the merged §H.1–§H.7
-  pins. The cap rationale "ceiling, not floor" and the election
-  tiebreak "lowest `device.id`" stay consistent across §H.1 and
-  §H.7.4.
-- **Bootstrap envelope shapes.** `pending`, `challenge`, `rejected`,
-  `response`, `result` payload fields match the Receiver guide §E.3
-  shapes.
-- **`activate-v1` and `deact-v1` canonicals.** Reused unchanged from
-  the receiver walkthrough §2.3 and receiver guide §E.3.
-- **Receiver-side address ownership for nRF24 PTX.** `TX_ADDR ==
-  RX_ADDR_P0 == receiver's RX_ADDR_P1` matches the table in Receiver
-  §G.7.7. With the rf_code-as-address model, the destination
-  receiver's `RX_ADDR_P1` is the bytes the backend mints as the
-  receiver's `device_rf_code` (Device Integration Plan §2.4 — `bits == 40`),
-  and the hub writes those exact bytes to its `TX_ADDR` and
-  `RX_ADDR_P0` per dispatch.
-- **DPL bilateral, retransmit retry, channel range, byte order.**
-  DPL, retry, and byte-order rules pinned in §I.3 match the receiver's
-  §G.7.5 design notes; deviations (TX-side EN_AA pipe, retransmit
-  retry, MASK_RX_DR, per-dispatch address writes) are explicitly
-  justified inline. Channel bounds intentionally match the receiver's
-  `97..125` Wi-Fi-avoidance policy; the datasheet supports the silicon
-  tuning range, but local regulatory compliance must be checked before
-  field deployment.
-- **433 MHz plaintext encoding.** "Big-endian, left-padded to
-  ceil(bits/8), only bottom `bits` significant" matches Receiver
-  Plan §3.1 schema comment. The bits-to-pulses encoder in §G.6
-  walks MSB-first across exactly those `bits`, one pulse-pair per
-  logic bit, terminated by the protocol's sync pair — matching what
-  the receiver's RC-Switch decoder expects.
-- **ESP-IDF API surfaces.** `esp_mqtt_client_publish` thread-safety,
-  `gptimer` 1 MHz resolution, SPI `flags = 0` full-duplex, ISR IRAM
-  rule, NVS `nvs_flash_init` + erase-retry, `esp_wifi_set_ps` post-
-  GOT_IP — every surface is one already used by the receiver
-  firmware in this repo (`receiver-esp32/main/`), and by the
-  documented v6 conventions in
-  `docs/walkthrough/ESP_IDF_SDK_REFERENCE.md`. No `transmitter/` or
-  `receiver-esp32/` SDK-reference copy is checked in at this audit
-  point.
-- **Backend techstack — Context7-verified during merge.**
-  - `@ConditionalOnProperty` (Spring Boot 3.5): when multiple
-    `name` entries are listed on a single annotation, "all properties
-    must pass the test for the condition to match" (AND semantics).
-    The §H.6 / §H.7.0 feature gate uses a single `name`, so the
-    distinction is recorded for future-proofing rather than load-
-    bearing today. (Source: spring.io/spring-boot/3.5 API docs.)
-  - Paho MQTT v5 Java client: `MqttSubscription.setNoLocal(true)` is
-    available on the v5 client. The current repo wrapper still only
-    exposes `subscribe(topicFilter, qos)`, so §H.2 / §H.7.0 explicitly
-    add a v5 subscription overload before relying on `noLocal`.
-    (Source: eclipse/paho.mqtt.java MQTTv5 reference plus current
-    `backend/core/mqtt/MqttClientManager.kt`.)
-  - Reactor Core `Sinks.many().multicast().directBestEffort()` is
-    documented as the multicast strategy that drops `onNext` only
-    for the specific slow subscriber, leaving healthy subscribers
-    unaffected — exactly what `DeviceDispatchEventBroadcaster` (§H.7.5)
-    needs. (Source: reactor/reactor-core docs/processors.adoc.)
-- **Existing transmitter source.** `rf/rf_common.h`, `rf_data.c`,
-  `rf_timer.c`, `rf_transmitter.c` are kept; the only additions are
-  `bits_to_pulses` and the `rf433_tx_*` thin wrappers in §G.6 (no
-  changes to the existing `gptimer` ISR or the protocol table). The
-  current `main.c` is empty and must be replaced per §F.1.
-- **Hub `op_state` set.** `{ACTIVE, SUSPENDED, DECOMMISSIONED}`
-  matches §H.1 / §H.7.4 (`status NOT IN ('DECOMMISSIONED', 'REJECTED')`
-  excluded from the candidate pool; `REJECTED` is a backend-only
-  state that never reaches the firmware).
-- **No Kconfig radio gate.** §C.2 / §I.3 — both radios are always
-  built; `idf_component_register` lists both `rf/*.c` and
-  `nrf24/nrf24_transmitter.c` unconditionally.
-- **Backend-only content is fully absorbed.** Scope/topology, topic
-  contract, canonicals, package additions, configuration, phases,
-  execution order, cross-domain dependencies, and deferred backend
-  items all live inside §H.1–§H.10. No separate backend transmitter
-  plan remains.
-- **Cross-references after merge.** Every internal `§H.x` anchor
-  used in §A–§G and §J resolves to a heading present in this file.
-  The receiver walkthrough now points to this guide for transmitter-
-  side work, so no live doc link depends on a separate backend-prep
-  plan.
+The checked-in `transmitter/sdkconfig` already targets `esp32c3`, and
+`dependencies.lock` records `idf 6.0.0`. Run `idf.py set-target
+esp32c3` when regenerating a fresh local config or when the local
+`sdkconfig` has been removed or reset.

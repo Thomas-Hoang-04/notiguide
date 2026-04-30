@@ -116,7 +116,7 @@ reprovision.
 | `mqtt_uri`      | `str` | provisioning       | must be `mqtts://...` (TLS is mandatory) |
 | `mqtt_user`     | `str` | provisioning       | shared broker credential; not rotated    |
 | `mqtt_pwd`      | `str` | provisioning       | shared broker credential; not rotated    |
-| `enroll_token`  | `str` | provisioning       | erased after successful activation       |
+| `enroll_token`  | `str` | provisioning       | admin-issued single-use authorization; erased after activation |
 | `public_id`     | `str` | activation         | backend-assigned; topic scope (§3.6)     |
 | `device_name`   | `str` | activation         | backend-assigned label                   |
 | `rf_code`       | `u32` | `cmd/rf_code` MQTT | trigger code; sensitive                  |

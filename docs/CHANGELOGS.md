@@ -1,5 +1,80 @@
 # Changelogs
 
+## 2026-05-01 - ESP8266 recovery actions exposure alignment
+
+### Summary
+- Adjusted the ESP8266 provisioning UI so its recovery actions are exposed like the ESP32 receiver and transmitter pages instead of being conditionally hidden.
+- The recovery block is now always shown, and `Retry connection` is state-gated through button disablement rather than disappearing from the UI.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `receiver-esp8266/main/provision/index.html` | MODIFIED | Made recovery actions always visible, added dedicated recovery heading copy, and aligned retry gating with the state-disabled pattern used by the other provisioning pages |
+| `receiver-esp8266/main/provision/index.html.gz` | MODIFIED | Refreshed the embedded compressed provisioning asset after the UI adjustment |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the ESP8266 recovery-actions exposure alignment |
+
+### Verification
+- Rechecked `receiver-esp8266/main/provision/index.html` against `receiver-esp32/main/provision/index.html` and `transmitter/main/provision/index.html` to confirm the recovery actions are now exposed in the same general way while keeping the simpler 8266 layout.
+- Did not run build or flash steps in this UI-only follow-up.
+
+## 2026-04-30 - ESP8266 provisioning recovery audit follow-up
+
+### Summary
+- Audited the new `receiver-esp8266` recovery-loop implementation against the standalone plan and the current ESP32-C3 recovery patterns.
+- Fixed one runtime gap where the new recovery loop could still hang indefinitely during initial MQTT connection instead of falling back into recovery.
+- Fixed one UI regression where the new same-boot `Retry connection` flow could leave the recovery buttons disabled forever if the device returned to SoftAP after a failed retry.
+- Added `boot_state` to the ESP8266 local status API so the recovery status surface is closer to the plan and the ESP32-C3 variants, while keeping the page itself simple.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `receiver-esp8266/main/network/mqtt.c` | MODIFIED | Added bounded MQTT startup failure detection so the recovery loop can re-enter SoftAP instead of waiting forever on the first connection |
+| `receiver-esp8266/main/provision/http_server.c` | MODIFIED | Added `boot_state` to the local status payload for closer recovery-contract parity with the plan and ESP32-C3 variants |
+| `receiver-esp8266/main/provision/index.html` | MODIFIED | Added lightweight status polling and retry follow-up handling so the recovery UI re-enables itself if same-boot retry falls back into SoftAP |
+| `receiver-esp8266/main/provision/index.html.gz` | MODIFIED | Refreshed the embedded compressed provisioning asset after the HTML fix |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the ESP8266 recovery audit follow-up |
+
+### Verification
+- Re-audited `receiver-esp8266/main/main.c`, `main/network/mqtt.c`, `main/provision/recovery.c`, `main/provision/http_server.c`, and `main/provision/index.html` against `docs/planned/RECEIVER_ESP8266_PROVISIONING_RECOVERY_PLAN.md`.
+- Compared the resulting control flow to `receiver-esp32/main/main.c` and `transmitter/main/main.c` to confirm the ESP8266 retry path now follows the same return-to-recovery pattern as the transmitter-style loop while keeping the simpler page.
+- Did not run build or flash steps in this audit pass.
+
+## 2026-04-30 - ESP8266 provisioning recovery implementation plan
+
+### Summary
+- Added a docs-only implementation plan for bringing the ESP8266 receiver provisioning recovery flow closer to the richer ESP32 behavior without changing the lightweight page shape or the existing local API surface.
+- Expanded the plan into a standalone module-local spec so it can be carried into an isolated `receiver-esp8266` Dev Container without relying on any other repo docs or context.
+- Grounded the plan in the live ESP8266 codebase, the existing Dev Container setup, the checked-in SDK reference snapshot, and the current mismatch between the historical ESP-01 guide intent and the actual reboot-only `retry` behavior.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/RECEIVER_ESP8266_PROVISIONING_RECOVERY_PLAN.md` | ADDED | New standalone implementation-ready plan for ESP8266 recovery-loop parity, including current contracts, state model, file responsibilities, and container validation steps |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the new ESP8266 recovery plan |
+
+### Verification
+- Re-audited the current ESP8266 recovery/runtime flow in `receiver-esp8266/main/main.c`, `receiver-esp8266/main/provision/recovery.c`, `receiver-esp8266/main/provision/http_server.c`, `receiver-esp8266/main/network/wifi.c`, and `receiver-esp8266/main/config/device_config.c`.
+- Re-checked the container baseline in `receiver-esp8266/.devcontainer/devcontainer.json` and the local SDK snapshot in `receiver-esp8266/ESP8266_SDK_REFERENCE.md`.
+- Did not run build or flash steps in this docs-only task.
+
+## 2026-04-30 — Device Provisioning UI Simplification
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `receiver-esp8266/main/provision/index.html` | MODIFIED | Finished the remaining bilingual static/meta copy, localized loading/title text, and restored explicit `Be Vietnam Pro` font loading while keeping the same simple layout |
+| `receiver-esp32/main/provision/index.html` | MODIFIED | Reworked the ESP32-C3 receiver provisioning page from a multi-panel layout into a simpler single-card flow aligned with the ESP8266 page, restored explicit `Be Vietnam Pro` font loading, and restored always-visible recovery actions with gated retry behavior |
+| `transmitter/main/provision/index.html` | MODIFIED | Reworked the transmitter provisioning page into the same lighter single-card pattern, preserved polling and recovery actions, restored the live status summary badge plus retry follow-up messaging, aligned retry-button enablement with the actual `provisioned` state, and restored explicit `Be Vietnam Pro` font loading |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the provisioning UI simplification pass |
+
+### Skipped / Deferred
+| Item | Status | Reason |
+|---|---|---|
+| Additional layout expansion beyond the single-card flow | SKIPPED | Not applicable to the lightweight vanilla provisioning pages and would overextend beyond the glass, color, typography, and i18n rules from the workspace docs |
+
+### Verification
+- Not run: build/flash flows were intentionally skipped per repository instruction not to attempt post-implementation builds in this flow.
+
 ## 2026-04-30 — Enrollment token purpose statement
 
 ### Summary

@@ -1,5 +1,42 @@
 # Changelogs
 
+## 2026-05-02 - PT2272 address-only registration, RF cleanup & protocol randomization
+
+### Summary
+Three changes:
+1. **Transmitter firmware RF cleanup (pass 1):** Removed all legacy tri-state/channel-based transmission code from the 433 MHz module. The hub now exclusively uses `bits_to_pulses` for flat binary encoding. Removed: `tristate_code`, `chn_count`, `chn_2/3/4` globals; `tristate_to_pulses()`, `tristate_to_uint32()`, `load_rf_chn_pulses()` functions; `ORIGINAL_CODE`, `CHN_COUNT`, and NVS key macros.
+2. **Transmitter firmware RF cleanup (pass 2):** Purged all remaining multi-channel infrastructure from the `RFHandler` struct and all RF functions. The hub only ever transmits a single pulse sequence per dispatch — multi-channel was dead weight from the old remote-control emulation design. Collapsed `RFPulse *pulses[4]` → `RFPulse *pulses`; removed `chn_count`, `current_chn`, `pulse_count_per_chn` struct fields (replaced with `pulse_count`); removed `chn_idx` parameter from `rf_send()`; simplified `rf_trans_init`/`rf_trans_deinit` from 4-slot array management to single pointer; updated `rf_timer_callback` ISR to use flat `pulses[current_pulse]` instead of `pulses[current_chn][current_pulse]`; updated `rf433_tx_timeout_ticks` and `rf433_tx_send_bits` to use new field names.
+3. **PT2272 address-only registration (plan update):** Changed passive PT2272 receiver registration from full 24-bit code to 16-bit address only. The PT2272 code word has two parts: 8-trit address (16 bits) + 4-trit channel ID (8 bits). Toggle and de-toggle require different channel IDs, so storing the full 24-bit code prevented de-trigger. The backend now stores only the 16-bit address and patches the 8-bit channel ID (toggle=`0x00`, de-toggle=`0x01`) at dispatch time in `TransmitterDispatchService` (§T5). No backend code was implemented — only the plan was updated.
+4. **Per-dispatch protocol randomization:** Added `proto_any` boolean field to the `cmd/transmit` wire format and canonical string (`transmit-v1|...|<proto_any>|<issued_at>`). When `true` (MCU receivers), the hub randomizes the 433 MHz transmission protocol across all 15 RC-Switch entries via `esp_random()` on every dispatch. When `false` (PT2272 passive), it stays on Protocol 1 (350 µs, PT2272-compatible). MCU receivers auto-detect all 15 protocols with 60% timing tolerance in `recv_proto()`; PT2272 hardware decoders only respond to their fixed oscillator timing. The backend populates the field from `device.kind`. Hub-side changes: `dispatch.c` (parse + canonical), `radio_supervisor.c` (protocol selection + `esp_random.h`), `radio_supervisor.h` (signature). Plan and design guide updated.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `transmitter/main/rf/rf_data.c` | MODIFIED | Removed `tristate_code`, `chn_count`, `chn_2/3/4` globals; removed `tristate_to_pulses()`, `tristate_to_uint32()`, `load_rf_chn_pulses()` functions; updated file-level doc comment |
+| `transmitter/main/rf/rf_common.h` | MODIFIED | Removed `RF_NVS_*` macros, `ORIGINAL_CODE`, `CHN_COUNT` defines; removed all tri-state externs and declarations; collapsed `RFHandler` struct from multi-channel (`pulses[4]`, `chn_count`, `current_chn`, `pulse_count_per_chn`) to single-sequence (`*pulses`, `pulse_count`); removed `chn_idx` param from `rf_send` |
+| `transmitter/main/rf/rf_transmitter.c` | MODIFIED | Rewrote `rf_trans_init`/`rf_trans_deinit` for single pulse pointer; simplified `rf_send` to use flat `pulses[]` with no channel index; updated `rf433_tx_timeout_ticks` and `rf433_tx_send_bits` to use `pulse_count` field name; updated doc comment |
+| `transmitter/main/rf/rf_timer.c` | MODIFIED | Updated ISR `rf_timer_callback` from `pulses[current_chn][current_pulse]` to `pulses[current_pulse]`; updated pulse-count comparison from `pulse_count_per_chn` to `pulse_count` |
+| `transmitter/main/dispatch/dispatch.c` | MODIFIED | Added `proto_any` bool to `transmit_cmd_t`; added `json_get_bool` helper; parse `proto_any` from JSON; added `proto_any` to canonical string (`transmit-v1|...|<proto_any>|<issued_at>`); pass `proto_any` to `radio_tx_send` |
+| `transmitter/main/dispatch/radio_supervisor.h` | MODIFIED | Added `bool proto_any` parameter to `radio_tx_send` declaration |
+| `transmitter/main/dispatch/radio_supervisor.c` | MODIFIED | Added `esp_random.h` include; `radio_tx_send` gains `proto_any` param; 433M path selects random protocol 0-14 via `esp_random() % PROTO_COUNT` when `proto_any` is true, else uses `PROTO_ID - 1`; calls `rf_trans_proto_select` before `rf433_tx_send_bits` |
+| `transmitter/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Updated §E.3 `cmd/transmit` payload with `proto_any` field; added field description and canonical string documentation; updated §F.2 dispatch handling step 5 with protocol selection logic; updated §G.6 intro; updated file tree; removed tristate references; bumped last-updated date |
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | SYNCED | Copied from `transmitter/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` to keep the docs/planned copy in sync |
+| `docs/planned/Device Integration Implementation Plan.md` | MODIFIED | §2.4: changed `RECEIVER_433M_PASSIVE` from `1..24` to `exactly 16`, rewrote PT2272 hardware guard as address-only registration explanation; §3.1: updated SQL enum comment, trigger constraint, and plaintext encoding comment for 16-bit address; §6.1: added `pt2272-toggle-channel` and `pt2272-detoggle-channel` config properties; §7: updated passive registration API body example to 16-bit; §D2.1: rewrote step 3 guard from `pt2272_hardware_cap_exceeded` to `pt2272_address_width_mismatch`; §D5.2: rewrote section for 16-bit address storage + dispatch-time patching; §T5: added step 3 (PT2272 channel patching) and rewrote STOP handler to use de-toggle channel; §9.8.1: changed bit-width field from Select to read-only Badge, fixed hex maxLength to 4; §9.8.2: updated validation to `bits === 16`, `hex.length === 4`; §9.8.3: updated RF code panel description for 16-bit address; §9.8.4: renamed error key; bumped last-updated date to 2026-05-02 |
+| `docs/CHANGELOGS.md` | MODIFIED | Added this changelog entry |
+
+### Verification
+- Confirmed zero references to `chn_count`, `current_chn`, `pulse_count_per_chn`, `chn_idx`, or `pulses[N]` (array-of-pointers form) remain in any RF module file.
+- `radio_supervisor.c` calls `rf_trans_deinit` directly — verified it takes `RFHandler*` unchanged.
+- `radio_supervisor.c` calls `rf433_tx_send_bits` which calls `rf_send` internally — no external `rf_send` callers exist.
+- `bits_to_pulses` signature (`RFPulse **pulses, size_t *pulse_count`) is type-compatible with the new `RFHandler` fields (`RFPulse *pulses` passed as `&h->pulses`, `size_t pulse_count` passed as `&h->pulse_count`).
+- ISR `rf_timer_callback` accesses `pulses[current_pulse]` — flat array indexing on the single pointer, correct for IRAM.
+- `proto_any` field present in: `transmit_cmd_t` struct, JSON parser, canonical string format, `radio_tx_send` parameter, and the `radio_supervisor.c` protocol selection branch. Canonical string order matches between `dispatch.c` (hub) and the plan's §2.3 / design guide §E.3.
+- `esp_random()` is hardware RNG on ESP32-C3, available via `esp_random.h` — no entropy seeding needed.
+- `rf_trans_proto_select` was already declared and defined but uncalled — now called from the 433M dispatch path in `radio_supervisor.c`.
+- Receiver-side `recv_proto()` in `receiver-esp32/main/rf/rf_receiver.c` already auto-detects all 15 protocols with 60% timing tolerance — no receiver changes needed.
+- Confirmed no stale references in the integration plan or design guide.
+- No build was attempted per project rules.
+
 ## 2026-05-01 - ESP8266 recovery actions exposure alignment
 
 ### Summary

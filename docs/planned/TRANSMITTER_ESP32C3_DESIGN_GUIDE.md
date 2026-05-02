@@ -26,13 +26,13 @@ Reference baselines:
 - nRF24L01+ PS v1.0: `docs/nrf24/nRF24L01P_PS_v1.0.txt`
 - nRF24L01 PS v2.0 (legacy): `docs/nrf24/nRF24L01_Product_Specification_v2_0-9199.txt`
 
-This document describes the **target end state**. The current
-`transmitter/` repo snapshot is a fresh ESP-IDF skeleton: `main.c` is
-an empty `app_main`, and only an RC-Switch-style 433 MHz pulse engine
-exists under `main/rf/` (`rf_common.h`, `rf_data.c`, `rf_timer.c`,
-`rf_transmitter.c`).
+This document describes the **target end state**. The transmitter hub
+firmware is implemented: dual-radio dispatch (433 MHz + nRF24), MQTT
+command handling, ECDSA signature verification, bootstrap/provisioning,
+heartbeat, and lifecycle management. The `main/rf/` module provides
+bit-oriented 433 MHz ASK/OOK encoding via the RC-Switch protocol table.
 
-**Last updated:** 2026-04-30
+**Last updated:** 2026-05-02
 
 ---
 
@@ -233,11 +233,11 @@ main/
 ├── dispatch/
 │   ├── dispatch.[ch]        cmd/transmit handler: verify, route, ack
 │   └── radio_supervisor.[ch] start/suspend/resume/deinit per radio (§G.2)
-├── rf/                      existing 433 MHz pulse engine
-│   ├── rf_common.h          add bits_to_pulses + rf433_tx_send
-│   ├── rf_data.c            keep RC-Switch protocols; add bits-based encoder
-│   ├── rf_timer.c           unchanged
-│   └── rf_transmitter.c     unchanged
+├── rf/                      433 MHz bit-oriented pulse engine
+│   ├── rf_common.h          bits_to_pulses + rf433_tx_send API
+│   ├── rf_data.c            RC-Switch protocol table; bits-based encoder
+│   ├── rf_timer.c           gptimer ISR for pulse timing
+│   └── rf_transmitter.c     rf433_tx_send_bits wrapper
 └── nrf24/
     ├── nrf24_regs.h         local register + command definitions for the
     │                        PTX driver, including `NRF_DYNPD_P0 (1U << 0)`
@@ -510,20 +510,33 @@ retained**, signed by the backend with the pinned EC key):
   "band": "433M",
   "rf_code_hex": "C35A5A5A",
   "rf_code_bits": 32,
+  "proto_any": true,
   "issued_at": "2026-04-25T10:00:00Z",
   "signature_b64": "BACKEND_ECDSA_SIGNATURE"
 }
 ```
 
+`proto_any` (boolean): when `true`, the hub randomizes the 433 MHz
+transmission protocol across all 15 RC-Switch entries in the `proto[]`
+table via `esp_random()`. When `false`, it uses Protocol 1
+(PT2272-compatible, 350 µs base). Ignored for 2.4 GHz dispatches. The
+backend populates this from `device.kind`: MCU receivers (`RECEIVER_433M`,
+`RECEIVER_2_4G`) → `true`; passive receivers (`RECEIVER_433M_PASSIVE`) →
+`false`. MCU receivers auto-detect any protocol with 60 % timing
+tolerance in `recv_proto()`; PT2272 hardware decoders only respond to
+their fixed oscillator timing.
+
 Canonical string for signing:
 
 ```text
-transmit-v1|<hub_public_id>|<dispatch_id>|<receiver_public_id>|<band>|<rf_code_hex>|<rf_code_bits>|<issued_at>
+transmit-v1|<hub_public_id>|<dispatch_id>|<receiver_public_id>|<band>|<rf_code_hex>|<rf_code_bits>|<proto_any>|<issued_at>
 ```
+
+`<proto_any>` is the literal string `true` or `false`.
 
 Validation order on the hub:
 
-1. JSON shape, `schema_version == 1`, all required fields present.
+1. JSON shape, `schema_version == 1`, all required fields present (including `proto_any`).
 2. `band ∈ { "433M", "2_4G" }`.
 3. Width per band:
    - `433M`: `bits ∈ [1, 32]`, `hex_len == 2 * ceil(bits/8)`.
@@ -681,7 +694,10 @@ no dispatches are in flight.
    replay ring, ack `rejected`, and stop.
 4. Take `radio_mtx`. Two transmits cannot interleave.
 5. Route by `band`:
-   - `"433M"` → `rf433_tx_send_bits(plaintext, byte_len, bits)` (§G.6).
+   - `"433M"` → select protocol: if `proto_any` is `true`, pick a
+     random index 0..14 via `esp_random() % PROTO_COUNT`; else use
+     `PROTO_ID - 1` (Protocol 1, PT2272-compatible). Call
+     `rf_trans_proto_select` then `rf433_tx_send_bits` (§G.6).
    - `"2_4G"` → `nrf24_tx_send(addr)` (§G.7) — `addr` is the 5
      plaintext bytes parsed from `rf_code_hex`; the send path writes
      them to `TX_ADDR` + `RX_ADDR_P0` and emits the fixed
@@ -1189,14 +1205,13 @@ Here `nvs_init_or_recover()` is the thin §G.1 wrapper around
 
 ### G.6 433 MHz transmitter — extend the existing `rf/` module
 
-The current `transmitter/main/rf/` already implements RC-Switch-style
+`transmitter/main/rf/` implements bit-oriented 433 MHz ASK/OOK
 encoding via `rf_common.h` / `rf_data.c` / `rf_timer.c` /
 `rf_transmitter.c`. The pulse engine and `gptimer` ISR are
-production-shaped; what's missing for backend dispatch is a **bits-
-oriented** encoder that complements the existing `tristate_to_pulses`
-(PT2272 remote emulation).
+production-complete; `bits_to_pulses` encodes backend-dispatched
+payloads as one pulse-pair per logic bit.
 
-Within that existing `proto[]` table, protocol IDs **1..4** are the
+Within the `proto[]` table, protocol IDs **1..4** are the
 PT2272 / pin-compatible subset: all four are non-inverted and keep the
 same waveform shape (`sync 1:31`, `zero 1:3`, `one 3:1`), differing
 only by base pulse length (`350`, `320`, `240`, `150` µs). `PROTO_ID`
@@ -1204,13 +1219,9 @@ defaults to `1` today. Protocol 5+ remain available in the RF engine
 for other 433 MHz families but are outside the PT2272-compatible
 contract this guide assumes for passive receivers.
 
-`rf_data.c`'s `tristate_to_pulses` represents each tri-state symbol
-('0', '1', 'F') as **two** pulse-pairs — the PT2272 wire format.
-Backend `cmd/transmit` for `band=433M` carries a flat `uint32_t` of
-`bits ∈ [1, 32]`. Encoding it as
-PT2272 tri-state would only work for codes whose 2-bit groups are in
-`{00, 01, 11}` and would silently misencode `10` groups. Don't go
-through tri-state; emit one pulse-pair per logic bit:
+Backend `cmd/transmit` for `band=433M` carries a flat binary payload
+of `bits ∈ [1, 32]`. The hub transmits one pulse-pair per logic bit
+(no tri-state encoding):
 
 ```c
 // rf/rf_common.h (additions)
@@ -1294,10 +1305,11 @@ generated pulse lengths, multiplies by `repeat_count`, and adds
 `RF433_TX_TIMEOUT_MARGIN_MS`; do not use the nRF24 250 ms budget as a
 433 timeout. The MIN/MAX bounds and protocol selection from
 `rf_common.h` (`PROTO_ID`, `TX_REPEAT_COUNT`, the `Protocol proto[]`
-table) carry over unchanged. Existing
-`tristate_to_pulses` and `tristate_to_uint32` stay in the source —
-they are useful for bench-side remote emulation tooling and have no
-runtime cost when unused.
+table) carry over unchanged. Legacy tri-state encoding functions
+(`tristate_to_pulses`, `tristate_to_uint32`, `load_rf_chn_pulses`)
+and their associated globals (`tristate_code`, `chn_count`,
+`chn_2`/`chn_3`/`chn_4`) have been removed — the hub only uses
+bit-oriented encoding via `bits_to_pulses`.
 
 ### G.7 nRF24L01 / nRF24L01+ transmitter — native ESP-IDF SPI driver
 
@@ -1852,8 +1864,9 @@ disambiguation. It stays on the wire because:
   and replay analysis without forcing the reader to remember the
   width-to-band mapping.
 - It leaves room for future widths without re-cutting the wire
-  format — for example, if 24-bit PT2272 codes ever flow through a
-  hub, `band = "433M"` already disambiguates the 24-bit case.
+  format — for example, PT2272 dispatch codes are 24-bit
+  (16-bit address + 8-bit channel, patched by the backend), and
+  `band = "433M"` already disambiguates the 24-bit case.
 
 Population:
 

@@ -9,7 +9,7 @@ Authoritative firmware sources:
 
 If this plan disagrees with the firmware guides on contract specifics (topics, canonical strings, RF-code shape), fix the guide first, then refresh this plan.
 
-**Last updated:** 2026-04-29
+**Last updated:** 2026-05-02
 
 ---
 
@@ -189,7 +189,7 @@ UTF-8, no trailing newline, exact field order. Builders live in `core/device/Dev
 activate-v1|<challenge_id>|<nonce>|<issued_at>|<expires_at>
 rf-code-v1|<public_id>|<code_version>|<rf_code_hex>|<rf_code_bits>|<issued_at>
 deact-v1|<public_id>|<command_id>|<action>|<issued_at>
-transmit-v1|<hub_public_id>|<dispatch_id>|<receiver_public_id>|<band>|<rf_code_hex>|<rf_code_bits>|<issued_at>
+transmit-v1|<hub_public_id>|<dispatch_id>|<receiver_public_id>|<band>|<rf_code_hex>|<rf_code_bits>|<proto_any>|<issued_at>
 ```
 
 Rules:
@@ -197,6 +197,7 @@ Rules:
 - `issued_at` / `expires_at` are ISO-8601 UTC ending in `Z`.
 - `rf_code_hex` is uppercase hex.
 - Integer fields (e.g. `rf_code_bits`) are base-10 without prefixes.
+- `proto_any` is `true` or `false` (literal string in the canonical). When `true`, the hub randomizes across all 15 RC-Switch protocols on every 433 MHz transmission; when `false`, the hub uses Protocol 1 (PT2272-compatible, 350 µs base). Ignored for 2.4 GHz dispatches. Populated from `device.kind`: `RECEIVER_433M` / `RECEIVER_2_4G` → `true`; `RECEIVER_433M_PASSIVE` → `false`.
 - `dispatch_id` is a UUID minted by the backend per dispatch event so the hub can dedupe replays.
 - `band ∈ { "433M", "2_4G" }`. Populated from `device.kind` of the destination receiver:
   - `RECEIVER_433M` and `RECEIVER_433M_PASSIVE` → `"433M"`.
@@ -214,13 +215,13 @@ Validate before signing or persisting. The bit-width rules reflect what each rec
 | `kind`                  | `rf_code_bits` | Constraints                                     | Source of code                    | What the bytes mean on air                                                                   |
 | ----------------------- | -------------- | ----------------------------------------------- | --------------------------------- | -------------------------------------------------------------------------------------------- |
 | `RECEIVER_433M`         | 1..32          | `hex_len == 2 * ceil(bits/8)`                   | Backend `SecureRandom` (§D5.1)    | RC-Switch payload value matched at the receiver MCU                                          |
-| `RECEIVER_433M_PASSIVE` | 1..24          | `hex_len == 2 * ceil(bits/8)`, **hardware cap** | Admin enters preset value (§D5.2) | PT2272 wire value matched in silicon                                                         |
+| `RECEIVER_433M_PASSIVE` | **exactly 16** | `hex_len == 4` (2 bytes)                        | Admin enters 8-trit address (§D5.2) | PT2272 address portion (first 8 trits); backend patches 8-bit channel ID at dispatch time (§T5) |
 | `RECEIVER_2_4G`         | **exactly 40** | `hex_len == 10`                                 | Backend `SecureRandom` (§D5.1)    | nRF24 5-byte `RX_ADDR_P1` — silicon-level identity, **not** an application-layer match value |
 
 
-Defaults for backend-generated codes (auto-issued at activation) live in §6.1: `default-bits-433m = 32`, `default-bits-24g = 40`. PT2272 has no default — admins always supply the preset because it's hardware-fixed at the chip.
+Defaults for backend-generated codes (auto-issued at activation) live in §6.1: `default-bits-433m = 32`, `default-bits-24g = 40`. PT2272 has no default — admins always supply the 16-bit address because it's hardware-fixed at the chip (the channel ID is a backend config, not per-device).
 
-**PT2272 24-bit hardware guard.** The 24-bit cap on `RECEIVER_433M_PASSIVE` is a property of the chip itself: PT2272-class decoders encode 12 tri-state symbols, each represented by 2 bits, for a 24-bit total. The cap therefore must be enforced as an authoritative server-side checkpoint, not just a UI nicety: a request with `bits > 24` on a passive registration is rejected before any DB write with a dedicated `pt2272_hardware_cap_exceeded` error so the UI can show a hardware-specific message rather than the generic width error.
+**PT2272 address-only registration.** PT2272-class decoders encode 12 tri-state symbols (24 bits total on the wire), split into two parts: the **address** (first 8 trits = 16 bits) identifies the receiver, and the **channel ID** (last 4 trits = 8 bits) selects which output pin to activate. Toggle (trigger) and de-toggle (de-trigger) use the same address but different channel IDs — the chip requires a separate code to turn off an output. The backend therefore stores only the 16-bit address; at dispatch time it patches the appropriate channel suffix to form the full 24-bit on-air code (§T5). `bits` is enforced at exactly `16` as an authoritative server-side checkpoint: a request with `bits != 16` on a passive registration is rejected before any DB write with a dedicated `pt2272_address_width_mismatch` error so the UI can show a hardware-specific message rather than the generic width error.
 
 **PT2272-compatible 433 MHz protocol subset.** For passive PT2272 and pin-compatible decoder ICs, the matching transmitter-side subset is protocol IDs **1..4** from `transmitter/main/rf/rf_data.c`. All four entries keep the same non-inverted PT2272-style waveform (`sync 1:31`, `zero 1:3`, `one 3:1`) and differ only by base pulse length (`350`, `320`, `240`, `150` µs). Protocol 5+ remain available in the RF engine for other 433 MHz families but are outside the PT2272-compatible contract.
 
@@ -258,7 +259,7 @@ The repo has no Flyway/Liquibase, and `bootJar` excludes `db/**`, so the migrati
 ```sql
 CREATE TYPE device_kind AS ENUM (
   'RECEIVER_433M',          -- MCU 433 MHz (ESP-01 / ESP32-C3); 1..32 bits
-  'RECEIVER_433M_PASSIVE',  -- PT2272-class hardware decoder; 1..24 bits, admin-registered
+  'RECEIVER_433M_PASSIVE',  -- PT2272-class hardware decoder; bits = 16 (address only), admin-registered
   'RECEIVER_2_4G',          -- MCU 2.4 GHz (ESP32-C3); rf_code is the 5-byte nRF24 RX_ADDR_P1 (bits = 40)
   'TRANSMITTER_HUB'         -- ESP32-C3 hub, dual-radio (433 MHz + 2.4 GHz)
 );
@@ -313,10 +314,12 @@ CREATE INDEX idx_device_kind ON device(kind);
 
 -- Plaintext payload encoding (firmware/backend MUST agree). Only
 -- ciphertext is stored; plaintext meaning by kind:
---   RECEIVER_433M / RECEIVER_433M_PASSIVE: big-endian unsigned int,
---     left-padded to byte_len = ceil(bits/8); only the bottom `bits`
---     LSBs are significant. Width: bits ∈ [1, 32] (433M) or [1, 24]
---     (433M_PASSIVE).
+--   RECEIVER_433M: big-endian unsigned int, left-padded to
+--     byte_len = ceil(bits/8); only the bottom `bits` LSBs are
+--     significant. Width: bits ∈ [1, 32].
+--   RECEIVER_433M_PASSIVE: 16-bit PT2272 address (8-trit address
+--     portion only; bits = 16, byte_len = 2). Backend patches the
+--     8-bit channel ID at dispatch time to form the 24-bit on-air code.
 --   RECEIVER_2_4G: 5-byte nRF24 address (SETUP_AW = 11). bits = 40,
 --     byte_len = 5 enforced by the kind-aware CHECK below. Bytes go on
 --     the wire LSByte first (PS v1.0 §8.3.1).
@@ -338,8 +341,8 @@ CREATE TABLE device_rf_code (
 );
 
 -- Width constraint scoped by device kind. RECEIVER_2_4G stores a 5-byte
--- nRF24 address (bits = 40) and nothing else; 433M variants keep their
--- existing 1..32 / 1..24 ranges. TRANSMITTER_HUB is rejected outright —
+-- nRF24 address (bits = 40) and nothing else; RECEIVER_433M allows
+-- 1..32, RECEIVER_433M_PASSIVE is fixed at 16. TRANSMITTER_HUB is rejected outright —
 -- no row of this table should ever describe a hub. The trigger fires on
 -- insert and update; the device_rf_code row is created in the same
 -- transaction as the device row (D2.1) or after activation (D5.1), so
@@ -355,8 +358,8 @@ BEGIN
     RAISE EXCEPTION 'RECEIVER_2_4G requires bits = 40 and byte_len = 5';
   ELSIF k = 'RECEIVER_433M' AND NEW.bits NOT BETWEEN 1 AND 32 THEN
     RAISE EXCEPTION 'RECEIVER_433M requires bits BETWEEN 1 AND 32';
-  ELSIF k = 'RECEIVER_433M_PASSIVE' AND NEW.bits NOT BETWEEN 1 AND 24 THEN
-    RAISE EXCEPTION 'RECEIVER_433M_PASSIVE requires bits BETWEEN 1 AND 24';
+  ELSIF k = 'RECEIVER_433M_PASSIVE' AND NEW.bits <> 16 THEN
+    RAISE EXCEPTION 'RECEIVER_433M_PASSIVE requires bits = 16';
   END IF;
   RETURN NEW;
 END;
@@ -544,6 +547,12 @@ device:
     # config-tunable.
     default-bits-433m: 32
     default-bits-24g: 40
+    # PT2272 channel IDs for toggle/de-toggle dispatch. The backend
+    # patches one of these onto the stored 16-bit address to form the
+    # full 24-bit on-air code. Values are 8-bit hex (1 byte).
+    # 0x00 = toggle (trigger output), 0x01 = de-toggle (de-trigger output).
+    pt2272-toggle-channel: 0x00
+    pt2272-detoggle-channel: 0x01
   enrollment:
     token-ttl-seconds: ${DEVICE_ENROLLMENT_TTL_SECONDS:3600}
 ```
@@ -633,12 +642,12 @@ Per-kind behaviour notes:
   "kind": "RECEIVER_433M_PASSIVE",
   "assignedName": "Front gate fob #3",
   "storeId": "<UUID>",
-  "rfCodeHex": "0A1B2C",
-  "rfCodeBits": 24
+  "rfCodeHex": "0A1B",
+  "rfCodeBits": 16
 }
 ```
 
-Server flow (§D2.1 spells out the full sequence): validate the `(hardwareModel, kind)` pair, validate width per §2.4, parse hex to plaintext, run §D5.0 forbidden-set + uniqueness checks, transactionally INSERT `device` (`status = ACTIVE`, synthetic `pas-XXXXX` `public_id`) and `device_rf_code` (`version = 1`, `ack = APPLIED`). No MQTT, no signing, no enrollment token, no approval — admin authority *is* the approval. Returns the new `DeviceDto`.
+Server flow (§D2.1 spells out the full sequence): validate the `(hardwareModel, kind)` pair, validate width per §2.4 (`bits == 16`), parse hex to plaintext (the 16-bit address), run §D5.0 forbidden-set + uniqueness checks, transactionally INSERT `device` (`status = ACTIVE`, synthetic `pas-XXXXX` `public_id`) and `device_rf_code` (`version = 1`, `ack = APPLIED`, `bits = 16`, `byte_len = 2`). No MQTT, no signing, no enrollment token, no approval — admin authority *is* the approval. Returns the new `DeviceDto`.
 
 Queue dispatch lives under existing queue admin routes (handled by `DeviceDispatchService` but exposed via `QueueAdminController`):
 
@@ -725,7 +734,7 @@ Authority: SUPER_ADMIN may issue for any store or none; ADMIN may only issue for
 
 1. Authority check: SUPER_ADMIN may target any store; ADMIN must target `principal.storeId`.
 2. Validate the `(hardwareModel, kind)` pair (§2.2). Reject anything that isn't `(PT2272, RECEIVER_433M_PASSIVE)`.
-3. **PT2272 hardware-cap guard**: reject `bits > 24` with `400 Bad Request {"error":"pt2272_hardware_cap_exceeded","limit":24}` *before* any other validation — the cap is a hardware-physical property of the chip, not just a configuration. Then run the residual width checks: `bits >= 1` and `hex_len == 2 * ceil(bits/8)`. Both surface as `400 Bad Request {"error":"width_out_of_range"}`.
+3. **PT2272 address-width guard**: reject `bits != 16` with `400 Bad Request {"error":"pt2272_address_width_mismatch","required":16}` *before* any other validation — the 16-bit width corresponds to the PT2272's 8-trit address portion, which is the only part the backend stores (the 8-bit channel ID is patched at dispatch time per §T5). Then run the residual width check: `hex_len == 4` (2 bytes). Failure surfaces as `400 Bad Request {"error":"width_out_of_range"}`.
 4. Parse `rfCodeHex` to plaintext bytes; run §D5.0 forbidden-set + uniqueness guards. Surface uniqueness collisions as `409 Conflict` with the colliding device's `public_id` (helps the admin diagnose without exposing the colliding code).
 5. Mint a `pas-XXXXX` `public_id`.
 6. Transactionally INSERT `device` (`status = ACTIVE`, `activated_at = now()`) and `device_rf_code` (`version = 1`, `ack = APPLIED`, `ack_at = now()` — no future ack is coming).
@@ -846,13 +855,13 @@ Applies to `RECEIVER_433M` and `RECEIVER_2_4G`. `RfCodeService.autoIssue(deviceI
 
 **Receiver-side rotation, 2.4G specific.** On `RECEIVER_2_4G`, applying a new rf_code requires rewriting `RX_ADDR_P1` in silicon (not just updating an in-RAM matcher). During the rewrite window plus MQTT round-trip, a dispatch to the new address can be missed until the receiver acks `APPLIED`. Acceptable because rotation is admin-driven and rare; the admin UI surfaces `ack = PENDING` so the operator knows not to dispatch through this device until it lands. Firmware implementation details live in the receiver design guide.
 
-#### D5.2 — Admin-set code (passive PT2272)
+#### D5.2 — Admin-set address (passive PT2272)
 
-Applies to `RECEIVER_433M_PASSIVE`, used at registration (D2.1) and **only** at registration — rotation is rejected because the chip is hardware-fixed.
+Applies to `RECEIVER_433M_PASSIVE`, used at registration (D2.1) and **only** at registration — rotation is rejected because the chip's address is hardware-fixed.
 
-- `POST /api/devices/{id}/rf-code` returns `400 Bad Request` for `RECEIVER_433M_PASSIVE` with body `{"error":"hardware_fixed_code","message":"PT2272 codes are set at the chip and cannot rotate. Replace the device or update the chip's DIP switches and re-register."}`.
-- The registration path supplies plaintext directly: `RfCodeValidator.validate` plus §D5.0 guards run, then `INSERT` with `version = 1`, `ack = APPLIED`, `ack_at = now()` — recording the truthful state immediately because no acknowledgement is ever coming.
-- Plaintext is encrypted on write with the same `encryption-key`. No MQTT publish, no signing. The transmitter reads the row at dispatch time exactly like an MCU code.
+- `POST /api/devices/{id}/rf-code` returns `400 Bad Request` for `RECEIVER_433M_PASSIVE` with body `{"error":"hardware_fixed_code","message":"PT2272 addresses are set at the chip and cannot rotate. Replace the device or update the chip's DIP switches and re-register."}`.
+- The registration path supplies the 16-bit address plaintext directly: `RfCodeValidator.validate` (enforces `bits == 16`) plus §D5.0 guards run, then `INSERT` with `version = 1`, `bits = 16`, `byte_len = 2`, `ack = APPLIED`, `ack_at = now()` — recording the truthful state immediately because no acknowledgement is ever coming.
+- Plaintext (the 16-bit address) is encrypted on write with the same `encryption-key`. No MQTT publish, no signing. At dispatch time `TransmitterDispatchService` decrypts the 16-bit address and patches the appropriate 8-bit channel ID (toggle or de-toggle from `device.rf-code.pt2272-toggle-channel` / `pt2272-detoggle-channel`) to form the full 24-bit on-air code before signing and publishing `cmd/transmit` (§T5).
 - Passive devices have no acks; `ack` stays `APPLIED` from the moment of registration.
 
 ### Phase D6 — Lifecycle (receivers)
@@ -989,16 +998,20 @@ On `DEVICE_CALL_REQUESTED(storeId, ticketId, deviceId)`:
   - Publish `DEVICE_DISPATCH_FAILED` through the queue-event path used elsewhere in the repo: widen `MqttPublisher.QueueEventType`, emit the MQTT queue event, and also `broadcast(QueueSseEvent(...))` locally so SSE stays coherent across single- and multi-instance deployments. §D7b widens the frontend `QueueEventType`, `QueueSseEvent`, and `useQueueEvents` listener list to receive it.
   - Stop. Do not auto-retry, auto-revert, or auto-release the device reservation. The ticket stays in its current queue state and the failure is an operator-facing signal.
 2. Load the receiver row and decrypt its RF code via `pgp_sym_decrypt_bytea` — this is the only point in the system that does so on the dispatch hot path. Decrypted plaintext lives only in service-local memory for the duration of the publish.
-3. Build `transmit-v1|hub_public_id|dispatch_id|receiver_public_id|band|rf_code_hex|rf_code_bits|issued_at`, where `band` is derived from the receiver row's `kind` (§2.3):
-  - `RECEIVER_433M`, `RECEIVER_433M_PASSIVE` → `"433M"`.
-  - `RECEIVER_2_4G` → `"2_4G"`.
+3. **PT2272 channel patching** (only when `kind = RECEIVER_433M_PASSIVE`): the decrypted plaintext is the 16-bit address (2 bytes). Append the appropriate 8-bit channel ID to form the full 24-bit on-air code:
+  - For `DEVICE_CALL_REQUESTED`: append `device.rf-code.pt2272-toggle-channel` (`0x00` by default).
+  - For `DEVICE_STOP_REQUESTED`: append `device.rf-code.pt2272-detoggle-channel` (`0x01` by default).
+  The resulting 3-byte plaintext is used for `rf_code_hex` (6 hex chars) and `rf_code_bits = 24` in the canonical string and the `cmd/transmit` payload. For `RECEIVER_433M` and `RECEIVER_2_4G`, the decrypted plaintext is used as-is (no patching).
+4. Build `transmit-v1|hub_public_id|dispatch_id|receiver_public_id|band|rf_code_hex|rf_code_bits|proto_any|issued_at`, where:
+  - `band` is derived from the receiver row's `kind` (§2.3): `RECEIVER_433M`, `RECEIVER_433M_PASSIVE` → `"433M"`; `RECEIVER_2_4G` → `"2_4G"`.
+  - `proto_any` is derived from `kind` (§2.3): `RECEIVER_433M` / `RECEIVER_2_4G` → `"true"`; `RECEIVER_433M_PASSIVE` → `"false"`.
    No new DB roundtrip — `kind` is already on the receiver row loaded in step 2.
-4. Sign with the existing command-signing key.
-5. Publish on `transmitter/hub/{hubPublicId}/cmd/transmit` (QoS 1, **not retained**) via `DeviceMqttPublisher.publishTransmit`.
+5. Sign with the existing command-signing key.
+6. Publish on `transmitter/hub/{hubPublicId}/cmd/transmit` (QoS 1, **not retained**) via `DeviceMqttPublisher.publishTransmit`.
 
 On `DEVICE_STOP_REQUESTED(storeId, ticketId, deviceId)`:
 
-- "Stop" is another `transmit-v1` with the same RF code (firmware toggles vibrator on each matching frame). Re-elect, decrypt, sign, publish.
+- Same flow as `DEVICE_CALL_REQUESTED` above (re-elect, decrypt, patch, sign, publish). For `RECEIVER_433M` and `RECEIVER_2_4G`, the RF code is the same as the call (firmware toggles on each matching frame). For `RECEIVER_433M_PASSIVE`, step 3 patches the **de-toggle** channel ID instead of the toggle channel, producing a different 24-bit on-air code that de-triggers the PT2272 output pin.
 - If re-election fails, emit `DEVICE_DISPATCH_FAILED` and structured warning. No silent fallback — the admin needs the signal because the receiver may keep vibrating until a hub resends the stop frame.
 
 Busy-key ownership for hub-published signals:
@@ -1219,8 +1232,8 @@ The button is **not** role-gated in the UI; backend `StoreAccessUtil` enforces a
 | Hardware model | `Badge`                  | Read-only, `PT2272`. Hardcoded in payload.                                                                                                                                                                                         |
 | Store          | `Select`                 | SUPER_ADMIN: reuse the repo's current selector pattern (`listStores(0, 100)` from the store feature) rather than coupling this dialog to the store-management table state. ADMIN: single read-only entry forced to `principal.storeId`. Required. |
 | Assigned name  | `Input`                  | Required, `maxLength={100}`.                                                                                                                                                                                                       |
-| Bit width      | `Select`                 | Options 1..24; default 24. Selecting a width re-derives the hex field's `maxLength`. Helper text via `devices.passive.bitsHelp` explains the 24-bit cap is a PT2272 hardware limit.                                                |
-| RF code hex    | `Input` with `font-mono` | `[0-9A-Fa-f]+`, uppercased on blur. `maxLength = 2 * Math.ceil(bits / 8)`.                                                                                                                                                         |
+| Bit width      | `Badge`                  | Read-only, fixed at `16`. Hardcoded in payload. Helper text via `devices.passive.bitsHelp` explains this is the PT2272's 8-trit address; the channel ID is patched by the backend at dispatch time. |
+| RF code hex    | `Input` with `font-mono` | `[0-9A-Fa-f]+`, uppercased on blur. `maxLength = 4` (16 bits = 2 bytes = 4 hex chars).                                                                                                                                              |
 
 
 Field errors render via `InlineError`; field labels via `Label`; helper text uses the existing muted-text pattern from `store-general-fields.tsx`. Footer: primary `Button` (`devices.passive.submit`) with a `Loader2` spinner during submit (matching `create-admin-dialog.tsx`); secondary `Button variant="outline"` (`common.cancel`, existing key). `Dialog` already provides its surface — do not nest it inside a `glass-card`.
@@ -1233,20 +1246,20 @@ Client-side (blocks submit; mirrors §2.4 + §D5.0):
 
 - `assignedName.trim().length > 0`.
 - `storeId` present.
-- `rfCodeBits ∈ [1, 24]`.
-- `rfCodeHex` matches `/^[0-9A-F]+$/i` and `rfCodeHex.length === 2 * Math.ceil(rfCodeBits / 8)`.
+- `rfCodeBits === 16` (hardcoded, not user-adjustable).
+- `rfCodeHex` matches `/^[0-9A-F]+$/i` and `rfCodeHex.length === 4`.
 
 Server-side (surface via `toast` from `sonner` plus `InlineError` next to the relevant field):
 
 - `409 Conflict` on uniqueness clash → `devices.passive.errorConflict`. The response body includes the colliding `public_id`; render it as plain text in the toast (no link). Never render the colliding code itself.
-- `400 Bad Request` with structured `error` field (`pt2272_hardware_cap_exceeded`, `forbidden_pattern`, `width_out_of_range`) → keys under `devices.passive.errors.`*. The hardware-cap variant is the authoritative server-side echo of the `Select` cap, in case a client bypasses the form.
+- `400 Bad Request` with structured `error` field (`pt2272_address_width_mismatch`, `forbidden_pattern`, `width_out_of_range`) → keys under `devices.passive.errors.`*. The address-width variant is the authoritative server-side echo of the fixed width, in case a client bypasses the form.
 - `403 Forbidden` from `StoreAccessUtil` → `devices.passive.errorForbidden`.
 
 #### 9.8.3 Detail page consistency for passive devices
 
 `/dashboard/devices/{id}` renders panels conditionally on `device.kind`:
 
-- `rf-code-editor.tsx` (`kind === "RECEIVER_433M_PASSIVE"`): render read-only. Show `bits` and a `Badge` reading `••  ••  ••` via key `devices.rfCode.maskedValue`. Hide the **Rotate** button. Replace the panel description with `devices.rfCode.lockedNote` — a frontend-i18n string that conveys the same meaning as the server's `hardware_fixed_code` 400 (§D5.2). Do not parrot the server's English message; the server returns the structured `error` code, the UI provides the user-facing copy.
+- `rf-code-editor.tsx` (`kind === "RECEIVER_433M_PASSIVE"`): render read-only. Show `bits = 16` and a `Badge` reading `••  ••` via key `devices.rfCode.maskedValue`. Hide the **Rotate** button. Replace the panel description with `devices.rfCode.lockedNote` — a frontend-i18n string that explains the stored value is the PT2272 address (16-bit); the channel ID is patched by the backend at dispatch time. Do not parrot the server's English message; the server returns the structured `error` code, the UI provides the user-facing copy.
 - `lifecycle-panel.tsx`: behaviour is unchanged (backend handles passive lifecycle as a status flip per §D6). Add `devices.lifecycle.passiveSubtitle` so admins understand the chip itself does not stop listening.
 - The **Reprovision** action is hidden for passive devices (the server returns 404 anyway per §7).
 
@@ -1261,7 +1274,7 @@ Add to both `en.json` and `vi.json`:
 - `devices.passive.hexErrorFormat`, `devices.passive.hexErrorLength`
 - `devices.passive.submit`, `devices.passive.successToast`
 - `devices.passive.errorConflict`, `devices.passive.errorForbidden`
-- `devices.passive.errors.pt2272_hardware_cap_exceeded`, `devices.passive.errors.forbidden_pattern`, `devices.passive.errors.width_out_of_range`
+- `devices.passive.errors.pt2272_address_width_mismatch`, `devices.passive.errors.forbidden_pattern`, `devices.passive.errors.width_out_of_range`
 - `devices.rfCode.maskedValue`, `devices.rfCode.lockedNote`
 - `devices.lifecycle.passiveSubtitle`
 

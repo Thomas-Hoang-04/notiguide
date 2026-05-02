@@ -1837,8 +1837,8 @@ UTF-8, no trailing newline, exact field order:
   reused unchanged for the transmitter bootstrap flow.
 - `deact-v1|<public_id>|<command_id>|<action>|<issued_at>` — reused
   unchanged for the transmitter lifecycle topic family.
-- `transmit-v1|<hub_public_id>|<dispatch_id>|<receiver_public_id>|<band>|<rf_code_hex>|<rf_code_bits>|<issued_at>`
-  — new, with the `band` field per §H.4.
+- `transmit-v1|<hub_public_id>|<dispatch_id>|<receiver_public_id>|<band>|<rf_code_hex>|<rf_code_bits>|<proto_any>|<issued_at>`
+  — new, with the `band` and `proto_any` fields per §H.4 / §E.3.
 
 Rules:
 
@@ -1880,9 +1880,9 @@ Population:
   `band` before signing. No new DB roundtrip — the kind is on the
   same row.
 
-This is not a contract break against an existing firmware: no
-transmitter firmware is in production yet, so `band` lands as part
-of `transmit-v1` from day one rather than a future `transmit-v2`.
+The transmitter firmware already implements `transmit-v1` with `band`
+and `proto_any` from its initial release, so these fields are part of
+the contract from day one rather than a future `transmit-v2`.
 
 ### H.5 Backend package additions
 
@@ -2055,8 +2055,8 @@ unchanged. One signing key covers both fleets.
      same.
   2. Decrypt the receiver's RF code (only point in the system that
      does so on the dispatch hot path).
-  3. Build `transmit-v1|hub_public_id|dispatch_id|receiver_public_id|band|rf_code_hex|rf_code_bits|issued_at`,
-     where `band` is derived from the receiver row's `kind` (§H.4),
+  3. Build `transmit-v1|hub_public_id|dispatch_id|receiver_public_id|band|rf_code_hex|rf_code_bits|proto_any|issued_at`,
+     where `band` and `proto_any` are derived from the receiver row's `kind` (§H.4 / §E.3),
      sign with the existing command-signing key.
   4. Publish on `transmitter/hub/{hubPublicId}/cmd/transmit`
      (QoS 1, not retained).

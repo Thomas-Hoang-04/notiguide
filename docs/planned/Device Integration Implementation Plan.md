@@ -53,7 +53,7 @@ In scope:
 
 Out of scope:
 
-- Firmware in `receiver-esp32/`, `receiver-esp8266/`, and `transmitter/`. The transmitter design guide §A–§G covers the firmware target end state; §I covers firmware build config.
+- Firmware in `receiver-esp32/`, `receiver-esp8266/`, and `transmitter/`. All three firmwares are implemented; the transmitter design guide §A–§G documents the firmware implementation; §I covers firmware build config.
 - Customer-facing `client-web/`.
 - Web Serial bridge (provisioning helper).
 - Per-device MQTT credentials and broker ACLs (v1 uses one shared MQTT credential; isolation rests on TLS, unguessable `public_id`s, and signed operational commands).
@@ -1343,9 +1343,9 @@ After all phases ship, mark the notifier/device-domain row complete in `docs/pla
 
 ## 11. Deferred
 
-Items intentionally out of scope for this plan. Each is independent of the work above and can land as a follow-up.
+Items intentionally out of scope for this plan. Each is independent of the work above.
 
-- Transmitter hub firmware (this plan covers backend and admin web only; firmware target end state lives in [TRANSMITTER_ESP32C3_DESIGN_GUIDE.md](TRANSMITTER_ESP32C3_DESIGN_GUIDE.md) §A–§G, §I).
+- Transmitter hub firmware is already implemented (dual-radio dispatch, MQTT command handling, ECDSA verification, bootstrap/provisioning, heartbeat, lifecycle). This plan covers backend and admin web integration only; firmware implementation details live in [TRANSMITTER_ESP32C3_DESIGN_GUIDE.md](TRANSMITTER_ESP32C3_DESIGN_GUIDE.md) §A–§G, §I.
 - Web Serial bridge (provisioning helper).
 - Per-device MQTT credentials and broker ACLs.
 - SSE for device acks; v1 polls detail pages while ack is pending. The hub heartbeat panel polls on a fixed interval too.

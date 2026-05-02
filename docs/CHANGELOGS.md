@@ -1,5 +1,49 @@
 # Changelogs
 
+## 2026-05-02 - Device Integration Plan audit & stale-reference fixes
+
+### Summary
+Comprehensive audit of `Device Integration Implementation Plan.md` against all three firmware codebases (transmitter, receiver-esp32, receiver-esp8266), the backend, the web frontend, and tech documentation (Spring Boot, Next.js, next-intl, PemContent, pgcrypto via Context7). Five stale references fixed across two files; no factual errors found in the plan's contract descriptions, MQTT topics, canonical strings, version numbers, or UI specification.
+
+### Issues found and fixed
+1. **Transmitter guide §H.3 (line 1840):** `transmit-v1` canonical string was missing `proto_any` field. §E.3 (line 532) and the firmware code both include it. Fixed to match.
+2. **Transmitter guide §H.7.5 step 3 (line 2058):** Same stale canonical string, missing `proto_any`. Fixed.
+3. **Transmitter guide §H.4 (line 1883):** Claimed "no transmitter firmware is in production yet." Firmware is complete since commit `bea2102`. Reworded.
+4. **Integration plan §11 (line 1348):** Listed transmitter firmware as deferred work that "can land as a follow-up." Updated to acknowledge firmware is implemented.
+5. **Integration plan §1.1 (line 56):** Referred to "firmware target end state." Updated to "firmware implementation."
+
+### Verified correct (no changes needed)
+- All MQTT topics across all three firmwares match the plan (§2.1)
+- All four canonical strings match firmware code: `activate-v1`, `rf-code-v1`, `deact-v1`, `transmit-v1` (§2.3)
+- Registration payloads: field names (`hardware_model`, `receiver_type`/`kind`, `firmware_version`, `public_key_b64`, `enrollment_token`, `registration_nonce`) match all firmwares (§2.2)
+- Heartbeat interval (10 s), QoS (0), and payload format match transmitter firmware (§2.5)
+- TOGGLE_MAGIC (0xAA 0x55) matches both transmitter and receiver-esp32 (§2.4)
+- nRF24 address width (40 bits / 5 bytes), channel default (100), and data rate match (§2.4)
+- Protocol table (15 entries) identical across all three firmware codebases and the plan (§2.4)
+- PT2272-compatible subset (protocols 1–4) correctly characterized (§2.4)
+- Backend version numbers: Kotlin 2.3.20, Spring Boot 3.5.11, Java 21, Paho MQTT v5 1.2.5 (§1.1)
+- Web version numbers: Next.js 16.2.1, React 19.2.4, next-intl ^4.8.3, Tailwind ^4, Biome 2.2.0 (§1.1)
+- SecurityConfig permit-all paths match (§1.2)
+- RateLimitFilter.resolveTier accepts path only; plan correctly identifies need to make method-aware (§1.2)
+- MqttClientManager.subscribe(topicFilter, qos) has no descriptor; plan correctly proposes extending it (§F0)
+- MqttConfig @ConditionalOnProperty(prefix = "mqtt", name = ["broker"]) matches (§1.2)
+- notifier_device table still exists; migration path is correct (§3.2)
+- QueueService.issueTicket(storeId, serviceTypeId?) signature matches; plan correctly describes adding extraFields (§D7a)
+- TicketDto fields (id, number, status, issuedAt, calledAt, position) match; plan correctly describes adding deviceId/deviceName (§D7a)
+- MqttPublisher.QueueEventType has 4 values; plan correctly describes adding DEVICE_DISPATCH_FAILED (§D7b)
+- Sidebar NavItem label union matches (§9.2)
+- 24 shadcn primitives installed; no table/tabs/accordion confirms plan's native-table approach (§1.2, §9.3)
+- QueueEventType / QueueSseEvent / use-queue-events.ts match (§D7b)
+- CSS variable tokens in globals.css match Web Styles guide (§9.4)
+- Context7 verified: @ConditionalOnProperty AND semantics, Next.js 16 await params, next-intl 4 useTranslations, PemContent.load/of API, pgp_sym_encrypt_bytea
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` | MODIFIED | Fixed §H.3 and §H.7.5 stale `transmit-v1` canonical strings (added `proto_any`); reworded §H.4 to reflect firmware is implemented |
+| `docs/planned/Device Integration Implementation Plan.md` | MODIFIED | Updated §11 deferred firmware bullet and §1.1 out-of-scope firmware description to reflect implemented status |
+| `docs/CHANGELOGS.md` | MODIFIED | Added this changelog entry |
+
 ## 2026-05-02 - PT2272 address-only registration, RF cleanup & protocol randomization
 
 ### Summary

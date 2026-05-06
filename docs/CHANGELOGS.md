@@ -1,5 +1,534 @@
 # Changelogs
 
+## 2026-05-07 — Known Limitation Amendments (Backend + Frontend)
+
+### Summary
+Resolved all 5 known limitations from the Sprint 3 audit. Backend changes enrich `DeviceDetailDto` with per-hub election state and bound-ticket info, add `reason` to SSE `DEVICE_DISPATCH_FAILED` events, and expose `maxHubsPerStore` from config. Frontend consumes all new fields.
+
+### Backend changes
+- `DeviceDetailDto` — Added `isElected: Boolean?` (hub-only, compared against Redis `store:{storeId}:transmitter:active` elected hub ID) and `boundTicket: BoundTicketDto?` (receiver-only, reads `device:busy:{deviceId}` → ticket hash from Redis).
+- `BoundTicketDto` — New DTO: `ticketId`, `ticketNumber`, `status`.
+- `DeviceQueryService.findDeviceDetailById()` — Enriched with `loadElectedHubId()` (reads `TransmitterActiveRecord` from Redis) and `loadBoundTicket()` (reads `DeviceBusyRecord` → ticket hash fields).
+- `QueueSseEvent` — Added optional `reason: String?` field (backward-compatible, null for non-dispatch events).
+- `TransmitterDispatchService.emitDispatchFailed()` — Now requires a `reason` string. Six call sites emit distinct reasons: `no_active_transmitter`, `device_not_found`, `rf_code_error`, `infrastructure_unavailable`, `payload_error`, `publish_failed`.
+- `QueueDispatchAvailabilityResponse` — Added `maxHubsPerStore: Int?` sourced from `DeviceTransmitterProperties.maxRegisteredPerStore`.
+- `DeviceDispatchService` — Injected `DeviceTransmitterProperties` via `ObjectProvider` to populate `maxHubsPerStore`.
+
+### Frontend changes
+- `types/device.ts` — Added `BoundTicketDto`, `isElected`, `boundTicket` to `DeviceDetailDto`.
+- `types/queue.ts` — Added `reason: string | null` to `QueueSseEvent`, `maxHubsPerStore: number | null` to `AvailableDevicesResponse`.
+- `hub-heartbeat-panel.tsx` — Removed `getAvailableDevices` import and local `isElected` state. Election badge now reads `device.isElected` directly from the device DTO (per-hub accurate). One fewer API call per 15s poll.
+- `dispatched-ticket-panel.tsx` — Receivers now show bound ticket number and status when `device.boundTicket` is present; placeholder when unbound.
+- `queue/page.tsx` — SSE `DEVICE_DISPATCH_FAILED` handler maps `event.reason` to distinct toasts: `no_active_transmitter`, `device_not_found`, or generic infrastructure error.
+- `devices/page.tsx` — Hub cap badge fetched on mount (keyed to store IDs, not filtered device list) so it persists across filter changes. `maxHubsPerStore` read from `AvailableDevicesResponse` instead of hardcoded constant.
+- `en.json` / `vi.json` — Added `queue.dispatch.errorDeviceNotFound`, `queue.dispatch.errorInfrastructure`, `devices.dispatch.boundTicket` (3 keys each). Structural parity verified (596 keys).
+
+### Limitation resolution map
+| # | Limitation | Resolution |
+|---|-----------|------------|
+| 1 | Election state was store-level, not per-hub | `isElected` on `DeviceDetailDto` compared against Redis active cache |
+| 2 | Dispatched-ticket panel showed placeholders | Receivers show bound ticket from `device:busy` → ticket hash lookup |
+| 3 | SSE always showed "no active transmitter" toast | `reason` field on `QueueSseEvent`, 6 distinct reasons, 3 frontend toast categories |
+| 4 | Hub cap badge disappeared on filter change | Fetched independently on mount, not derived from filtered device list |
+| 5 | Hub cap max was hardcoded to 3 | `maxHubsPerStore` exposed from `DeviceTransmitterProperties` via `AvailableDevicesResponse` |
+
+---
+
+## 2026-05-07 — Frontend Sprint 3: Hub Panels + Queue Dispatch UI
+
+### Summary
+Implemented Frontend Sprint 3 of the Device Integration plan. Transmitter hub detail pages are now live with heartbeat polling, liveness badges, and election state. The queue page gains the device-dispatch workflow — issuing device-bound tickets via a dialog, seeing device badges on ticket rows, and handling dispatch failures through SSE. Hub cap badges display per-store hub registration counts on the device list page. Bilingual support (EN/VI) complete.
+
+### Files created
+- `web/src/features/device/hub-heartbeat-panel.tsx` — Hub heartbeat panel: last-heartbeat timestamp, liveness badge (alive/stale derived from lastSeenAt), election state (elected/standby via dispatchReady). 15s polling interval.
+- `web/src/features/device/hub-cap-badge.tsx` — "N / M hubs registered" badge with tooltip explaining backend-enforced ceiling.
+- `web/src/features/queue/device-dispatch-dialog.tsx` — Device-selection dialog for dispatching device-bound tickets. Fetches available receivers, auto-selects when only one device. Handles no_active_transmitter, device_busy, and generic errors.
+
+### Files modified
+- `web/src/types/queue.ts` — Widened `TicketDto` with `deviceId: string | null` and `deviceName: string | null`. Added `DEVICE_DISPATCH_FAILED` to `QueueEventType`. Added `AvailableDevicesResponse` and `IssueDeviceTicketRequest` types.
+- `web/src/lib/constants.ts` — Added `QUEUE.DEVICE_TICKETS(storeId)` and `QUEUE.AVAILABLE_DEVICES(storeId)` to API routes.
+- `web/src/hooks/use-queue-events.ts` — Added `DEVICE_DISPATCH_FAILED` to SSE event listener list.
+- `web/src/features/queue/api.ts` — Added `getAvailableDevices(storeId)` and `issueDeviceTicket(storeId, request)` functions.
+- `web/src/features/device/dispatched-ticket-panel.tsx` — Updated from placeholder to real content. Hub devices show election note + recent dispatches info. Receivers show placeholder (v1 — dispatch history deferred per §11). Now accepts `device` prop.
+- `web/src/app/[locale]/dashboard/devices/[id]/page.tsx` — Hub-specific rendering: heartbeat panel (hub-only), no RF-code panel for hubs, dispatched-ticket panel for both hubs (election note) and receivers, reprovision with hub-specific confirmation. Panel visibility unified via `showDispatchPanel`.
+- `web/src/app/[locale]/dashboard/devices/page.tsx` — Added HubCapBadge: fetches hub registration counts per store, renders badge for admin's store (non-super-admin) or per-store badges in grouped view (super-admin).
+- `web/src/app/[locale]/dashboard/queue/page.tsx` — Added dispatch button (disabled with distinct tooltips for "no devices" vs "no hub"), device dispatch dialog integration, `DEVICE_DISPATCH_FAILED` SSE handler with error toast and dispatch availability refresh.
+- `web/src/features/queue/waiting-list.tsx` — Device badge (Radio icon + device name) on ticket rows when `ticket.deviceId` is non-null. Badge links to `/dashboard/devices/{deviceId}`.
+- `web/src/features/queue/serving-display.tsx` — Device badge on serving ticket cards when `ticket.deviceId` is non-null. Badge links to `/dashboard/devices/{deviceId}`.
+- `web/src/messages/en.json` — Added `queue.dispatch.*` (13 keys)
+- `web/src/messages/vi.json` — Matching Vietnamese translations (13 new keys, natural phrasing)
+
+### Post-implementation audit
+- **Fixed (LOW):** `hub-heartbeat-panel.tsx` STALE_THRESHOLD_MS was 20s (only 5s margin over 15s poll interval). Changed to 30s to match backend `heartbeatLivenessSeconds`, preventing false-stale flicker from network jitter.
+- **Fixed (MEDIUM):** `serving-display.tsx` device badge rendered raw `ticket.deviceName` instead of using `tQueue("dispatch.badgeLabel", ...)` i18n key. Inconsistent with `waiting-list.tsx` which used the i18n key. Now both use the same pattern.
+- **Fixed (LOW):** `queue/page.tsx` declared `dispatchError` state (set from `AvailableDevicesResponse.error`) but never read it anywhere. Removed dead state.
+- **Fixed (LOW):** `types/queue.ts` used inline `import("@/types/device").DeviceDto[]` instead of a top-level named import. Changed to `import type { DeviceDto } from "@/types/device"` per project convention.
+- **Fixed (LOW):** Removed unused `devices.hub.reprovisionConfirm` i18n key from both locale files. Code uses Sprint 2's `reprovision.hubDescription` instead; this key was added per plan spec but never wired.
+- **Fixed (LOW):** Removed unused `queue.dispatch.errorGeneric` i18n key from both locale files. Error handling falls through to `translateCommonApiError()` for non-specific errors, making this key unreachable.
+
+### Known limitations (accepted)
+- **Election state is store-level, not per-hub.** The `GET /available-devices` endpoint returns `dispatchReady` at the store level, not a per-hub election flag. In multi-hub setups, a standby hub could incorrectly show "Elected" if any hub in the store is elected. Correct for single-hub stores (common case). Backend would need to expose per-hub `isElected` field to fully resolve.
+- **Dispatched-ticket panel shows placeholders, not real dispatch history.** Intentional per plan — v1 does not render transmit-ack history (deferred to §11).
+- **SSE DEVICE_DISPATCH_FAILED always shows "no active transmitter" toast.** The backend `QueueSseEvent` has no sub-reason field; the only current emission case is election failure. Correct for v1.
+
+### Verified correct (no fix needed)
+- Hub detail page: heartbeat panel rendered, RF-code panel NOT rendered for hubs, dispatched-ticket panel shows election note
+- Device dispatch button: enabled only when `dispatchReady = true` AND devices available; disabled tooltip distinguishes "no devices" vs "no hub"
+- Device badge on ticket rows: only rendered when `ticket.deviceId` is non-null; clicking navigates to device detail
+- Issued device-bound ticket enters WAITING state (not CALLED) — correctly appears in waiting list, not serving display
+- `DEVICE_DISPATCH_FAILED` SSE handler refreshes dispatch availability after showing toast
+- All existing queue controls (Call Next, serve, cancel, no-show, cleanup, pause/resume, keyboard shortcuts) unchanged
+- Glass-card panels are siblings (no glass-on-glass nesting)
+- All Loader2/Radio icons have `aria-hidden="true"`
+- All theme tokens used correctly per Web Styles guide
+- i18n keys structurally mirrored in en.json and vi.json
+- Zustand queue store compatible with widened TicketDto (nullable fields pass through)
+- No Sprint 1/2 artifacts modified beyond the sprint scope
+
+### Sprint scope compliance
+- Hub heartbeat panel with 15s polling, liveness badge, election state ✓
+- Hub cap badge with registered count and tooltip ✓
+- Device list page: HubCapBadge for stores with hubs ✓
+- Hub detail page: heartbeat panel, no RF-code panel, dispatched-ticket with election note ✓
+- Queue page: dispatch button with disabled states/tooltips ✓
+- Queue page: device-selection dialog ✓
+- Queue page: per-row device badge on waiting list + serving display ✓
+- Queue page: error toasts for dispatch failures ✓
+- SSE: DEVICE_DISPATCH_FAILED event type + handler ✓
+- API constants: QUEUE.DEVICE_TICKETS, QUEUE.AVAILABLE_DEVICES ✓
+- i18n: queue.dispatch.* keys (EN + VI) ✓
+
+---
+
+## 2026-05-05 — Frontend Sprint 2: Approval, Detail Page + Lifecycle
+
+### Summary
+Implemented Frontend Sprint 2 of the Device Integration plan. Admins can now approve/reject pending devices, view conditional panels by device kind on the detail page, rotate RF codes for MCU receivers, and manage device lifecycle (suspend/resume/decommission). Reprovision action available for MCU devices and hubs. Ack polling auto-refreshes device state while awaiting firmware acknowledgment. Bilingual support (EN/VI) complete.
+
+### Files created
+- `web/src/features/device/approve-dialog.tsx` — Approval AlertDialog with assignedName + storeId fields, hub-specific subtitle
+- `web/src/features/device/reject-dialog.tsx` — Rejection AlertDialog with destructive styling
+- `web/src/features/device/rf-code-editor.tsx` — RF code panel: rotation for MCU receivers, read-only for passive (masked value + locked note), not rendered for hubs
+- `web/src/features/device/lifecycle-panel.tsx` — Suspend/resume/decommission actions with AlertDialog confirmations, kind-specific subtitles
+- `web/src/features/device/dispatched-ticket-panel.tsx` — Placeholder panel for device-bound ticket info
+- `web/src/features/device/use-device-ack-poll.ts` — Polling hook (5s interval) for RF code ack, lifecycle command ack, and PENDING_RF_CODE status
+
+### Files modified
+- `web/src/types/device.ts` — Added `DeviceLifecycleAckStatus`, `ApproveDeviceRequest`, `RotateRfCodeRequest`, `DeviceLifecycleRequest` types
+- `web/src/features/device/api.ts` — Added `getDevice`, `approveDevice`, `rejectDevice`, `rotateRfCode`, `lifecycleAction`, `reprovisionDevice` functions
+- `web/src/features/device/pending-review-card.tsx` — Added approve/reject inline action buttons (Check/X icons) for PENDING devices; new `onActionComplete` prop
+- `web/src/app/[locale]/dashboard/devices/[id]/page.tsx` — Conditional panels by device.kind: RF code editor (receivers only), lifecycle panel (non-pending statuses), dispatched ticket placeholder (active receivers), reprovision action (hidden for passive). Uses feature API functions instead of raw `get`/`post`. Wired ack polling hook.
+- `web/src/app/[locale]/dashboard/devices/page.tsx` — Pass `onActionComplete` to PendingReviewCard
+- `web/src/app/[locale]/dashboard/devices/pending/page.tsx` — Pass `onActionComplete` to PendingReviewCard
+- `web/src/messages/en.json` — Added `devices.pending.*` (13 keys), `devices.rfCode.*` (6 new keys), `devices.lifecycle.*` (15 keys), `devices.reprovision.*` (5 keys), `devices.dispatch.*` (2 keys), `devices.hub.*` (12 keys)
+- `web/src/messages/vi.json` — Matching Vietnamese translations (53 new keys, natural phrasing)
+
+### Post-implementation audit
+- **Fixed (MEDIUM):** Detail page used raw `get`/`post` from `@/lib/api` instead of feature API functions. Changed to use `getDevice()` and `reprovisionDevice()` from `@/features/device/api` for consistency.
+- **Fixed (LOW):** Unused `Power` import in `lifecycle-panel.tsx`. Removed.
+- **Fixed (LOW):** `use-device-ack-poll.ts` captured `onUpdate` in interval closure without ref. Added `useRef` pattern to prevent stale closure.
+
+### Plan-adherence audit (round 2)
+- **Fixed (MEDIUM):** `lifecycle-panel.tsx` rendered `lifecycleCmd.action` as a raw backend string (`suspend`/`resume`/`decommission`) without i18n translation. Vietnamese locale showed English action names. Mapped to existing button-label translation keys (`lifecycle.suspendButton`, `lifecycle.resumeButton`, `lifecycle.decommissionButton`).
+- **Fixed (MEDIUM):** `approve-dialog.tsx` reused `tokens.storePlaceholder` ("Select a store (optional)") for the store selector, but store is **required** for device approval. Added dedicated `pending.approveStorePlaceholder` key ("Select a store" / "Chọn cửa hàng") in both locale files.
+
+### Verified correct (no fix needed)
+- Approve buttons only appear for PENDING status (not PENDING_RF_CODE) — PENDING_RF_CODE devices already passed approval
+- RF code rotation blocked for passive (button hidden) and hub (panel not rendered)
+- Lifecycle buttons disabled for DECOMMISSIONED and REJECTED statuses; panel hidden for PENDING/PENDING_RF_CODE
+- Reprovision hidden for RECEIVER_433M_PASSIVE (backend returns 404 anyway)
+- Error codes handled: `hub_cap_reached` (409 on approve), `hardware_fixed_code` (400 on rf-code), `hub_no_rf_code` (400 on rf-code)
+- Glass-card panels are siblings (no glass-on-glass nesting)
+- All Loader2 icons have `aria-hidden="true"`
+- All theme tokens used correctly per Web Styles guide
+- i18n keys structurally mirrored in en.json and vi.json
+- No Sprint 3 artifacts present (no hub-heartbeat, no hub-cap-badge, no queue dispatch UI)
+
+### Sprint scope compliance
+- All 6 Sprint 2 feature files created (§9.3)
+- Pending review card gains approve/reject actions
+- Detail page conditional panels by device.kind
+- Reprovision AlertDialog confirmation, hidden for passive
+- Ack polling hook operational
+- All Sprint 2 i18n keys present
+
+---
+
+## 2026-05-05 — Frontend Sprint 1: Plan-adherence audit
+
+### Summary
+Audited Frontend Sprint 1 for plan adherence, logic consistency, UI rules/consistency, and syntax accuracy (verified Next.js 16 + next-intl APIs with Context7).
+
+### Findings — 3 issues fixed
+
+1. **CONVENTION — `device-status-badge.tsx`: value import of React instead of type import.** `import React from "react"` used only for `React.ReactNode` type annotation. Changed to `import type { ReactNode } from "react"` with direct `ReactNode` usage. Matches project convention (`import type` for type-only imports).
+
+2. **UI CONSISTENCY — `enrollment-token-table.tsx`: missing `aria-hidden` on Loader2.** The `<Loader2>` in the revoke AlertDialogAction was missing `aria-hidden="true"` — every other Loader2 icon in the sprint consistently includes it. Fixed.
+
+3. **CONVENTION — `[id]/page.tsx`: inline `DeviceDetailDto` type.** The `DeviceDetailDto extends DeviceDto` interface was defined inline in the page file. Moved to `@/types/device.ts` alongside other device types, consistent with the project's centralized type pattern. Page now imports from `@/types/device`.
+
+### Verified correct (no fix needed)
+- `types.ts` in `@/types/device.ts` instead of `features/device/types.ts` — follows existing project convention (all type files live in `@/types/`)
+- `[id]/page.tsx` uses `useParams` — plan §9.1 explicitly allows this as an alternative to the async server wrapper; consistent with `analytics/[storeId]/page.tsx`
+- `device.css` empty — placeholder per §9.4; no long Tailwind class lists to extract
+- Dialogs use `<p>` for descriptions instead of `DialogDescription` — matches project-wide pattern (no Dialog in the project uses `DialogDescription`; only AlertDialogs use `AlertDialogDescription`)
+- All `useFormatter().dateTime()` calls use correct next-intl API (verified with Context7)
+- Next.js 16 `useParams<{ id: string }>()` usage is valid (verified with Context7)
+- All theme tokens (`primary`, `action`, `success`, `warning`, `destructive`, `muted`, `border`) used correctly per Web Styles guide
+- Glass cards are sibling panels (no glass-on-glass nesting)
+- Native `<table>` in `glass-card` with `overflow-x-auto` matches admin/store table pattern
+- All i18n keys present in both en.json and vi.json; Vietnamese translations are natural
+- Filter bar, token dialog, passive form dialog all follow existing shadcn component patterns
+
+### Plan adherence — all Sprint 1 scope items verified
+- 4 routes created (§9.1)
+- Sidebar entry wired with Radio icon (§9.2)
+- 9 Sprint 1 feature files + pending-review-card created (§9.3)
+- API constants match §9.5
+- i18n keys match §9.6 + §9.8.4
+- No Sprint 2 or Sprint 3 artifacts present
+
+---
+
+## 2026-05-04 — Frontend Sprint 1: Device Domain Shell + Tokens + Registration
+
+### Summary
+Implemented Frontend Sprint 1 of the Device Integration plan. The device management pages, sidebar entry, enrollment token workflow, pending device review, passive PT2272 registration, and device list with filtering are all live. Bilingual support (EN/VI) complete.
+
+### Files created
+- `web/src/types/device.ts` — TypeScript types for device DTOs, enums, request/response shapes
+- `web/src/features/device/api.ts` — API functions: listDevices, issueEnrollmentToken, listEnrollmentTokens, revokeEnrollmentToken, registerPassiveDevice
+- `web/src/features/device/device-status-badge.tsx` — Status badge with per-status colors and icons
+- `web/src/features/device/device-filter-bar.tsx` — Filter bar with status/kind/hardware/store selects
+- `web/src/features/device/device-list-table.tsx` — Native table in glass-card with skeleton loading and empty state
+- `web/src/features/device/enrollment-token-dialog.tsx` — Issue token dialog with one-time plaintext display and copy action
+- `web/src/features/device/enrollment-token-table.tsx` — Token listing with revoke confirmation (AlertDialog)
+- `web/src/features/device/passive-device-form-dialog.tsx` — PT2272 manual registration with client-side + server error handling
+- `web/src/features/device/pending-review-card.tsx` — Pending devices card with links to detail
+- `web/src/app/[locale]/dashboard/devices/page.tsx` — Main device list page with filters, actions, pending card
+- `web/src/app/[locale]/dashboard/devices/pending/page.tsx` — Dedicated pending review page
+- `web/src/app/[locale]/dashboard/devices/tokens/page.tsx` — Enrollment tokens management page
+- `web/src/app/[locale]/dashboard/devices/[id]/page.tsx` — Device detail page with identity + RF code panels
+- `web/src/styles/device.css` — Device feature CSS (minimal; styling via Tailwind + glass.css)
+
+### Files modified
+- `web/src/lib/api.ts` — Backfill `code`/`message`/`path`/`method` from HTTP response when body omits them (fixes device controller custom error bodies)
+- `web/src/lib/constants.ts` — Added `DEVICES.*` block to `API_ROUTES`
+- `web/src/components/layout/sidebar.tsx` — Added `devices` to NavItem.label union, `Radio` icon, nav entry
+- `web/src/messages/en.json` — Added `navigation.devices` + `devices.*` namespace (94 keys)
+- `web/src/messages/vi.json` — Added matching Vietnamese translations (94 keys, natural phrasing)
+
+### Post-implementation audit
+- **Fixed:** RF code ack status rendered as raw enum → now uses i18n keys `devices.rfCode.ack.*`
+- **Fixed:** Non-superAdmin passive form showed "Loading..." for store → now uses `admin.storeName` from auth store
+- **Fixed:** Detail page used `toLocaleString()` → now uses `useFormatter().dateTime()` for locale-aware dates
+- **Fixed (CRITICAL):** Device controller exception handler returns custom response bodies (`{"error": "..."}`) without `code`/`path`/`method` fields. The frontend `api.ts` created `ApiError` with `code = undefined`, causing all HTTP-status-based error handling (`err.code === 400/409/403`) to silently fail. Fixed by falling back to `response.status` in `api.ts` when body lacks `code`. Also fixed passive form to check `err.error` (the backend's discriminator field) instead of `err.message` for 400 error classification.
+- **Fixed (pre-existing):** `translateCommonApiError` fallback leaked raw backend English strings to users via `return error.message`. Added `errors.badRequest` i18n key for 400 responses. Changed final fallthrough from `error.message` to `tErrors("serverError")` so no raw backend text ever reaches the toast. Verified all 60+ callers: no regressions — callers that handle 409 specifically (delete-store, delete-service-type) do so before calling this function.
+
+### Sprint scope compliance
+- All 4 routes created (§9.1)
+- Sidebar entry wired with Radio icon (§9.2)
+- All 9 Sprint 1 feature files created (§9.3)
+- API constants match §9.5
+- i18n keys match §9.6 + §9.8.4
+- No Sprint 2 or Sprint 3 artifacts present
+
+---
+
+## 2026-05-04 - Device Integration Backend Sprint 3 — post-implementation audit
+
+### Summary
+Audited Backend Sprint 3 for plan adherence, logic consistency, execution/inter-app communication flow, syntax accuracy, Sprint 1 & 2 coherence (verified with Context7), and overall device domain coherence across all three backend sprints.
+
+### Findings — 1 issue fixed, 1 noted (pre-existing)
+
+1. **CLEANUP (LOW) — Dead `TransmitterLifecycleAckListener.kt` file.** After Sprint 3 consolidated hub ack handling into `TransmitterOperationalListener`, the original file was left as a deprecated typealias with no consumers. Removed.
+
+2. **INFO (PRE-EXISTING) — Missing multi-instance SSE propagation for TICKET_REQUEUED, TICKET_SKIPPED, TICKET_TRANSFERRED.** These SSE events are broadcast locally only — they are not in `MqttPublisher.QueueEventType` and won't propagate across instances via MQTT. Not a Sprint 3 regression; predates the device domain entirely. Noted for future multi-instance work.
+
+### Plan adherence — all 5 phases verified
+
+- **T3 (TransmitterOperationalListener):** Heartbeat → `last_seen_at` + Redis liveness key. Transmit-ack → log with `dispatch_id`. Deact-ack → shared lifecycle handler. QoS 0 for heartbeat. Conditional gating correct.
+- **T4 (TransmitterElectionService):** Cache-first with liveness re-validation, fresh election sorted by `last_seen_at DESC, id ASC`, null when no live candidate. Election cache invalidated on suspend/decommission in `DeviceLifecycleService`.
+- **D7a (Queue Dispatch Plumbing):** `issueTicket` + `extraFields`, `TicketDto` widened, all 6 queue-operation hooks correct (call, serve, cancel, no-show requeue, no-show skip, transfer). FCM vs dispatch-event branching, busy-key TTL lifecycle, rollback on failure.
+- **T5 (TransmitterDispatchService):** Re-election on dispatch, PT2272 channel patching (toggle/de-toggle), band/protoAny from receiver kind, canonical string matches §2.3, `cmd/transmit` not retained, busy-key ownership correct (RELEASE → delete, REQUEUE → keep, CALL → keep, FAILED → keep).
+- **T7 (Cap Endpoint):** `GET /api/devices?kind=TRANSMITTER_HUB&storeId=X` returns `registered` count via existing `DeviceListResponse`.
+
+### Overall device domain coherence audit
+
+- **Conditional bean wiring:** Transmitter features (`TransmitterOperationalListener`, `TransmitterBootstrapListener`, `TransmitterElectionService`, `TransmitterDispatchService`) all gated behind `device.transmitter.enabled`. `DeviceDispatchService` (always registered) injects election service via `ObjectProvider` — absent-bean treated as `no_active_transmitter`.
+- **MQTT topic namespace:** `receiver/*` and `transmitter/*` correctly scoped. Topic prefix applied consistently. Bootstrap listeners use `noLocal` for transmitter path.
+- **Redis key conventions:** `device:busy:`, `device:hub:alive:`, `store:{storeId}:transmitter:active` all follow `RedisKeyManager` pattern. TTLs consistent with `RedisTTLPolicy`.
+- **Error handling:** `DeviceControllerExceptionHandler` covers both `DeviceAdminController` and `QueueAdminController`. Domain exceptions (`DeviceConflictEnvelopeException`, etc.) produce structured JSON envelopes.
+- **SecurityConfig invariant preserved:** No new permit-all routes added. Device and queue dispatch endpoints stay authenticated.
+- **Canonical strings:** All 4 builders (`activate-v1`, `rf-code-v1`, `deact-v1`, `transmit-v1`) produce ISO-8601 UTC timestamps via `OffsetDateTime.toInstant()`.
+- **Platform consistency (§1.0):** Device-bound tickets enter the same Redis queues, same admin operations, same SSE/MQTT events. Device hooks are transparent side-effects keyed on `device_id` presence.
+- **Sprint 1→2→3 coherence:** Registration → approval → activation → RF code → lifecycle flows all work end-to-end. Deact-ack handler shared between receiver and hub paths. Election cache invalidated on lifecycle state changes.
+
+### Context7 verification
+All Spring Boot 3.5 / WebFlux patterns confirmed correct: `@ConditionalOnProperty`, `ObjectProvider<T>`, `SmartInitializingSingleton`, `Sinks.many().multicast().directBestEffort()`, `ReactiveRedisTemplate.setIfAbsent`, coroutine scope lifecycle, R2DBC `DatabaseClient` reactive-to-coroutine bridge.
+
+### Files changed
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/listener/TransmitterLifecycleAckListener.kt` — **removed** (dead deprecated typealias)
+- `docs/planned/Device Integration Implementation Plan.md` — marked Backend Sprint 3 as ✅
+- `docs/CHANGELOGS.md`
+
+---
+
+## 2026-05-04 - Device Integration Backend Sprint 3
+
+### Summary
+Implemented Backend Sprint 3 of `docs/planned/Device Integration Implementation Plan.md` within the documented backend scope only: transmitter heartbeat ingestion, active-hub election, queue-side device dispatch plumbing, the transmitter dispatch consumer, queue admin device endpoints, and `DEVICE_DISPATCH_FAILED` MQTT/SSE fan-out. Frontend Sprint 3 work, resend affordances, and deferred analytics stayed untouched.
+
+### Files changed
+- `backend/src/main/kotlin/com/thomas/notiguide/core/mqtt/MqttPublisher.kt` — added `DEVICE_DISPATCH_FAILED` to queue-event fan-out types
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/controller/DeviceControllerExceptionHandler.kt` — extended structured device conflict/service-unavailable envelopes to the queue admin controller for device-dispatch errors
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/listener/TransmitterLifecycleAckListener.kt` — converted to a compatibility alias so the new operational listener owns hub ack handling
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/listener/TransmitterOperationalListener.kt` — added hub heartbeat + transmit/deact ack ingestion with liveness-key bumps and `last_seen_at` updates
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/repository/DeviceRepository.kt` — added active-hub candidate query for store-level election
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/repository/DeviceRfCodeRepository.kt` — added hot-path RF-code decryption helper for transmitter dispatch
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceDispatchEventBroadcaster.kt` — added in-process dispatch event broadcaster using Reactor multicast `directBestEffort`
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceDispatchService.kt` — added `issueDeviceTicket(...)` and `getAvailableDevices(...)` with hub preflight and busy-key reservation
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceRedisState.kt` — added shared Redis record models for busy-ticket and active-hub cache payloads
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/TransmitterDispatchService.kt` — added elected-hub RF dispatch consumer with PT2272 channel patching and fail-closed release rules
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/TransmitterElectionService.kt` — added Redis-cached active-hub election with liveness re-validation
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/controller/QueueAdminController.kt` — added `GET /available-devices` and `POST /device-tickets`
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/dto/QueueDispatchAvailabilityResponse.kt` — added the queue preflight response envelope
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/dto/TicketDto.kt` — widened tickets with `deviceId` and `deviceName`
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/request/IssueDeviceTicketRequest.kt` — added request model for queue-side device ticket issuance
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/service/QueueService.kt` — added `extraFields` ticket persistence, device-bound queue hooks, busy-key lifecycle updates, and device-aware ticket mapping
+- `docs/CHANGELOGS.md`
+
+### Scope kept out
+- Frontend Sprint 3 queue/device UI, hub panels, and SSE client typing
+- Queue-side resend/auto-retry or auto-revert behavior after `DEVICE_DISPATCH_FAILED`
+- `DEVICE_TRIGGERED` / transmit-ack analytics emission
+- Web Serial provisioning helpers and per-device MQTT credentials / ACLs
+
+### Verification
+- Context7 verification used before implementation for Spring Boot conditional bean registration patterns, Spring Data Redis reactive value/hash operations, Spring R2DBC/`DatabaseClient` query patterns, and Reactor `Sinks.many().multicast().directBestEffort()`.
+- Manual direct impact scan was used for the touched symbols because GitNexus re-analyze was explicitly skipped: the high-risk slice was contained to `TicketDto`, `QueueService`, `QueueAdminController`, and queue event fan-out, while the transmitter/election pieces were additive new services/listeners.
+- Static audit confirmed the Sprint 3 backend T7 surface was already satisfied by the existing `GET /api/devices?kind=TRANSMITTER_HUB&storeId=...` `registered` count path, so no extra device-list widening beyond the documented response was needed.
+- IDE lints on the edited files were clean.
+- Static checks run: `git diff --check` was attempted; the only reported diff-check issue was a pre-existing blank-line-at-EOF warning in `docs/planned/Device Integration Implementation Plan.md`, outside this change set.
+- Not run: build/test commands were intentionally skipped per repository instruction not to attempt post-implementation builds in this flow.
+
+## 2026-05-03 - Device Integration Backend Sprint 2 — post-implementation audit
+
+### Summary
+Audited Backend Sprint 2 for plan adherence, logic consistency, execution/inter-app communication flow, syntax accuracy, and Sprint 1 coherence (verified with Context7 for Spring Framework 6.2 coroutine/transaction patterns).
+
+### Findings — 2 issues, both fixed
+
+1. **BUG — `DeviceActivationService.onResponse` double activation-state deletion.** `deleteActivationState` was called twice: first bare (line 87, would abort transaction on failure), then inside `runCatching` (line 96, always a no-op). Removed the bare call, kept only the error-tolerant `runCatching`-wrapped version.
+
+2. **PLAN ADHERENCE — Bootstrap listeners missing self-echo guard.** `DeviceBootstrapListener` and `TransmitterBootstrapListener` forwarded ALL messages on `…/bootstrap/{cid}` to `DeviceActivationService.onResponse`, including backend-owned envelope types (`pending`, `challenge`, `rejected`, `result`). Plan §D2 requires "Backend-owned envelope types arriving on `receiver/bootstrap/+` are ignored (self-echo guard)." Added explicit `type == "response"` filter before dispatch in both listeners. The transmitter listener already uses MQTT v5 `noLocal`; the explicit filter stays as defense-in-depth per §T1.
+
+### Files changed
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceActivationService.kt` — removed duplicate `deleteActivationState` call, kept `runCatching`-wrapped version only
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/listener/DeviceBootstrapListener.kt` — added `ObjectMapper` dependency and `type == "response"` self-echo guard; added shared `BootstrapEnvelopeType` data class
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/listener/TransmitterBootstrapListener.kt` — added `ObjectMapper` dependency and `type == "response"` self-echo guard (defense-in-depth alongside `noLocal`)
+- `docs/planned/Device Integration Implementation Plan.md` — marked Backend Sprint 2 as ✅, appended audit log
+- `docs/CHANGELOGS.md`
+
+### Context7 verification
+- Spring Framework 6.2 docs confirm `@Transactional` on `suspend` functions requires `TransactionalOperator.executeAndAwait` for service-layer code. However, the project uses declarative `@Transactional` on suspend functions throughout (`AdminService`, `StoreService`, `ServiceTypeService`) as an established pattern. Spring Boot 3.5's coroutine-aware R2DBC transaction interceptor (added in Spring 6.1+) supports this. Not flagged as a Sprint 2 regression since it matches the existing codebase convention.
+
+---
+
+## 2026-05-03 - Device Integration Backend Sprint 2
+
+### Summary
+Implemented Backend Sprint 2 of `docs/planned/Device Integration Implementation Plan.md` within the documented scope only: device approval/rejection, bootstrap activation response handling for receivers and hubs, RF-code issue/rotation plus receiver ack ingestion, lifecycle/reprovision flows, and the remaining `/api/devices/{id}` admin endpoints. Heartbeat ingestion, active-hub election, queue-dispatch plumbing, and queue-side device endpoints were intentionally left untouched for Backend Sprint 3.
+
+### Files changed
+- `backend/src/main/kotlin/com/thomas/notiguide/core/device/DeviceMqttPublisher.kt` — added `challenge`, `result`, and kind-aware bootstrap rejection publishing for Sprint 2 bootstrap envelopes
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/controller/DeviceAdminController.kt` — added `GET /api/devices/{id}` plus approve/reject/rf-code/lifecycle/reprovision endpoints
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/controller/DeviceControllerExceptionHandler.kt` — extended structured device error handling to cover conflict and service-unavailable envelopes
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/dto/DeviceDetailDto.kt` — added the device detail read model
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/dto/DeviceLifecycleCommandDto.kt` — added detail-page lifecycle command metadata
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/listener/DeviceBootstrapListener.kt` — now handles receiver activation `response` envelopes in addition to registration
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/listener/DeviceOperationalListener.kt` — new receiver ack listener for `rf_code` and `deact`
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/listener/TransmitterBootstrapListener.kt` — now handles hub activation `response` envelopes in addition to registration
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/listener/TransmitterLifecycleAckListener.kt` — new hub lifecycle-ack listener scoped to `ack_for = "deact"` only
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/repository/DeviceRepository.kt` — added `findByPublicId(...)` for operational ack handling
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/repository/DeviceRfCodeRepository.kt` — added RF-code update/current/ack-write helpers needed for auto-issue and rotation
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/request/ApproveDeviceRequest.kt` — added approval request DTO
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/request/DeviceLifecycleRequest.kt` — added lifecycle request DTO
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/request/RotateRfCodeRequest.kt` — added RF-code rotation request DTO
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceActivationService.kt` — added shared receiver/hub activation-response verification and post-activation flow
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceApprovalService.kt` — added pending-device approve/reject handling with Redis challenge updates and hub cap re-check
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceControllerExceptions.kt` — added structured device conflict/service-unavailable exception types and optional detail messages
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceLifecycleService.kt` — added lifecycle command issue/ack handling plus reprovision
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceQueryService.kt` — added device detail loading with transient lifecycle-command state
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceRedisState.kt` — added shared Redis record models for activation and lifecycle state
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceRegistrationService.kt` — switched to the shared activation Redis record model
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/RfCodeService.kt` — added RF-code auto-issue, rotation, retained publish, and receiver ack handling
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/types/DeviceLifecycleAckStatus.kt` — added lifecycle ack enum
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/types/DeviceLifecycleAction.kt` — added lifecycle action enum
+- `docs/CHANGELOGS.md`
+
+### Verification
+- Context7 verification used before implementation for Spring Boot conditional annotations, Spring WebFlux controller mappings, Spring Data Redis reactive value ops, and Spring Data R2DBC query/repository usage.
+- GitNexus impact checks were run for the modified existing symbols (`DeviceAdminController`, `DeviceQueryService`, `DeviceMqttPublisher`, `DeviceRepository`, `DeviceRfCodeRepository`, `DeviceRegistrationService`, `DeviceControllerExceptionHandler`, `DeviceBootstrapListener`, `TransmitterBootstrapListener`, `DeviceApprovalService`, `DeviceActivationService`, `RfCodeService`, `DeviceLifecycleService`, `DeviceBadRequestEnvelopeException`, `PassiveDeviceConflictException`). All returned `LOW` risk. A later `RedisKeyManager` helper addition returned `MEDIUM` import-surface risk because the class is shared broadly, but the change was additive and localised; no HIGH/CRITICAL warnings were ignored.
+- Reprovision remains MQTT-silent per the plan's phase notes. To preserve the plan's retained-topic cleanup outcome without publishing from the reprovision endpoint, the previous `public_id` is staged in Redis and consumed by the next activation transaction before retained cleanup runs.
+- Static checks run: `git diff --check`, Sprint-3-surface grep (no heartbeat/election/dispatch/queue endpoint implementation added), and manual source audit against the Sprint 2 checklist.
+- Not run: build/test commands were intentionally skipped per repository instruction not to attempt post-implementation builds in this flow.
+
+## 2026-05-03 - Backend Sprint 1 post-implementation audit
+
+### Summary
+Audited the Backend Sprint 1 (Foundation + Device Registration) implementation against the plan for adherence, logic consistency, and syntax accuracy. One code fix applied; two plan deviations accepted and documented.
+
+### Findings
+1. **Fixed — `DeviceRegistrationService` missing conditional annotation:** The service is an unconditional `@Service` that hard-depends on the conditional `DeviceMqttPublisher` (`@ConditionalOnBean(MqttClientManager::class)`). If MQTT were disabled, Spring would fail to wire the dependency at startup. Added `@ConditionalOnBean(MqttClientManager::class)` to align with the existing conditionality chain (listeners → service → publisher).
+2. **Accepted deviation — BouncyCastle PEM loading:** `DeviceCommandSigner` uses BouncyCastle `PEMParser` + `JcaPEMKeyConverter` instead of Spring's `PemContent`. Both approaches are correct; BouncyCastle is already a project dependency and provides explicit handling of `PEMKeyPair` vs `PrivateKeyInfo` formats. Plan §6.1 updated to match.
+3. **Accepted deviation — PT2272 channel YAML values:** Uses plain decimal (`0`, `1`) instead of hex notation (`0x00`, `0x01`). Functionally identical; plain decimal is unambiguous.
+
+### Verified correct (no changes needed)
+- All four canonical builders (`activate-v1`, `rf-code-v1`, `deact-v1`, `transmit-v1`) produce correct ISO-8601 `Z` timestamps via `Instant.toString()`
+- `MqttSubscription.setNoLocal(boolean)` confirmed in Paho MQTT v5 1.2.5 JAR
+- `SubscriptionDescriptor` with `noLocal = true` on `TransmitterBootstrapListener` correctly implements §F0 step 8
+- `@ConditionalOnExpression` SpEL with escaped `\${}` is valid Kotlin syntax for Spring property resolution
+- `DevicePublicIdMinter` prefixes (`rcv-`, `pas-`, `hub-`) + Crockford base32 + global collision check
+- `DeviceMqttPublisher` kind-aware topic routing, non-retained `publishTransmit`, `clearRetained` hub variant
+- `DeviceBootstrapListener` uses simple `subscribe()` (no noLocal) — correct for MQTT 3.1.1 receiver path
+- `RateLimitFilter.resolveTier` is method-aware; `POST /api/devices/enrollment-tokens` → strict tier
+- R2DBC enum codecs + write converters for all four device enums
+- Migration script idempotent with proper `IF EXISTS` / `IF NOT EXISTS` guards
+- Schema matches §3.1 (tables, constraints, trigger function, indexes)
+- Redis keys match §4
+- `EnrollmentTokenService`: 128-bit `SecureRandom` + base64url + SHA-256 hex + `GETDEL` (`getAndDelete`)
+- Hub cap check with `IS DISTINCT FROM` self-exclusion matches §T1 step 5
+- `.gitignore` and `bootJar.exclude` include `device/**`
+
+### Files changed
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceRegistrationService.kt` — added `@ConditionalOnBean(MqttClientManager::class)` + import
+- `docs/planned/Device Integration Implementation Plan.md` — marked Backend Sprint 1 complete; updated §6.1 PEM loading approach; added `@ConditionalOnBean` guidance for MQTT-dependent services
+- `docs/CHANGELOGS.md`
+
+---
+
+## 2026-05-03 - Refine §10 into sprint-based execution plan
+
+### Summary
+Replaced the flat 11-step execution order (§10) with a sprint-based structure: 3 backend sprints + 3 frontend sprints, each independently implementable and verifiable. Added a dependency map and parallelism guidance.
+
+### Changes
+1. **§10 header:** "Execution Order" → "Sprint Plan"
+2. **§10.1 Backend Sprints:** 3 sprints with explicit scope, phase mappings, and verification checklists:
+   - Backend Sprint 1: Foundation + Device Registration (F0, D1, D2, D2.1, T1)
+   - Backend Sprint 2: Approval, Activation + RF Code (D3, D4, T2, D5, D6, T6)
+   - Backend Sprint 3: Transmitter Election + Queue Dispatch (T3, T4, D7a, T5, T7)
+3. **§10.2 Frontend Sprints:** 3 sprints with explicit scope, component lists, and verification checklists:
+   - Frontend Sprint 1: Device Domain Shell + Tokens + Registration
+   - Frontend Sprint 2: Approval, Detail Page + Lifecycle
+   - Frontend Sprint 3: Hub Panels + Queue Dispatch UI
+4. **§10.3 Sprint Dependency Map:** ASCII diagram showing backend→frontend dependency edges and parallelism opportunities.
+
+### Files changed
+- `docs/planned/Device Integration Implementation Plan.md`
+- `docs/CHANGELOGS.md`
+
+---
+
+## 2026-05-03 - Make Device Integration Plan self-contained
+
+### Summary
+Merged on-wire contract content from the three authoritative firmware design guides (RECEIVER_DESIGN_GUIDE.md, RECEIVER_ESP32C3_DESIGN_GUIDE.md, TRANSMITTER_ESP32C3_DESIGN_GUIDE.md) into `Device Integration Implementation Plan.md` so the plan is a standalone implementation document requiring no cross-reference to firmware guides during backend/admin-web work.
+
+### Changes
+1. **Preamble (lines 3-10):** Rewritten to declare independence. "Never duplicated here" → "full on-wire contract included." Firmware guides reclassified as firmware-side references only. Authority direction reversed: this plan governs the backend; firmware guides reconcile to match, not the other way around.
+2. **§2 header (line 109):** Removed "fix the guide first, then refresh this section" disclaimer. Replaced with "this plan governs the backend implementation."
+3. **New §2A (lines 247-651):** Added ~400-line section "On-Wire Payloads, Cryptography, And Identifier Lifecycle" containing:
+   - §2A.1: Cross-device invariants table (ESP-01 / ESP32-C3 / Hub shared contract) and registration validation rules (`hardware_model` × `kind` legal pairs)
+   - §2A.2: Full JSON payload examples for all bootstrap envelopes (provisioning, registration for both families, pending, rejected, challenge, response, activation result with receiver/hub variants)
+   - §2A.3: Full JSON payload examples for all operational commands (rf_code, deact, dispatch/transmit, heartbeat) with canonical string references, field semantics, and firmware-side validation order
+   - §2A.4: Full JSON payload examples for all ack envelopes (receiver rf_code/deact acks, hub transmit/deact acks) with status value enumerations
+   - §2A.5: Cryptography specification (EC P-256 / SHA256withECDSA, key generation, backend loading, Kotlin signing and verification snippets, performance budgets)
+   - §2A.6: Identifier lifecycle rules (public_id, challenge_id, command_id, dispatch_id, registration_nonce, enrollment_token, code_version monotonicity, topic invalidation via public_id re-minting)
+   - §2A.7: Backend flow summary for receivers (7-step end-to-end with phase references)
+   - §2A.8: Backend flow summary for transmitter hubs (6-step delta from receiver flow)
+4. **Last updated date:** 2026-05-02 → 2026-05-03
+
+### Files changed
+- `docs/planned/Device Integration Implementation Plan.md`
+- `docs/CHANGELOGS.md`
+
+### Content sourced from
+- `docs/planned/RECEIVER_DESIGN_GUIDE.md` §3.3 (payloads), §3.4 (crypto), §3.5-3.7 (identifiers, topic invalidation, key distribution), §H.1 (cross-device invariants), §H.3 (registration validation), §12 (backend flow), §13 (Kotlin verify)
+- `docs/planned/RECEIVER_ESP32C3_DESIGN_GUIDE.md` §E.3 (payloads), §E.4 (crypto), §E.5 (identifiers), §H.1 (invariants)
+- `docs/planned/TRANSMITTER_ESP32C3_DESIGN_GUIDE.md` §E.3 (payloads incl. dispatch, heartbeat, ack), §E.4-E.5 (crypto, heartbeat cadence), §H.1-H.4 (topology, MQTT subscriptions, canonical strings, band field)
+
+---
+
+## 2026-05-03 — Device Integration Backend Sprint 1
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/build.gradle.kts` | MODIFIED | Excluded `device/**` resources from the boot jar so device private material can stay out of packaged artifacts |
+| `backend/.gitignore` | MODIFIED | Ignored backend `resources/device/**` to keep local device key material untracked |
+| `backend/src/main/resources/application.yaml` | MODIFIED | Added Sprint 1 device-domain configuration for command signing, RF-code encryption/defaults, enrollment-token TTL, and transmitter feature-gate/topology limits |
+| `backend/src/main/resources/application-dev.yaml` | MODIFIED | Added a commented development example for `device.command-signing.pk` |
+| `backend/src/main/resources/db/schema.sql` | MODIFIED | Replaced the legacy notifier-device shape with the new `device` / `device_rf_code` schema, new enums, trigger enforcement, and `analytics_event.device_id` `ON DELETE SET NULL` |
+| `backend/src/main/resources/db/migrations/2026-04-25-device-domain.sql` | NEW | Added the idempotent Sprint 1 device-domain migration, including `pgcrypto`, legacy-table rename handling, enum creation, schema reshaping, trigger recreation, and indexes |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/database/R2DBCConfig.kt` | MODIFIED | Registered Postgres enum codecs and Spring write converters for the new device enums |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/redis/RedisKeyManager.kt` | MODIFIED | Added Sprint 1 Redis keys for enrollment tokens, activation state, lifecycle placeholders, hub liveness, and cached active-transmitter slots |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/mqtt/MqttClientManager.kt` | MODIFIED | Added stored MQTT subscription descriptors so reconnect replay preserves MQTT v5 `noLocal` subscriptions |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/ratelimit/RateLimitFilter.kt` | MODIFIED | Narrowed strict rate limiting to `POST /api/devices/enrollment-tokens` while leaving the rest of `/api/**` on the standard tier |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/device/DeviceCanonical.kt` | NEW | Added pure canonical-string builders for `activate-v1`, `rf-code-v1`, `deact-v1`, and `transmit-v1` |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/device/DeviceCommandSigner.kt` | NEW | Added PEM-loading EC P-256 command signing support for device command envelopes |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/device/DeviceCommandSigningConfig.kt` | NEW | Registered the conditional `DeviceCommandSigner` bean when a command-signing key is configured |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/device/DeviceCommandSigningProperties.kt` | NEW | Bound Sprint 1 `device.*` receiver-side properties and enforced config invariants including the fixed 40-bit 2.4 GHz default |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/device/DeviceMqttPublisher.kt` | NEW | Added device-domain MQTT publishing for pending/rejected bootstrap envelopes plus retained RF/deactivation and hub transmit helpers |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/device/DevicePublicIdMinter.kt` | NEW | Added global `public_id` minting with `rcv-`, `pas-`, and `hub-` prefixes plus collision retries |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/device/DeviceTransmitterProperties.kt` | NEW | Bound Sprint 1 transmitter feature-gate and topology properties |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/controller/DeviceAdminController.kt` | NEW | Added Sprint 1 device admin endpoints: `GET /api/devices` and `POST /api/devices/passive` |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/controller/DeviceControllerExceptionHandler.kt` | NEW | Added structured device-domain 400/409 responses for passive-registration validation and RF-code conflicts |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/controller/EnrollmentTokenController.kt` | NEW | Added Sprint 1 enrollment-token issue/list/revoke endpoints |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/dto/DeviceDto.kt` | NEW | Added the shared device response DTO |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/dto/DeviceListResponse.kt` | NEW | Added the device-list envelope with optional registered-hub count |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/dto/DeviceRfCodeSummaryDto.kt` | NEW | Added the RF-code summary projection used in device responses |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/dto/EnrollmentTokenIssueResponse.kt` | NEW | Added the enrollment-token creation response DTO |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/dto/EnrollmentTokenMetadataDto.kt` | NEW | Added the enrollment-token list metadata DTO |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/entity/Device.kt` | NEW | Added the root `device` aggregate entity |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/entity/DeviceRfCode.kt` | NEW | Added the encrypted RF-code row entity |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/listener/DeviceBootstrapListener.kt` | NEW | Added receiver bootstrap MQTT registration intake for `receiver/bootstrap/register` |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/listener/TransmitterBootstrapListener.kt` | NEW | Added transmitter bootstrap MQTT registration intake for `transmitter/bootstrap/register` behind the transmitter feature flag |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/repository/DevicePublicIdLookup.kt` | NEW | Added the lookup interface used by the public-id minter |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/repository/DeviceRepository.kt` | NEW | Added device persistence queries including public-key lookup and registered-hub cap counting |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/repository/DeviceRfCodeRepository.kt` | NEW | Added encrypted RF-code persistence, collision checks, and delete support |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/request/IssueEnrollmentTokenRequest.kt` | NEW | Added the enrollment-token issue request model |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/request/PassiveDeviceRegistrationRequest.kt` | NEW | Added the passive PT2272 registration request model |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceControllerExceptions.kt` | NEW | Added device-domain exception types for structured request/uniqueness failures |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceQueryService.kt` | NEW | Added device listing and reload queries, including the hub `registered` count for `kind=TRANSMITTER_HUB&storeId=...` |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceRegistrationService.kt` | NEW | Added shared receiver/hub bootstrap registration handling, enrollment-token consumption, pending-device upsert logic, and activation-key staging with rollback cleanup on partial Redis failure |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/EnrollmentTokenService.kt` | NEW | Added enrollment-token issue/list/revoke/consume behavior backed by Redis |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/PassiveDeviceRegistrationService.kt` | NEW | Added manual passive PT2272 registration with store scoping, RF-code validation, uniqueness checks, and immediate ACTIVE persistence |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/RfCodeForbiddenSet.kt` | NEW | Added Sprint 1 forbidden RF-code pattern guards for 433 MHz passive/active and 2.4 GHz paths |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/RfCodeValidator.kt` | NEW | Added RF-code width validation for receiver kinds |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/types/DeviceFamily.kt` | NEW | Added bootstrap-family discriminator types |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/types/DeviceHardwareModel.kt` | NEW | Added wire-label-aware hardware-model enum mapping |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/types/DeviceKind.kt` | NEW | Added the shared device kind enum with kind helpers |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/types/DeviceRfAckStatus.kt` | NEW | Added the RF-code acknowledgement enum |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/types/DeviceStatus.kt` | NEW | Added the unified device lifecycle status enum |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged Backend Sprint 1 implementation scope, exclusions, and verification status |
+
+### Scope Kept Out
+| Item | Status | Reason |
+|---|---|---|
+| `GET /api/devices/{id}` | NOT IMPLEMENTED | Scheduled for later device-detail work; omitted to stay inside Backend Sprint 1 |
+| Approval / rejection / activation result flow | NOT IMPLEMENTED | Belongs to Backend Sprint 2 |
+| RF-code rotation, lifecycle, and reprovision endpoints | NOT IMPLEMENTED | Belongs to Backend Sprint 2 |
+| Transmitter heartbeat ingestion, active-hub election, queue dispatch, and queue device endpoints | NOT IMPLEMENTED | Belongs to Backend Sprint 3 |
+| Backend test files for this sprint | REMOVED | Provisional test files were deleted from the change set per request so no test scripts remain in this implementation slice |
+
+### Verification
+- Static audit only: verified the implemented backend scope matches Sprint 1 and does not add Sprint 2/3 device endpoints or queue-dispatch services.
+- Static checks run: `git diff --check`, route/feature grep for out-of-scope endpoints/services, and final diff review.
+- Not run: build/test commands were intentionally skipped per repository instruction not to attempt post-implementation builds in this flow.
+
 ## 2026-05-02 - Device Integration Plan audit & stale-reference fixes
 
 ### Summary
@@ -1821,6 +2350,7 @@ Re-audit of service type selector rework. **3 real issues found + reverted 5 unn
 
 ### Verification
 - Not run: build/lint/test commands were intentionally skipped per repository instruction not to attempt post-implementation builds in this flow.
+
 
 ## 2026-03-30 — Public Store URL Compatibility
 

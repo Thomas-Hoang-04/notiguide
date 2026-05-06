@@ -1,15 +1,15 @@
 # Device Integration Implementation Plan
 
-Concrete backend and admin-web plan for integrating the unified `device` domain end-to-end: ESP-01 and ESP32-C3 **receiver** families, passive PT2272 receivers, **and** the ESP32-C3 **transmitter hub** that drives them. Both families share enrollment, approval, lifecycle, and admin UX through one Kotlin domain; firmware contracts live in their respective design guides and are referenced — never duplicated — here.
+Self-contained backend and admin-web plan for integrating the unified `device` domain end-to-end: ESP-01 and ESP32-C3 **receiver** families, passive PT2272 receivers, **and** the ESP32-C3 **transmitter hub** that drives them. Both families share enrollment, approval, lifecycle, and admin UX through one Kotlin domain. This document includes the full on-wire contract (MQTT payloads, cryptography, identifier lifecycle) so no external document is required during implementation.
 
-Authoritative firmware sources:
+Related firmware design guides (firmware-side implementation details only — not needed for backend/admin-web work):
 
 - Receivers — [RECEIVER_DESIGN_GUIDE.md](RECEIVER_DESIGN_GUIDE.md) (historical ESP-01 reference) and [RECEIVER_ESP32C3_DESIGN_GUIDE.md](RECEIVER_ESP32C3_DESIGN_GUIDE.md).
-- Transmitter hub — [TRANSMITTER_ESP32C3_DESIGN_GUIDE.md](TRANSMITTER_ESP32C3_DESIGN_GUIDE.md). §A–§G describe the firmware; §H of that guide is the originating backend slice that has been merged into this plan and should now be treated as a duplicate, with this plan as the source of truth.
+- Transmitter hub — [TRANSMITTER_ESP32C3_DESIGN_GUIDE.md](TRANSMITTER_ESP32C3_DESIGN_GUIDE.md). §A–§G describe the firmware; §H of that guide is the originating backend slice that has been merged into this plan.
 
-If this plan disagrees with the firmware guides on contract specifics (topics, canonical strings, RF-code shape), fix the guide first, then refresh this plan.
+If a contract discrepancy is found between this plan and a firmware guide, this plan is authoritative for the backend/admin-web implementation. Reconcile by updating the firmware guide to match, not the other way around.
 
-**Last updated:** 2026-05-02
+**Last updated:** 2026-05-03
 
 ---
 
@@ -19,19 +19,21 @@ If this plan disagrees with the firmware guides on contract specifics (topics, c
 
 A device-bound ticket is a **regular queue ticket** that happens to have a `device_id` attached. It enters the same Redis queue (global + service-type sorted sets), holds the same ticket hash shape, participates in the same position-ordered FIFO, and flows through every admin operation identically to a mobile-web-client ticket. The table below maps each lifecycle step to what is shared and what differs:
 
-| Lifecycle step | Shared (identical for both platforms) | Device-specific addition | Mobile-web-specific |
-| --- | --- | --- | --- |
-| **Issue** | `QueueService.issueTicket` creates the ticket hash, ZADD to queue, SSE `TICKET_ISSUED`, MQTT `TICKET_ISSUED`, counter increment, position tracking | `device_id` written to ticket hash; `device:busy:{deviceId}` key set; preflight hub election check (§D7a step 1) | FCM token registration (customer-initiated) |
-| **Wait (WAITING)** | Ticket sits in queue sorted set with timestamp score; admin sees it in waiting list; position is ZRANK-based; TTL = 12 h; SSE updates flow to admin dashboard | `device:busy:{deviceId}` TTL mirrors `TICKET_WAITING` | Customer polls status; position alerts via FCM when near front |
+
+| Lifecycle step            | Shared (identical for both platforms)                                                                                                                                                                                            | Device-specific addition                                                                                                                                                                                                  | Mobile-web-specific                                                       |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| **Issue**                 | `QueueService.issueTicket` creates the ticket hash, ZADD to queue, SSE `TICKET_ISSUED`, MQTT `TICKET_ISSUED`, counter increment, position tracking                                                                               | `device_id` written to ticket hash; `device:busy:{deviceId}` key set; preflight hub election check (§D7a step 1)                                                                                                          | FCM token registration (customer-initiated)                               |
+| **Wait (WAITING)**        | Ticket sits in queue sorted set with timestamp score; admin sees it in waiting list; position is ZRANK-based; TTL = 12 h; SSE updates flow to admin dashboard                                                                    | `device:busy:{deviceId}` TTL mirrors `TICKET_WAITING`                                                                                                                                                                     | Customer polls status; position alerts via FCM when near front            |
 | **Call Next / Jump Call** | `callNext` / `callSpecificTicket` Lua scripts pop from queue → serving set; status → CALLED; `called_at` set; TTL → 30 min; SSE `TICKET_CALLED`; MQTT `TICKET_CALLED`; proactive position alerts sent to *other* waiting tickets | `DEVICE_CALL_REQUESTED` event published → transmitter dispatch → RF broadcast to physical receiver; `device:busy:{deviceId}` stays bound to the ticket and is refreshed to `TICKET_CALLED`; FCM skipped for *this* ticket | FCM `TICKET_CALLED` notification sent to *this* ticket's registered token |
-| **Serve** | `serveTicket` sets status → SERVED; TTL → 2 h; removes from serving set; SSE `TICKET_SERVED`; MQTT `TICKET_SERVED`; analytics `TICKET_COMPLETED` | `DEVICE_STOP_REQUESTED` event → RF stop broadcast. The busy key moves to a terminal TTL before dispatch and is deleted only after a successful stop publish; on dispatch failure it stays reserved fail-closed | FCM token removed |
-| **Cancel** | `cancelTicket` sets status → CANCELLED; TTL → 2 h; removes from queue (if WAITING) or serving (if CALLED); SSE `TICKET_CANCELLED`; MQTT `TICKET_CANCELLED`; analytics `TICKET_CANCELLED` | If was CALLED: `DEVICE_STOP_REQUESTED` → RF stop broadcast. The busy key moves to a terminal TTL before dispatch and is deleted only after a successful stop publish; on dispatch failure it stays reserved fail-closed | FCM token removed |
-| **No-show → Requeue** | `handleNoShow` executes `REQUEUE_TICKET_SCRIPT` Lua; ticket re-enters queue at offset position; status → REQUEUED → WAITING; requeue_count incremented; TTL → 12 h; SSE `TICKET_REQUEUED` | `DEVICE_STOP_REQUESTED` event → RF stop broadcast; `device_id` stays on ticket hash; `device:busy:{deviceId}` TTL returns to `TICKET_WAITING`, and a dispatch failure leaves that reservation in place | — |
-| **No-show → Skip** | `handleNoShow` sets status → SKIPPED; TTL → 2 h; removes from serving; SSE `TICKET_SKIPPED`; analytics `TICKET_SKIPPED` | `DEVICE_STOP_REQUESTED` event → RF stop broadcast. The busy key moves to a terminal TTL before dispatch and is deleted only after a successful stop publish; on dispatch failure it stays reserved fail-closed | FCM token removed |
-| **Transfer** | `transferTicket` moves WAITING ticket between service-type queues; score preserved; SSE `TICKET_TRANSFERRED` | `device_id` stays on ticket hash; `device:busy:{deviceId}` unchanged (device follows the ticket) | — |
-| **Queue pause/resume** | `pauseQueue` / `resumeQueue` toggles `queue_state` | No difference — device-bound tickets honour queue state identically | No difference |
-| **Cleanup** | `ServingSetCleanupScheduler` removes orphaned serving-set entries; Redis TTL auto-expires stale tickets | `device:busy:{deviceId}` TTL mirrors ticket TTL; key auto-expires alongside ticket | FCM token TTL (12 h) auto-expires alongside ticket |
-| **Admin dashboard** | Ticket appears in waiting list, serving display, and queue stats identically; all SSE events fire | Device badge shown on ticket row (§D7b); links to device detail | — |
+| **Serve**                 | `serveTicket` sets status → SERVED; TTL → 2 h; removes from serving set; SSE `TICKET_SERVED`; MQTT `TICKET_SERVED`; analytics `TICKET_COMPLETED`                                                                                 | `DEVICE_STOP_REQUESTED` event → RF stop broadcast. The busy key moves to a terminal TTL before dispatch and is deleted only after a successful stop publish; on dispatch failure it stays reserved fail-closed            | FCM token removed                                                         |
+| **Cancel**                | `cancelTicket` sets status → CANCELLED; TTL → 2 h; removes from queue (if WAITING) or serving (if CALLED); SSE `TICKET_CANCELLED`; MQTT `TICKET_CANCELLED`; analytics `TICKET_CANCELLED`                                         | If was CALLED: `DEVICE_STOP_REQUESTED` → RF stop broadcast. The busy key moves to a terminal TTL before dispatch and is deleted only after a successful stop publish; on dispatch failure it stays reserved fail-closed   | FCM token removed                                                         |
+| **No-show → Requeue**     | `handleNoShow` executes `REQUEUE_TICKET_SCRIPT` Lua; ticket re-enters queue at offset position; status → REQUEUED → WAITING; requeue_count incremented; TTL → 12 h; SSE `TICKET_REQUEUED`                                        | `DEVICE_STOP_REQUESTED` event → RF stop broadcast; `device_id` stays on ticket hash; `device:busy:{deviceId}` TTL returns to `TICKET_WAITING`, and a dispatch failure leaves that reservation in place                    | —                                                                         |
+| **No-show → Skip**        | `handleNoShow` sets status → SKIPPED; TTL → 2 h; removes from serving; SSE `TICKET_SKIPPED`; analytics `TICKET_SKIPPED`                                                                                                          | `DEVICE_STOP_REQUESTED` event → RF stop broadcast. The busy key moves to a terminal TTL before dispatch and is deleted only after a successful stop publish; on dispatch failure it stays reserved fail-closed            | FCM token removed                                                         |
+| **Transfer**              | `transferTicket` moves WAITING ticket between service-type queues; score preserved; SSE `TICKET_TRANSFERRED`                                                                                                                     | `device_id` stays on ticket hash; `device:busy:{deviceId}` unchanged (device follows the ticket)                                                                                                                          | —                                                                         |
+| **Queue pause/resume**    | `pauseQueue` / `resumeQueue` toggles `queue_state`                                                                                                                                                                               | No difference — device-bound tickets honour queue state identically                                                                                                                                                       | No difference                                                             |
+| **Cleanup**               | `ServingSetCleanupScheduler` removes orphaned serving-set entries; Redis TTL auto-expires stale tickets                                                                                                                          | `device:busy:{deviceId}` TTL mirrors ticket TTL; key auto-expires alongside ticket                                                                                                                                        | FCM token TTL (12 h) auto-expires alongside ticket                        |
+| **Admin dashboard**       | Ticket appears in waiting list, serving display, and queue stats identically; all SSE events fire                                                                                                                                | Device badge shown on ticket row (§D7b); links to device detail                                                                                                                                                           | —                                                                         |
+
 
 **The admin never needs to know whether a ticket was issued via a device or via the mobile web client to manage it.** Call Next, serve, cancel, no-show, transfer, pause/resume, and cleanup all work through the same `QueueService` / `QueueAdminController` methods regardless of origin. The device-specific additions are side effects that fire transparently based on the presence of `device_id` in the ticket hash.
 
@@ -61,7 +63,7 @@ Out of scope:
 
 ### 1.2 Repo Invariants The Plan Must Preserve
 
-- `SecurityConfig` permits only `/api/auth/**`, `/api/queue/public/**`, `/actuator/health`, `/actuator/info`. Device endpoints stay authenticated; no permit-all widening.
+- `SecurityConfig` permits only `/api/auth/`**, `/api/queue/public/`**, `/actuator/health`, `/actuator/info`. Device endpoints stay authenticated; no permit-all widening.
 - `RateLimitFilter.resolveTier` currently matches strict only for `/api/queue/public/**`, auth for `/api/auth/**`, standard for everything else under `/api/**`. Method-specific strict routes require making this helper method-aware.
 - `ReactiveRedisTemplate<String, String>` with `StringRedisSerializer`. Do not introduce JSON-wrapping serializers.
 - Ticket hash key: `ticket:{storeId}:{ticketId}` via `RedisKeyManager.ticket(storeId, ticketId)`.
@@ -108,7 +110,7 @@ The whole transmitter slice is gated behind `device.transmitter.enabled` (§6.2)
 
 ## 2. Device Contract Summary
 
-Authoritative sources: [RECEIVER_DESIGN_GUIDE.md](RECEIVER_DESIGN_GUIDE.md), [RECEIVER_ESP32C3_DESIGN_GUIDE.md](RECEIVER_ESP32C3_DESIGN_GUIDE.md), [TRANSMITTER_ESP32C3_DESIGN_GUIDE.md](TRANSMITTER_ESP32C3_DESIGN_GUIDE.md). If this summary disagrees with them, fix the guide first, then refresh this section.
+This section and §2A below are the authoritative on-wire contract for the backend and admin web. The firmware design guides document the same contract from the firmware's perspective; if a discrepancy is found, this plan governs the backend implementation.
 
 ### 2.1 MQTT Topics
 
@@ -212,11 +214,11 @@ Each builder ships with a golden-string unit test pinned against the example pay
 Validate before signing or persisting. The bit-width rules reflect what each receiver family physically uses on the air:
 
 
-| `kind`                  | `rf_code_bits` | Constraints                                     | Source of code                    | What the bytes mean on air                                                                   |
-| ----------------------- | -------------- | ----------------------------------------------- | --------------------------------- | -------------------------------------------------------------------------------------------- |
-| `RECEIVER_433M`         | 1..32          | `hex_len == 2 * ceil(bits/8)`                   | Backend `SecureRandom` (§D5.1)    | RC-Switch payload value matched at the receiver MCU                                          |
-| `RECEIVER_433M_PASSIVE` | **exactly 16** | `hex_len == 4` (2 bytes)                        | Admin enters 8-trit address (§D5.2) | PT2272 address portion (first 8 trits); backend patches 8-bit channel ID at dispatch time (§T5) |
-| `RECEIVER_2_4G`         | **exactly 40** | `hex_len == 10`                                 | Backend `SecureRandom` (§D5.1)    | nRF24 5-byte `RX_ADDR_P1` — silicon-level identity, **not** an application-layer match value |
+| `kind`                  | `rf_code_bits` | Constraints                   | Source of code                      | What the bytes mean on air                                                                      |
+| ----------------------- | -------------- | ----------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `RECEIVER_433M`         | 1..32          | `hex_len == 2 * ceil(bits/8)` | Backend `SecureRandom` (§D5.1)      | RC-Switch payload value matched at the receiver MCU                                             |
+| `RECEIVER_433M_PASSIVE` | **exactly 16** | `hex_len == 4` (2 bytes)      | Admin enters 8-trit address (§D5.2) | PT2272 address portion (first 8 trits); backend patches 8-bit channel ID at dispatch time (§T5) |
+| `RECEIVER_2_4G`         | **exactly 40** | `hex_len == 10`               | Backend `SecureRandom` (§D5.1)      | nRF24 5-byte `RX_ADDR_P1` — silicon-level identity, **not** an application-layer match value    |
 
 
 Defaults for backend-generated codes (auto-issued at activation) live in §6.1: `default-bits-433m = 32`, `default-bits-24g = 40`. PT2272 has no default — admins always supply the 16-bit address because it's hardware-fixed at the chip (the channel ID is a backend config, not per-device).
@@ -241,6 +243,413 @@ These rules are pinned in [TRANSMITTER_ESP32C3_DESIGN_GUIDE.md](TRANSMITTER_ESP3
 - **Per-store active cap: 1.** With 0 registered: dispatch fails with `no_active_transmitter`. With 1 registered and live: that hub is the active. With 2–3 registered: election picks the hub with the most recent live heartbeat (ties broken by lowest `device.id`). When *no* registered hub is heartbeating, dispatch fails — admin sees the failure and triages, no silent queueing.
 - **Failover is automatic.** When the cached primary stops heartbeating, the next dispatch event re-elects from live hubs. No promote/demote endpoint needed; admin `suspend` / `decommission` removes a hub from the candidate pool.
 - **No simultaneous broadcast.** Because only one hub transmits per dispatch event, RF collisions between peer hubs are not a concern and the hubs need no inter-hub coordination protocol.
+
+---
+
+## 2A. On-Wire Payloads, Cryptography, And Identifier Lifecycle
+
+This section contains the complete MQTT wire-format contract the backend must parse or produce — JSON shapes, cryptographic signing, and identifier rules. All wire payloads carry `"schema_version": 1`.
+
+### 2A.1 Cross-Device Invariants (ESP-01 / ESP32-C3 / Transmitter Hub)
+
+The backend manages ESP-01 and ESP32-C3 receivers through **one** logical contract. Do not fork topic names, payload field names, envelope types, or management flags by hardware family. The only device-family-specific inputs are `hardware_model`, the legal `kind` set for that model, and the RF-code width rules. Transport differences do **not** change the backend contract: the ESP-01 stays on MQTT 3.1.1 while the ESP32-C3 may connect with MQTT v5, but both publish the same JSON payloads on the same topics.
+
+
+| Area                     | Shared requirement (identical for all families)                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Topics                   | `receiver/bootstrap/register`, `receiver/bootstrap/{challenge_id}`, `receiver/device/{public_id}/cmd/rf_code`, `receiver/device/{public_id}/cmd/deact`, `receiver/device/{public_id}/ack` for receivers; `transmitter/bootstrap/register`, `transmitter/bootstrap/{challenge_id}`, `transmitter/hub/{public_id}/cmd/transmit`, `transmitter/hub/{public_id}/cmd/deact`, `transmitter/hub/{public_id}/heartbeat`, `transmitter/hub/{public_id}/ack` for hubs |
+| Payload versioning       | Every wire payload carries `schema_version = 1`                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Bootstrap envelope types | `pending`, `challenge`, `rejected`, `result`, `response` — same on both families                                                                                                                                                                                                                                                                                                                                                                            |
+| Ack discriminator        | Receiver: `ack_for = "rf_code"` or `"deact"`. Hub: `ack_for = "transmit"` or `"deact"`                                                                                                                                                                                                                                                                                                                                                                      |
+| Deactivation actions     | `suspend`, `resume`, `decommission` — same payload shape on both families                                                                                                                                                                                                                                                                                                                                                                                   |
+| RF-code ack statuses     | `applied`, `unchanged`, `rejected` (receiver only; hubs have no rf_code)                                                                                                                                                                                                                                                                                                                                                                                    |
+| Deact ack statuses       | `ok`, `ignored`, `rejected`                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Canonical strings        | `activate-v1                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Activation result fields | `public_id`, `assigned_device_name`                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Topic scoping            | Operational traffic is always scoped by backend-minted `public_id`                                                                                                                                                                                                                                                                                                                                                                                          |
+| Re-activation semantics  | Every successful activation mints a fresh `public_id`; old retained operational topics become orphaned automatically                                                                                                                                                                                                                                                                                                                                        |
+
+
+Registration validation rules for `(hardware_model, kind)`:
+
+
+| Wire `hardware_model` | Stored enum | Legal `kind`                                        | Notes                                  |
+| --------------------- | ----------- | --------------------------------------------------- | -------------------------------------- |
+| `ESP-01`              | `ESP_01`    | `RECEIVER_433M`                                     | ESP-01 is 433 MHz only                 |
+| `ESP32-C3`            | `ESP32_C3`  | `RECEIVER_433M`, `RECEIVER_2_4G`, `TRANSMITTER_HUB` | Dual-radio receiver or transmitter hub |
+| `PT2272`              | `PT2272`    | `RECEIVER_433M_PASSIVE`                             | Admin-registered, no MQTT bootstrap    |
+
+
+Violations publish `type: "rejected"` with `reason: "model_radio_mismatch"`. Cross-family guards: a `kind: TRANSMITTER_HUB` arriving on `receiver/bootstrap/register` is rejected, and vice versa. `RECEIVER_433M_PASSIVE` never arrives over MQTT.
+
+### 2A.2 Bootstrap Payloads
+
+**SoftAP provisioning** (`POST /api/provision` — local HTTP on device, not a backend endpoint):
+
+```json
+{
+  "schema_version": 1,
+  "wifi": { "ssid": "OfficeWiFi", "password": "super-secret" },
+  "mqtt": {
+    "broker_uri": "mqtts://broker.example.com:8883",
+    "username": "shared-receiver-user",
+    "password": "shared-receiver-password"
+  },
+  "enrollment": { "token": "<opaque string>" }
+}
+```
+
+**Receiver registration** (`receiver/bootstrap/register`):
+
+```json
+{
+  "schema_version": 1,
+  "hardware_model": "ESP32-C3",
+  "receiver_type": "RECEIVER_433M",
+  "firmware_version": "dev",
+  "public_key_b64": "BASE64_DER_PUBLIC_KEY",
+  "enrollment_token": "<opaque string>",
+  "registration_nonce": "hG7aK2pQcR"
+}
+```
+
+- `hardware_model` is `ESP-01` or `ESP32-C3`.
+- `receiver_type` is `RECEIVER_433M` or `RECEIVER_2_4G`. Mapped to `DeviceKind` on ingest.
+- `registration_nonce` is device-generated, base64url, session-scoped, at least 8 random bytes before encoding.
+- The device sends no self-minted operational identifier.
+
+**Transmitter hub registration** (`transmitter/bootstrap/register`):
+
+```json
+{
+  "schema_version": 1,
+  "hardware_model": "ESP32-C3",
+  "kind": "TRANSMITTER_HUB",
+  "firmware_version": "dev",
+  "public_key_b64": "BASE64_DER_PUBLIC_KEY",
+  "enrollment_token": "<opaque string>",
+  "registration_nonce": "hG7aK2pQcR"
+}
+```
+
+- The discriminator field is `"kind"` (not `"receiver_type"`), set to the literal `TRANSMITTER_HUB`.
+- Only `ESP32-C3` is legal for `hardware_model` on hubs in v1.
+
+**Bootstrap envelopes** — shared topic `{family}/bootstrap/{challenge_id}` where `{family}` is `receiver` or `transmitter`. Direction is inferred from `type`: `pending`, `challenge`, `rejected`, and `result` are backend-originated; `response` is device-originated. Both sides ignore any envelope whose `type` they own (self-echo guard).
+
+**Pending** (`type: "pending"`, backend → device):
+
+```json
+{
+  "schema_version": 1,
+  "type": "pending",
+  "challenge_id": "6b99a4cb-2fc0-4559-8ae4-4ad65f8f8e0d",
+  "registration_nonce": "hG7aK2pQcR",
+  "issued_at": "2026-04-16T12:00:00Z"
+}
+```
+
+Published immediately after registration + token validation. The device checks `registration_nonce`, narrows its subscription to the exact `{family}/bootstrap/{challenge_id}` topic, and waits.
+
+**Rejected** (`type: "rejected"`, backend → device):
+
+```json
+{
+  "schema_version": 1,
+  "type": "rejected",
+  "challenge_id": "6b99a4cb-2fc0-4559-8ae4-4ad65f8f8e0d",
+  "reason": "admin_rejected"
+}
+```
+
+`reason` values: `admin_rejected`, `invalid_token`, `model_radio_mismatch`, `hub_cap_reached`.
+
+**Challenge** (`type: "challenge"`, backend → device):
+
+```json
+{
+  "schema_version": 1,
+  "type": "challenge",
+  "challenge_id": "6b99a4cb-2fc0-4559-8ae4-4ad65f8f8e0d",
+  "registration_nonce": "hG7aK2pQcR",
+  "nonce": "QzZ3eUNhWmVQWGhJd0V1TQ",
+  "issued_at": "2026-04-16T12:00:00Z",
+  "expires_at": "2026-04-16T12:05:00Z",
+  "purpose": "activate-v1"
+}
+```
+
+Published after admin approves. `nonce` is a fresh ≥128-bit challenge. `purpose` identifies the canonical string format.
+
+**Response** (`type: "response"`, device → backend):
+
+```json
+{
+  "schema_version": 1,
+  "type": "response",
+  "challenge_id": "6b99a4cb-2fc0-4559-8ae4-4ad65f8f8e0d",
+  "signature_b64": "BASE64_SIGNATURE"
+}
+```
+
+The device signs the canonical string `activate-v1|<challenge_id>|<nonce>|<issued_at>|<expires_at>` with its EC P-256 private key. The backend verifies with `device.public_key_der`.
+
+**Activation result** (`type: "result"`, backend → device):
+
+Receiver variant:
+
+```json
+{
+  "schema_version": 1,
+  "type": "result",
+  "challenge_id": "6b99a4cb-2fc0-4559-8ae4-4ad65f8f8e0d",
+  "status": "active",
+  "public_id": "rcv-7Q4KZ",
+  "assigned_device_name": "Front Gate Receiver"
+}
+```
+
+Transmitter hub variant (identical shape, different `public_id` prefix):
+
+```json
+{
+  "schema_version": 1,
+  "type": "result",
+  "challenge_id": "6b99a4cb-2fc0-4559-8ae4-4ad65f8f8e0d",
+  "status": "active",
+  "public_id": "hub-7Q4KZ",
+  "assigned_device_name": "Front Desk Transmitter Hub"
+}
+```
+
+Post-activation behaviour differs by family:
+
+- **Receivers**: persist `public_id`, set `op_state = PENDING_RF_CODE`, erase `enroll_token`, restart MQTT with `client_id = public_id`, subscribe to `receiver/device/{public_id}/cmd/#`, and wait for the first `cmd/rf_code`.
+- **Hubs**: persist `public_id`, set `op_state = ACTIVE` directly (no `PENDING_RF_CODE` — hubs own no per-device code), erase `enroll_token`, restart MQTT with `client_id = public_id`, subscribe to `transmitter/hub/{public_id}/cmd/#`, start heartbeat.
+
+### 2A.3 Operational Command Payloads
+
+**RF code** (`receiver/device/{public_id}/cmd/rf_code`, retained, receiver-only):
+
+```json
+{
+  "schema_version": 1,
+  "rf_code_hex": "C35A5A5AE7",
+  "rf_code_bits": 40,
+  "code_version": 4,
+  "issued_at": "2026-04-19T10:15:00Z",
+  "signature_b64": "BACKEND_ECDSA_SIGNATURE"
+}
+```
+
+- `RECEIVER_433M`: `rf_code_bits ∈ [1, 32]`, `hex_len == 2 * ceil(bits/8)`. The bytes are the application-layer match value.
+- `RECEIVER_2_4G`: `rf_code_bits == 40`, `hex_len == 10`. The 5 bytes are the receiver's nRF24 `RX_ADDR_P1` — silicon-level identity, not an application-layer match value.
+- `code_version` is monotonic per `public_id`. Device rejects older versions. Re-activation mints a fresh `public_id`, so `code_version` restarts from 1.
+- Hubs never receive `cmd/rf_code`.
+
+Canonical string for signing (§2.3 `rf-code-v1`):
+
+```text
+rf-code-v1|<public_id>|<code_version>|<rf_code_hex>|<rf_code_bits>|<issued_at>
+```
+
+**Deactivation command** (`receiver/device/{public_id}/cmd/deact` or `transmitter/hub/{public_id}/cmd/deact`, retained):
+
+```json
+{
+  "schema_version": 1,
+  "action": "suspend",
+  "command_id": "2f1c4b40-8b6b-4d17-9c43-2d4b98c7ce71",
+  "issued_at": "2026-04-19T10:20:00Z",
+  "signature_b64": "BACKEND_ECDSA_SIGNATURE"
+}
+```
+
+`action ∈ { "suspend", "resume", "decommission" }`. Same payload shape on both families; the topic namespace differs. Firmware applies the action to its own persistent state. Verification failure → ack `rejected`, no state changes. `command_id == last_deact_id` → republish the prior ack, skip side effects (retained-message replay suppression).
+
+Canonical string for signing (§2.3 `deact-v1`):
+
+```text
+deact-v1|<public_id>|<command_id>|<action>|<issued_at>
+```
+
+**Dispatch command** (`transmitter/hub/{public_id}/cmd/transmit`, **not retained**, hub-only):
+
+```json
+{
+  "schema_version": 1,
+  "dispatch_id": "f6e60f38-2f1f-4f22-9ca0-71a55a2d65bb",
+  "receiver_public_id": "rcv-7Q4KZ",
+  "band": "433M",
+  "rf_code_hex": "C35A5A5A",
+  "rf_code_bits": 32,
+  "proto_any": true,
+  "issued_at": "2026-04-25T10:00:00Z",
+  "signature_b64": "BACKEND_ECDSA_SIGNATURE"
+}
+```
+
+- `band ∈ { "433M", "2_4G" }`. Populated from `device.kind` of the destination receiver: `RECEIVER_433M`, `RECEIVER_433M_PASSIVE` → `"433M"`; `RECEIVER_2_4G` → `"2_4G"`.
+- `proto_any` (boolean): when `true`, the hub randomizes the 433 MHz transmission protocol across all 15 RC-Switch entries; when `false`, it uses Protocol 1 (PT2272-compatible, 350 µs base). Ignored for 2.4 GHz dispatches. Populated from `device.kind`: `RECEIVER_433M` / `RECEIVER_2_4G` → `true`; `RECEIVER_433M_PASSIVE` → `false`.
+- `dispatch_id` is a UUID minted by the backend per dispatch event so the hub can dedupe replays.
+- Not retained: the broker must never replay a stale broadcast on hub reconnect.
+
+Canonical string for signing (§2.3 `transmit-v1`):
+
+```text
+transmit-v1|<hub_public_id>|<dispatch_id>|<receiver_public_id>|<band>|<rf_code_hex>|<rf_code_bits>|<proto_any>|<issued_at>
+```
+
+`<proto_any>` is the literal string `true` or `false`.
+
+Firmware-side validation order on the hub:
+
+1. JSON shape, `schema_version == 1`, all required fields present (including `proto_any`).
+2. `band ∈ { "433M", "2_4G" }`.
+3. Width per band: `433M` → `bits ∈ [1, 32]`, `hex_len == 2 * ceil(bits/8)`; `2_4G` → `bits == 40`, `hex_len == 10`.
+4. Rebuild canonical string byte-for-byte and verify `signature_b64` against the pinned backend public key.
+5. `dispatch_id` not in the in-RAM replay ring; if it is, re-ack the prior terminal outcome and skip RF emission.
+6. Reject with `status = rejected` on shape error, signature failure, or width mismatch.
+
+**Heartbeat** (`transmitter/hub/{public_id}/heartbeat`, QoS 0, not retained, hub-only):
+
+```json
+{ "schema_version": 1, "issued_at": "2026-04-25T10:00:10Z" }
+```
+
+- 10 s cadence while `op_state == ACTIVE`; stops on `SUSPENDED` or `DECOMMISSIONED`.
+- QoS 0 because liveness is a sliding window, not a fact. The backend's 30 s TTL absorbs single missed packets.
+- ±0.5 s uniform random jitter on each tick.
+
+### 2A.4 Ack Payloads
+
+**Receiver ack stream** (`receiver/device/{public_id}/ack`):
+
+RF-code ack:
+
+```json
+{ "schema_version": 1, "ack_for": "rf_code", "code_version": 4, "status": "applied", "applied_at": "2026-04-19T10:15:02Z" }
+```
+
+Deact ack:
+
+```json
+{ "schema_version": 1, "ack_for": "deact", "command_id": "2f1c4b40-8b6b-4d17-9c43-2d4b98c7ce71", "action": "suspend", "status": "ok", "applied_at": "2026-04-19T10:20:01Z" }
+```
+
+- `ack_for = "rf_code"`: `status ∈ { "applied", "unchanged", "rejected" }`. Never echo the RF code.
+- `ack_for = "deact"`: `status ∈ { "ok", "ignored", "rejected" }`. `rejected` covers signature failures and RF lifecycle failures.
+
+**Transmitter hub ack stream** (`transmitter/hub/{public_id}/ack`):
+
+Transmit ack:
+
+```json
+{ "schema_version": 1, "ack_for": "transmit", "dispatch_id": "f6e60f38-...", "status": "applied", "applied_at": "2026-04-25T10:00:00.230Z" }
+{ "schema_version": 1, "ack_for": "transmit", "dispatch_id": "f6e60f38-...", "status": "rejected", "reason": "signature_failed" }
+{ "schema_version": 1, "ack_for": "transmit", "dispatch_id": "f6e60f38-...", "status": "unchanged", "applied_at": "2026-04-25T10:00:00.230Z" }
+```
+
+Deact ack:
+
+```json
+{ "schema_version": 1, "ack_for": "deact", "command_id": "2f1c4b40-...", "action": "suspend", "status": "ok" }
+```
+
+- `ack_for = "transmit"`: `applied` (RF emitted), `unchanged` (replay of a prior applied command), `rejected` (shape error / signature failure / width mismatch / `device_suspended` / `device_decommissioned` / `tx_failed` / `no_2_4g_radio`). Acks never echo `rf_code_hex`.
+- `ack_for = "deact"`: same shape as receiver.
+
+### 2A.5 Cryptography
+
+Two EC P-256 keypairs are in play per device family:
+
+1. **Device/hub keypair** — generated on first boot, stored in the `identity` NVS namespace (DER blobs), used only to sign the activation challenge. Public half is sent in the registration envelope as base64-encoded DER (`public_key_b64`).
+2. **Backend command-signing keypair** — generated offline, one key covers both receiver and hub fleets. Private half stays on the backend and signs every operational command (`cmd/rf_code`, `cmd/deact`, `cmd/transmit`). Public half is pinned in firmware via Kconfig (`CONFIG_RECEIVER_BACKEND_PUBKEY_B64` for receivers, `CONFIG_TRANSMITTER_BACKEND_PUBKEY_B64` for hubs).
+
+Common settings:
+
+- Curve: `secp256r1` / `MBEDTLS_ECP_DP_SECP256R1`
+- Signature algorithm: `SHA256withECDSA`
+- Device key storage: DER blobs in NVS
+- Device public key on wire: DER → base64
+- Backend public key in firmware: base64-encoded DER, parsed once at boot
+- Activation nonce: at least 16 random bytes before base64url
+- Registration nonce: at least 8 random bytes, base64url, session-scoped
+
+**Key generation** (offline, operator machine):
+
+```bash
+openssl ecparam -name prime256v1 -genkey -noout -out cmd_signing_priv.pem
+openssl pkey -in cmd_signing_priv.pem -pubout -outform DER \
+  | base64 -w0 > cmd_signing_pub.b64
+```
+
+**Backend-side loading.** The private key path is injected via `device.command-signing.pk` (§6.1). Spring Boot resolves via `ResourceLoader.getResource(pk).inputStream` then `PemContent.load(inputStream).getPrivateKey()`. Prefix `classpath:` for dev, `file:` for prod-mounted secrets, or `base64:` for inline base64-encoded PEM contents.
+
+**Backend-side signing** (Kotlin):
+
+```kotlin
+val canonical = "rf-code-v1|$publicId|$codeVersion|$rfCodeHex|$rfCodeBits|$issuedAt"
+    .toByteArray(Charsets.UTF_8)
+val sig = Signature.getInstance("SHA256withECDSA").apply {
+    initSign(privateKey)
+    update(canonical)
+}
+val signatureB64 = Base64.getEncoder().encodeToString(sig.sign())
+```
+
+**Backend-side verification** (activation challenge, Kotlin):
+
+```kotlin
+val pubKey: PublicKey = KeyFactory.getInstance("EC")
+    .generatePublic(X509EncodedKeySpec(Base64.getDecoder().decode(publicKeyB64)))
+val canonical = "activate-v1|$challengeId|$nonce|$issuedAt|$expiresAt"
+    .toByteArray(Charsets.UTF_8)
+val sig = Signature.getInstance("SHA256withECDSA").apply {
+    initVerify(pubKey)
+    update(canonical)
+}
+val ok = sig.verify(Base64.getDecoder().decode(signatureB64))
+```
+
+**What is signed.** The canonical strings defined in §2.3 — NOT the raw JSON. JSON whitespace/key-ordering differences between Jackson on the backend and cJSON on the device would otherwise break verification. Each command type has its own versioned canonical (`rf-code-v1|…`, `deact-v1|…`, `transmit-v1|…`) so the payload shapes can evolve independently.
+
+Firmware-side performance budget (ESP32-C3 @ 160 MHz): ECDSA verify ≈ 70–100 ms, sign ≈ 100–150 ms. ESP-01 (80 MHz): verify ≈ 300–500 ms. Command verification is not a hot path.
+
+### 2A.6 Identifier Lifecycle
+
+- `**public_id`**: backend-minted, opaque to the device, scopes all operational MQTT topics. Re-minted on every activation so retained state from prior activations is automatically orphaned. Prefix encodes the device family: `rcv-XXXXX` (MCU receivers), `pas-XXXXX` (passive PT2272), `hub-XXXXX` (transmitter hubs).
+- `**challenge_id`**: backend-generated UUID, allocated at registration. Scopes the bootstrap envelope topic.
+- `**command_id**`: backend-generated UUID per lifecycle command. Persisted as `last_deact_id` on device for replay suppression.
+- `**dispatch_id**`: backend-generated UUID per dispatch event. Replay suppression is in-RAM only on the hub (ring buffer of 8 entries; §D NVS in the transmitter guide). Not retained — no stale replay across reboots.
+- `**registration_nonce**`: device-generated, single-session, binds a challenge back to the registration that triggered it.
+- `**enrollment_token**`: single-use, short-lived, opaque to firmware. Stored in Redis as SHA-256 hash. The device treats it as an opaque UTF-8 string.
+- `**code_version**`: monotonic only within one `public_id`. A new activation starts from version 1 because it is a new topic namespace.
+
+**Topic invalidation via `public_id`.** Because `public_id` is re-minted on every activation, old retained `cmd/rf_code` or `cmd/deact` payloads live on orphaned topic paths and are never delivered to a newly activated device. Broker-side retained cleanup (zero-length `retain=true` publishes to old topics) is recommended hygiene, not a correctness requirement. The backend performs this cleanup at activation time when `priorPublicId != null` (§D4 / §T2 step 9).
+
+### 2A.7 Backend Flow Summary (Receiver)
+
+This is the end-to-end flow that the backend service phases implement. Phase references are in parentheses.
+
+1. Admin issues an enrollment token (§D1). Plaintext shown once; backend stores only the SHA-256 hash in Redis with TTL.
+2. On `receiver/bootstrap/register` (§D2): validate `schema_version`, shape, `hardware_model`, `receiver_type`, field presence, and token usability. Consume the token atomically via `GETDEL`. Look up or create device row by `public_key_der` (stable identity). Persist `hardware_model`, `kind`, `firmware_version`, `registration_nonce`. Write Redis activation keys. Publish `pending` on `receiver/bootstrap/{challengeId}`.
+3. Admin review (§D3): approve → generate challenge nonce, publish `challenge`; reject → publish `rejected`, delete activation keys, set `device.status = REJECTED`.
+4. On valid `response` (§D4): rebuild `activate-v1|...` byte-for-byte, verify ECDSA signature against `device.public_key_der`. Mint fresh `rcv-XXXXX` `public_id`. Set `status = PENDING_RF_CODE`, `activated_at`. Delete activation keys. Publish `result`. If `priorPublicId != null`, clear retained topics on old `public_id`.
+5. Immediately after activation (§D5): `RfCodeService.autoIssue(deviceId)` generates code, signs `rf-code-v1|...`, publishes retained `cmd/rf_code`. When the device acks `APPLIED` or `UNCHANGED`, promote to `ACTIVE`.
+6. Rotation (§D5.1): new `code_version`, same flow as step 5.
+7. Deactivation (§D6): sign `deact-v1|...`, publish retained `cmd/deact`. On ack, update `device.status`. On decommission, clear retained topics.
+
+### 2A.8 Backend Flow Summary (Transmitter Hub)
+
+Differences from the receiver flow:
+
+1. Registration (§T1): arrives on `transmitter/bootstrap/register`. Discriminator is `kind: "TRANSMITTER_HUB"` (not `receiver_type`). Per-store cap check before upsert. Pre-assigns `store_id` from the enrollment token so concurrent registrations see PENDING hubs in the cap count.
+2. Activation (§T2): same `activate-v1` signature verify. Mints `hub-XXXXX`. Sets `status = ACTIVE` directly — **no `PENDING_RF_CODE`**, no `RfCodeService.autoIssue`. Publishes `result` on `transmitter/bootstrap/{challengeId}`.
+3. Heartbeat ingestion (§T3): `TransmitterOperationalListener` updates `device.last_seen_at` and bumps Redis liveness key `device:hub:alive:{deviceId}` with 30 s TTL.
+4. Election (§T4): `TransmitterElectionService.electActive(storeId)` returns the live hub with the most recent `last_seen_at` (tie-break: lowest `device.id`). Cache in Redis for 60 s. Re-validates liveness on read.
+5. Dispatch (§T5): on `DEVICE_CALL_REQUESTED` event, re-elect hub, decrypt receiver RF code, build and sign `transmit-v1|...`, publish to `transmitter/hub/{hubPublicId}/cmd/transmit` (QoS 1, not retained).
+6. Lifecycle (§T6): same `deact-v1` canonical. On suspend/decommission ack, invalidate the Redis election cache.
 
 ---
 
@@ -562,10 +971,10 @@ Dev profile may use `pk: classpath:device/cmd_signing_priv.pem`.
 Implementation rules:
 
 - Bind `DeviceCommandSigningProperties` and RF-code properties unconditionally, but do not fail app startup just because `pk` or `encryption-key` is blank. APIs that need signing, MQTT publishing, or RF-code encryption return `503 Service Unavailable` with a structured error when the required dependency/config is absent; read-only list/detail endpoints still work.
-- Create `DeviceCommandSigner` only when `pk` is non-blank, then fail fast if that provided key cannot be loaded as an EC P-256 private key. Do not stack multi-name `@ConditionalOnProperty` on the config — Spring Boot 3.5 evaluates multiple `name` entries with AND semantics ("all properties must pass the test for the condition to match", per the [`@ConditionalOnProperty` reference](https://docs.spring.io/spring-boot/3.5/api/java/org/springframework/boot/autoconfigure/condition/ConditionalOnProperty.html)). Use a single annotation per condition.
-- Resolve `pk` via `ResourceLoader.getResource(pk).inputStream` then `PemContent.load(inputStream).getPrivateKey()`. Use explicit resource prefixes: `classpath:` for dev resources and `file:` for mounted files. Bare absolute paths are not part of the contract. If the value starts with `base64:`, decode the body to text and use `PemContent.of(text).getPrivateKey()`.
+- Create `DeviceCommandSigner` only when `pk` is non-blank, then fail fast if that provided key cannot be loaded as an EC P-256 private key. Do not stack multi-name `@ConditionalOnProperty` on the config — Spring Boot 3.5 evaluates multiple `name` entries with AND semantics ("all properties must pass the test for the condition to match", per the `[@ConditionalOnProperty` reference]([https://docs.spring.io/spring-boot/3.5/api/java/org/springframework/boot/autoconfigure/condition/ConditionalOnProperty.html](https://docs.spring.io/spring-boot/3.5/api/java/org/springframework/boot/autoconfigure/condition/ConditionalOnProperty.html))). Use a single annotation per condition.
+- Resolve `pk` via `ResourceLoader.getResource(pk).inputStream` and BouncyCastle `PEMParser` + `JcaPEMKeyConverter` (handles both `PEMKeyPair` and `PrivateKeyInfo` formats). Use explicit resource prefixes: `classpath:` for dev resources and `file:` for mounted files. Bare absolute paths are not part of the contract. If the value starts with `base64:`, decode the body to text and parse via `PEMParser(StringReader(text))`.
 - Add `**/resources/device/**` to `backend/.gitignore` and `"device/**"` to the existing `bootJar.exclude(...)` list so a dev key never ships in the prod JAR.
-- `DeviceMqttPublisher` and MQTT listeners are `@ConditionalOnBean(MqttClientManager::class)`. If MQTT or signing is missing, admin APIs that need them return `503 Service Unavailable` with a clear error code; token listing and device listing still work.
+- `DeviceMqttPublisher` and MQTT listeners are `@ConditionalOnBean(MqttClientManager::class)`. Services that inject `DeviceMqttPublisher` (e.g. `DeviceRegistrationService`) must also be `@ConditionalOnBean(MqttClientManager::class)`. If MQTT or signing is missing, admin APIs that need them return `503 Service Unavailable` with a clear error code; token listing and device listing still work.
 
 RF-code encryption boundary:
 
@@ -591,7 +1000,7 @@ Bind via `DeviceTransmitterProperties` `@ConfigurationProperties` bean.
 
 `enabled = false` keeps the transmitter listeners and dispatch consumer **unregistered**, so the backend never subscribes to transmitter topics and the queue-side dispatch service surfaces `no_active_transmitter` immediately. `enabled = true` registers those beans on startup.
 
-`heartbeat-`* and `active-cache-*` are deliberate hardcoded ceilings, config-readable for ops visibility but not per-store overridable. Bending them requires firmware coordination, so they belong in YAML, not in `store_settings`.
+`heartbeat-`* and `active-cache-`* are deliberate hardcoded ceilings, config-readable for ops visibility but not per-store overridable. Bending them requires firmware coordination, so they belong in YAML, not in `store_settings`.
 
 All transmitter listeners and `TransmitterDispatchService` are annotated:
 
@@ -752,7 +1161,7 @@ No MQTT, no enrollment token, no approval, no signing, no challenge. Skips D2 / 
 
 Transmitter-family registration in the generalised `onRegister`:
 
-1. Validate `schema_version`, required fields, public-key DER/base64 shape, wire `hardware_model`, the literal `kind == "TRANSMITTER_HUB"`, and `firmware_version`. Reject anything else (including all `RECEIVER_`* values) — cross-family guard, mirror of the receiver-side check.
+1. Validate `schema_version`, required fields, public-key DER/base64 shape, wire `hardware_model`, the literal `kind == "TRANSMITTER_HUB"`, and `firmware_version`. Reject anything else (including all `RECEIVER`_* values) — cross-family guard, mirror of the receiver-side check.
 2. Map wire `hardware_model` → `DeviceHardwareModel` (only `ESP32-C3` is legal for hubs in v1).
 3. Consume the enrollment token via `GETDEL enroll:{hash}`. Capture the token's `storeId` — it is the cap-check store for step 5 and the device's pre-assigned store for step 6.
 4. If the token is missing, publish `rejected` with `invalid_token`.
@@ -919,7 +1328,7 @@ Heartbeat QoS is 0 (§E.3 / §E.5 of the firmware guide) — liveness is a slidi
 `TransmitterElectionService.electActive(storeId)` returns the elected hub:
 
 1. Read cached `store:{storeId}:transmitter:active`. If present **and** the cached hub still has a live `device:hub:alive:`* key, return it. (The cache TTL is shorter than the alive-key TTL, but a hub can drop its alive-key between cache writes if it crashes — re-validating is the cheap correct move.)
-2. Otherwise scan candidates: `kind = 'TRANSMITTER_HUB' AND store_id = X AND status = 'ACTIVE'`, filter by live `device:hub:alive:*` key, pick the one with the highest `last_seen_at` (ties broken by lowest `device.id` for determinism), cache the result with `device.transmitter.active-cache-seconds` TTL, and return.
+2. Otherwise scan candidates: `kind = 'TRANSMITTER_HUB' AND store_id = X AND status = 'ACTIVE'`, filter by live `device:hub:alive:`* key, pick the one with the highest `last_seen_at` (ties broken by lowest `device.id` for determinism), cache the result with `device.transmitter.active-cache-seconds` TTL, and return.
 3. If no candidate, return `null` — the dispatch service translates that into `409 Conflict {"error":"no_active_transmitter"}`.
 
 Election runs **lazily, only on dispatch**, so heartbeat traffic doesn't pay election cost. Suspending or decommissioning the cached primary deletes the cache (§T6), so the next dispatch re-elects within one round-trip.
@@ -1226,14 +1635,14 @@ The button is **not** role-gated in the UI; backend `StoreAccessUtil` enforces a
 `passive-device-form-dialog.tsx` submits to `API_ROUTES.DEVICES.PASSIVE` via `post` from `@/lib/api`. Body shape per §7. Form fields:
 
 
-| Field          | Component                | Notes                                                                                                                                                                                                                              |
-| -------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Kind           | `Badge`                  | Read-only, shows the kind-label-map value for `RECEIVER_433M_PASSIVE` (`433 MHz Receiver` / `Bộ thu 433 MHz` per §9.6). The passive nature is conveyed by the adjacent `PT2272` hardware-model badge, not the kind label. Never render the enum literal. Hardcoded in payload.      |
-| Hardware model | `Badge`                  | Read-only, `PT2272`. Hardcoded in payload.                                                                                                                                                                                         |
-| Store          | `Select`                 | SUPER_ADMIN: reuse the repo's current selector pattern (`listStores(0, 100)` from the store feature) rather than coupling this dialog to the store-management table state. ADMIN: single read-only entry forced to `principal.storeId`. Required. |
-| Assigned name  | `Input`                  | Required, `maxLength={100}`.                                                                                                                                                                                                       |
-| Bit width      | `Badge`                  | Read-only, fixed at `16`. Hardcoded in payload. Helper text via `devices.passive.bitsHelp` explains this is the PT2272's 8-trit address; the channel ID is patched by the backend at dispatch time. |
-| RF code hex    | `Input` with `font-mono` | `[0-9A-Fa-f]+`, uppercased on blur. `maxLength = 4` (16 bits = 2 bytes = 4 hex chars).                                                                                                                                              |
+| Field          | Component                | Notes                                                                                                                                                                                                                                                                          |
+| -------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Kind           | `Badge`                  | Read-only, shows the kind-label-map value for `RECEIVER_433M_PASSIVE` (`433 MHz Receiver` / `Bộ thu 433 MHz` per §9.6). The passive nature is conveyed by the adjacent `PT2272` hardware-model badge, not the kind label. Never render the enum literal. Hardcoded in payload. |
+| Hardware model | `Badge`                  | Read-only, `PT2272`. Hardcoded in payload.                                                                                                                                                                                                                                     |
+| Store          | `Select`                 | SUPER_ADMIN: reuse the repo's current selector pattern (`listStores(0, 100)` from the store feature) rather than coupling this dialog to the store-management table state. ADMIN: single read-only entry forced to `principal.storeId`. Required.                              |
+| Assigned name  | `Input`                  | Required, `maxLength={100}`.                                                                                                                                                                                                                                                   |
+| Bit width      | `Badge`                  | Read-only, fixed at `16`. Hardcoded in payload. Helper text via `devices.passive.bitsHelp` explains this is the PT2272's 8-trit address; the channel ID is patched by the backend at dispatch time.                                                                            |
+| RF code hex    | `Input` with `font-mono` | `[0-9A-Fa-f]+`, uppercased on blur. `maxLength = 4` (16 bits = 2 bytes = 4 hex chars).                                                                                                                                                                                         |
 
 
 Field errors render via `InlineError`; field labels via `Label`; helper text uses the existing muted-text pattern from `store-general-fields.tsx`. Footer: primary `Button` (`devices.passive.submit`) with a `Loader2` spinner during submit (matching `create-admin-dialog.tsx`); secondary `Button variant="outline"` (`common.cancel`, existing key). `Dialog` already provides its surface — do not nest it inside a `glass-card`.
@@ -1321,23 +1730,262 @@ Add to both `en.json` and `vi.json`:
 
 ---
 
-## 10. Execution Order
+## 10. Sprint Plan
 
-Phases that can ship together (because they share a slice or unblock each other) are grouped. Each step updates `docs/CHANGELOGS.md` with every file touched and any skipped item.
+The work is split into **backend sprints** and **frontend sprints** that can be staffed and verified independently. Backend sprints produce API endpoints and MQTT listeners; frontend sprints consume those APIs. The two tracks share a dependency edge only where noted — otherwise they run in parallel.
 
-1. **F0** — Foundation: impact checks, schema/migration (§3), config, signing, canonical helpers (`activate-v1`, `rf-code-v1`, `deact-v1`, `transmit-v1`), `DevicePublicIdMinter` (with `hub-` prefix from day one), `DeviceMqttPublisher` with both receiver and hub publish methods, `MqttClientManager` v5 subscription overload, both Redis-key buckets.
-2. **D1** — Enrollment token backend + admin-web token screen.
-3. **D2 + T1** — Bootstrap registration for both families, `DeviceFamily` discriminator, per-store hub cap pre-check. Admin-web pending-review surface renders both kinds.
-4. **D2.1** — PT2272 manual register backend + admin-web dialog.
-5. **D3** — Approval (shared, kind-aware retained-cleanup hand-off in §D4 / §T2).
-6. **D4 + T2** — Activation: shared signature-verify path; receiver path issues initial RF code, hub path goes straight to `ACTIVE` with `hub-XXXXX` `public_id`.
-7. **D5** — RF code (receivers only): forbidden-set + uniqueness, auto-issue / rotation / admin-set, ack handling, RF-code editor.
-8. **D6 + T6** — Lifecycle: shared `cmd/deact` path; hub path adds election-cache invalidation. Lifecycle panel handles both.
-9. **T3 + T4** — Transmitter heartbeat ingestion + active-hub election service. Heartbeat panel + cap badge in admin web.
-10. **D7a + T5** — Queue dispatch backend plumbing (broadcaster, `TicketDto` widening, `device:busy` lifecycle, admin endpoints) + transmitter dispatch consumer that turns events into `cmd/transmit`. The two land together because §T5 is what makes §D7a's preflight pass.
-11. **D7b + T7** — Queue dispatch UI + cap-counter surface. Last because both depend on the dispatch path being end-to-end live.
+Each sprint updates `docs/CHANGELOGS.md` with every file touched and any skipped item.
 
-After all phases ship, mark the notifier/device-domain row complete in `docs/planned/Backend Remaining Plan.md` with a link back here.
+### 10.1 Backend Sprints
+
+#### Backend Sprint 1 — Foundation + Device Registration ✅
+
+**Status: COMPLETE** (2026-05-03)
+
+**Goal:** Stand up the device domain end-to-end from enrollment tokens through pending-device creation. After this sprint the backend can issue tokens, accept MQTT registrations from both receiver and hub families, and persist pending devices — but cannot yet approve or activate them.
+
+Phases: **F0**, **D1**, **D2**, **D2.1**, **T1**
+
+Scope:
+
+- Schema + migration (§3): `device`, `device_rf_code` tables, enum types, trigger function. `R2DBCConfig` enum codec entries.
+- Redis keys (§4): all receiver and transmitter buckets (`enroll:`*, `device:activation:*`, `device:activation-by-device:*`, `device:lifecycle:*`, `device:busy:*`, `device:hub:alive:*`, `store:*:transmitter:active`).
+- Configuration (§6): `DeviceCommandSigningProperties`, `DeviceCommandSigningConfig`, RF-code properties, `DeviceTransmitterProperties`. Both `@ConfigurationProperties` beans.
+- Signing infra (§6.1): `DeviceCommandSigner` (conditional on `pk` non-blank), `DeviceCanonical.kt` with all four canonical builders (`activate-v1`, `rf-code-v1`, `deact-v1`, `transmit-v1`), golden-string unit tests.
+- `DevicePublicIdMinter` with `rcv-`, `pas-`, `hub-` prefixes and global collision check.
+- `DeviceMqttPublisher` with both receiver and hub methods (`publishRfCode`, `publishDeact`, `publishTransmit`, `clearRetained`).
+- `MqttClientManager` v5 subscription descriptor/overload for `noLocal` on `transmitter/bootstrap/+` (§F0 step 8).
+- `RateLimitFilter.resolveTier` updated to accept `method` + `path`; strict tier for `POST /api/devices/enrollment-tokens`.
+- `EnrollmentTokenService` + `EnrollmentTokenController` (§D1).
+- `DeviceRegistrationService.onRegister` generalised with `DeviceFamily` discriminator (§D2 / §T1).
+- `DeviceBootstrapListener` for `receiver/bootstrap/{register,+}` (§D2).
+- `TransmitterBootstrapListener` (`@ConditionalOnProperty` on `device.transmitter.enabled`) for `transmitter/bootstrap/{register,+}` (§T1). Per-store hub cap pre-check.
+- `PassiveDeviceRegistrationService` + `POST /api/devices/passive` (§D2.1).
+- Entity/repository/DTO/type classes: `Device`, `DeviceRfCode`, `DeviceRepository`, `DeviceRfCodeRepository`, `DeviceFamily`, `DeviceHardwareModel`, `DeviceKind`, `DeviceStatus`, `DeviceRfAckStatus`.
+- Additional classes not in original scope but required: `DeviceQueryService` (device listing with RF code join + hub registration count), `DeviceControllerExceptionHandler`, `DeviceControllerExceptions`, `DevicePublicIdLookup` (interface extracted for minter).
+
+Verification:
+
+- Unit tests: canonical string builders (golden strings from §2A.2/2A.3), `DevicePublicIdMinter` prefix + collision, `RfCodeValidator` per-kind width rules.
+- Integration: issue enrollment token → `SET`/`GETDEL` round-trip, `GET`/`DELETE` token listing. Receiver registration → pending device row + `pending` envelope on MQTT. Hub registration → pending device row + cap check. Passive registration → `ACTIVE` device + `device_rf_code` row. Migration script idempotency (run twice, verify no-op on second run).
+
+Post-implementation audit (2026-05-03):
+
+- **Fixed:** `DeviceRegistrationService` was missing `@ConditionalOnBean(MqttClientManager::class)` — it hard-depended on the conditional `DeviceMqttPublisher`, which would cause a startup failure if MQTT were disabled. Added the annotation.
+- **Accepted deviation:** `DeviceCommandSigner` uses BouncyCastle `PEMParser` + `JcaPEMKeyConverter` instead of Spring's `PemContent.load().getPrivateKey()` (§6.1). Both approaches are correct; BouncyCastle is already a dependency (`bcpkix-jdk18on:1.83`) and provides more explicit control over `PEMKeyPair` vs `PrivateKeyInfo` formats.
+- **Accepted deviation:** YAML `pt2272-toggle-channel: 0` / `pt2272-detoggle-channel: 1` instead of plan's `0x00` / `0x01`. Functionally identical (SnakeYAML parses both as integer); plain decimal is unambiguous.
+
+---
+
+#### Backend Sprint 2 — Approval, Activation + RF Code ✅
+
+**Status: COMPLETE** (2026-05-03)
+
+**Goal:** Complete the device lifecycle from pending through fully operational. After this sprint an MCU receiver can be approved, activated, receive its initial RF code, get rotated codes, and be suspended/resumed/decommissioned. Hubs can be approved and activated (going straight to `ACTIVE`). The device detail API is functional.
+
+Phases: **D3**, **D4**, **T2**, **D5**, **D6**, **T6**
+
+Scope:
+
+- `DeviceApprovalService` (§D3): approve (set `store_id`, `assigned_name`, challenge nonce, publish `challenge`) and reject (publish `rejected`, cleanup). Hub-specific cap re-check on approval.
+- `DeviceActivationService.onResponse` (§D4 / §T2): shared `activate-v1` verify path. Receiver: mint `rcv-XXXXX`, set `PENDING_RF_CODE`, publish `result`, clear prior retained topics, auto-issue RF code. Hub: mint `hub-XXXXX`, set `ACTIVE` directly, publish `result` on `transmitter/bootstrap/{cid}`.
+- `RfCodeForbiddenSet` (§D5.0): forbidden patterns for 433M and 2.4G.
+- `RfCodeService` (§D5.1 / §D5.2): `autoIssue`, `rotate`, validation, encryption via `pgp_sym_encrypt_bytea`, sign + publish retained `cmd/rf_code`, ack handling (normalise statuses, promote `PENDING_RF_CODE` → `ACTIVE`).
+- `DeviceOperationalListener` for `receiver/device/+/ack` (§D5 / §D6 ack paths).
+- `DeviceLifecycleService.issue` (§D6 / §T6): sign `deact-v1`, publish retained `cmd/deact`. Passive devices: status flip only. MCU receivers: MQTT path + Redis lifecycle key. Hubs: MQTT path + election-cache invalidation.
+- `DeviceAdminController` full CRUD: `GET /api/devices`, `GET /api/devices/{id}`, `POST .../approve`, `POST .../reject`, `POST .../rf-code`, `POST .../lifecycle`, `POST .../reprovision`.
+
+Verification:
+
+- Integration: approve MCU receiver → `challenge` on MQTT → simulate `response` → `result` published, device `PENDING_RF_CODE`, RF code auto-issued on `cmd/rf_code`. Ack `applied` → device promoted to `ACTIVE`. Approve hub → `challenge` → `response` → device `ACTIVE` directly, no `cmd/rf_code`. Rotate RF code → new version published, ack updates row. Lifecycle suspend/resume/decommission → retained `cmd/deact`, ack flips status. Hub decommission → election cache deleted. Reprovision → `public_id` cleared, prior retained cleaned. Passive lifecycle → synchronous status flip.
+
+Audit (2026-05-03), 2 findings, both fixed:
+
+- **Fixed (BUG):** `DeviceActivationService.onResponse` called `deleteActivationState` twice — once bare at line 87 (would abort the transaction on failure), then again inside `runCatching` at line 96 (always a no-op since the first already deleted). Removed the bare call and kept only the `runCatching`-wrapped one.
+- **Fixed (PLAN ADHERENCE):** `DeviceBootstrapListener` and `TransmitterBootstrapListener` were missing the self-echo guard (§D2 / §T1). Both forwarded ALL messages on `…/bootstrap/{cid}` to `DeviceActivationService.onResponse`, including backend-owned envelope types (`pending`, `challenge`, `rejected`, `result`). Added an explicit `type == "response"` filter before dispatching. While `onResponse` already validates `type == "response"` internally, the listener-level guard prevents unnecessary deserialization and matches the plan's stated contract. The transmitter listener already uses `noLocal` (MQTT v5) as the primary guard; the explicit filter stays as defense-in-depth per §T1.
+
+Verified correct (no change needed):
+
+- `DeviceApprovalService` correctly re-runs the per-store hub cap check against the assigned `storeId` per §D3.
+- `DeviceActivationService.onResponse` correctly branches on `device.kind.isHub()` for status (`ACTIVE` vs `PENDING_RF_CODE`) and skips `rfCodeService.autoIssue` for hubs per §D4/§T2.
+- `DeviceMqttPublisher.publishResult` correctly routes to `transmitter/bootstrap/{cid}` vs `receiver/bootstrap/{cid}` based on `device.kind` per §T2.
+- `RfCodeValidator` enforces exact widths per kind (1..32 for 433M, 16 for passive, 40 for 2.4G) per §2.4.
+- `RfCodeForbiddenSet` implements all §D5.0 guards: repeating-nibble for 433M, zero/one/toggle/transition checks for 2.4G including first-byte bit-transition guard.
+- `RfCodeService.rotate` rejects passive with `hardware_fixed_code` and hubs with `hub_no_rf_code` per §D5.1/§D5.2.
+- `RfCodeService.autoIssue` gracefully degrades when signing or MQTT is unavailable, leaving status as `PENDING_RF_CODE` per §D4.
+- `RfCodeService.onAck` correctly promotes `PENDING_RF_CODE` → `ACTIVE` on `APPLIED`/`UNCHANGED` and ignores out-of-version acks per §D5.1.
+- `DeviceRfCodeRepository.findCollision` scopes 433M to same-store and 2.4G globally per §D5.0 uniqueness.
+- `DeviceLifecycleService.issue` correctly handles passive (synchronous status flip, no MQTT), MCU receivers (sign + publish `cmd/deact`, Redis lifecycle key), and rejects `DECOMMISSIONED` devices per §D6.
+- `DeviceLifecycleService.handleSuccessfulAck` invalidates election cache for hubs on suspend/decommission and clears retained topics on decommission per §T6.
+- `DeviceLifecycleService.reprovision` stores `priorPublicId` in Redis for activation-time retained cleanup, deletes RF code for receivers but not hubs, and invalidates election cache for hubs per plan.
+- `DeviceOperationalListener` subscribes to `receiver/device/+/ack` and dispatches by `ack_for` to `rfCodeService.onAck` or `deviceLifecycleService.onAck` per §D5/§D6.
+- `TransmitterLifecycleAckListener` subscribes to `transmitter/hub/+/ack`, filters `ack_for == "deact"` only, and delegates to the shared `deviceLifecycleService.onAck` per §T6.
+- `DeviceAdminController` exposes all required endpoints at the correct paths with proper auth validation per Sprint 2 scope.
+- `DeviceCanonical` string formats match §2.3 specification (`activate-v1`, `rf-code-v1`, `deact-v1`, `transmit-v1`) with correct field order and ISO-8601 UTC timestamps.
+- `DeviceCommandSigningProperties.RfCode` validates `defaultBits433m ∈ 1..32`, `defaultBits24g == 40`, PT2272 channels in byte range per §6.1.
+
+---
+
+#### Backend Sprint 3 — Transmitter Election + Queue Dispatch ✅
+
+**Goal:** The transmitter heartbeat/election system and the queue-dispatch plumbing that ties device-bound tickets to the existing queue. After this sprint, admins can issue device-bound tickets, and the full call→serve/cancel/no-show cycle works end-to-end with RF dispatch through an elected hub.
+
+Phases: **T3**, **T4**, **D7a**, **T5**, **T7**
+
+Scope:
+
+- `TransmitterOperationalListener` (`@ConditionalOnProperty`) for `transmitter/hub/+/heartbeat` and `transmitter/hub/+/ack` (§T3). Heartbeat → `device.last_seen_at` + Redis liveness key. Transmit-ack → log + drop stale. Deact-ack → shared lifecycle handler with election-cache invalidation.
+- `TransmitterElectionService.electActive(storeId)` (§T4): Redis-cached, lazy on dispatch, validates liveness.
+- `DeviceDispatchService` (§D7a): `issueDeviceTicket` (preflight election, load device, set `device:busy`, call `QueueService.issueTicket` with `extraFields`), `GET /available-devices` preflight envelope.
+- `DeviceDispatchEventBroadcaster` (`Sinks.many().multicast().directBestEffort()`).
+- `QueueService.issueTicket` gains `extraFields: Map<String, String>` parameter.
+- `TicketDto` widened with `deviceId` / `deviceName`.
+- Queue-operation hooks in `QueueService`: call (FCM vs dispatch-event branch), serve/cancel/no-show/transfer (§D7a hooks).
+- `TransmitterDispatchService` (`@ConditionalOnProperty`) subscribes to `DeviceDispatchEventBroadcaster` (§T5): re-elect, decrypt RF code, PT2272 channel patching, sign `transmit-v1`, publish `cmd/transmit`. Stop events: same flow with de-toggle channel for PT2272.
+- `DEVICE_DISPATCH_FAILED` event type added to `MqttPublisher.QueueEventType` + SSE.
+- Queue admin endpoints: `POST /api/queue/admin/{storeId}/device-tickets`, `GET /api/queue/admin/{storeId}/available-devices`.
+- `GET /api/devices?kind=TRANSMITTER_HUB&storeId=X` returns `registered` count (§T7).
+
+Verification:
+
+- Integration: simulate heartbeat stream → `device:hub:alive:`* bumped, `last_seen_at` updated. `electActive` returns the live hub; stop heartbeat → next election fails. Issue device-bound ticket → ticket in queue with `device_id` hash field, `device:busy` key set. Call next → `DEVICE_CALL_REQUESTED` → `cmd/transmit` published on elected hub topic. Serve → `DEVICE_STOP_REQUESTED` → `cmd/transmit` (stop). Cancel/no-show variants. PT2272 dispatch → 24-bit code with patched channel. Election loss mid-dispatch → `DEVICE_DISPATCH_FAILED` event, reservation kept.
+
+---
+
+### 10.2 Frontend Sprints
+
+Frontend sprints consume the APIs from the corresponding backend sprint. Each frontend sprint can begin as soon as the backend API it depends on is live, but the frontend track can also mock APIs and work in parallel.
+
+#### Frontend Sprint 1 — Device Domain Shell + Tokens + Registration ✓
+
+**Status:** Implemented and audited (2026-05-05). Post-implementation audit fixed 4 issues; plan-adherence audit fixed 3 more.
+
+**Depends on:** Backend Sprint 1 APIs (`/api/devices/enrollment-tokens/`**, `GET /api/devices`, `POST /api/devices/passive`)
+
+**Goal:** The device management pages exist, the sidebar entry is wired, tokens can be issued/listed/revoked, pending devices appear, and passive PT2272 devices can be manually registered.
+
+Scope:
+
+- Routes (§9.1): `/dashboard/devices/page.tsx`, `/dashboard/devices/pending/page.tsx`, `/dashboard/devices/tokens/page.tsx`, `/dashboard/devices/[id]/page.tsx`.
+- Sidebar (§9.2): add `devices` to `NavItem.label` union, `Radio` icon, `navigation.devices` i18n.
+- Feature folder (§9.3): `api.ts`, `types.ts`, `device-list-table.tsx`, `device-status-badge.tsx`, `device-filter-bar.tsx`, `enrollment-token-dialog.tsx`, `enrollment-token-table.tsx`, `passive-device-form-dialog.tsx`.
+- API constants (§9.5): `DEVICES.`* block.
+- CSS: `web/src/styles/device.css`.
+- i18n keys: `navigation.devices`, `devices.title`, `devices.pendingTab`, `devices.tokensTab`, `devices.listTitle`, `devices.emptyState`, `devices.groupByStore`, `devices.filterStatus`, `devices.filterKind`, `devices.filterHardware`, `devices.filterStore`, `devices.status.`*, `devices.kind.*`, `devices.tokens.*`, `devices.passive.*` (§9.8.4 full list).
+- Token dialog: one-time plaintext display with copy action and warning (§9.4).
+- Passive device form dialog (§9.8.1): `PassiveDeviceFormDialog` with validation (§9.8.2), server error handling (409/400/403).
+- Device list table: native `<table>` inside `glass-card`, kind-label-map rendering (§9.6), filter bar by status/kind/hardware/store.
+- Pending review surface: `pending-review-card.tsx` showing pending devices from both families.
+
+Verification:
+
+- Issue enrollment token → dialog shows plaintext once, token appears in list, can be revoked.
+- Register passive PT2272 → device appears in list as `ACTIVE`, detail page renders read-only RF-code panel.
+- Device list renders, filters work, kind labels are localized (never raw enum).
+- Pending list shows devices awaiting approval.
+- Vietnamese translations are natural, not word-for-word English.
+
+Implementation notes:
+
+- `types.ts` placed in `@/types/device.ts` (central types directory) rather than `features/device/types.ts`, following the existing project convention. All feature files import from `@/types/device`.
+- `[id]/page.tsx` uses `useParams` from `next/navigation` (the plan-allowed alternative to the async server wrapper), consistent with `analytics/[storeId]/page.tsx`.
+- `device.css` is a minimal placeholder — no long Tailwind class lists needed extraction yet.
+
+---
+
+#### Frontend Sprint 2 — Approval, Detail Page + Lifecycle ✓
+
+**Status:** Implemented and audited (2026-05-05). Post-implementation audit fixed 3 issues; plan-adherence audit fixed 2 more (lifecycle action i18n, approve store placeholder).
+
+**Depends on:** Backend Sprint 2 APIs (`POST .../approve`, `POST .../reject`, `POST .../rf-code`, `POST .../lifecycle`, `POST .../reprovision`, `GET /api/devices/{id}`)
+
+**Goal:** Admins can approve/reject pending devices, the detail page renders all panels conditionally by kind, RF-code rotation works for MCU receivers, and lifecycle actions (suspend/resume/decommission) work for all device types.
+
+Scope:
+
+- `approve-dialog.tsx`, `reject-dialog.tsx` (§D3 surface): `AlertDialog` for reject/decommission confirmations with destructive styling.
+- `pending-review-card.tsx` gains approve/reject actions. Hub-specific approval subtitle (§9.9.3 `devices.hub.approveSubtitle`).
+- `rf-code-editor.tsx` (§9.3): rotation editor for MCU receivers; read-only render for passive devices showing masked value + locked note (§9.8.3); not rendered for hubs (§9.9.2).
+- `lifecycle-panel.tsx` (§9.3): suspend/resume/decommission actions, `AlertDialog` for decommission. Kind-specific subtitles: `devices.lifecycle.passiveSubtitle` (§9.8.3), `devices.lifecycle.hubSubtitle` (§9.9.2).
+- `dispatched-ticket-panel.tsx` (§9.3): placeholder for device-bound ticket info.
+- `use-device-ack-poll.ts` (§9.3): polling hook for ack status while `PENDING`.
+- Detail page (§9.1 `[id]/page.tsx`): conditional panels by `device.kind` — identity panel (shared), RF-code panel (receivers only), lifecycle panel (shared), reprovision action (hidden for passive).
+- Reprovision: `AlertDialog` confirmation, calls `POST .../reprovision`, hidden for `RECEIVER_433M_PASSIVE`.
+- i18n keys: `devices.pending.`*, `devices.rfCode.`*, `devices.lifecycle.*`, remaining `devices.passive.*` keys (§9.8.4).
+
+Verification:
+
+- Approve a pending MCU receiver → status changes, RF-code panel shows `ack = PENDING`, polls until `APPLIED`, status promotes to `ACTIVE`.
+- Approve a pending hub → status goes directly to `ACTIVE`, no RF-code panel rendered.
+- Reject a pending device → device status `REJECTED`.
+- Rotate RF code on a `RECEIVER_433M` → new version displayed, ack polling works.
+- Rotate attempt on passive device → `400 Bad Request`, UI shows `hardware_fixed_code` error.
+- Suspend/resume/decommission → lifecycle panel updates. Decommission uses destructive confirmation.
+- Reprovision an MCU device → confirmation dialog, status resets.
+- Passive detail page → read-only RF-code, no reprovision button.
+
+---
+
+#### Frontend Sprint 3 — Hub Panels + Queue Dispatch UI ✓
+
+**Status:** Implemented and audited (2026-05-07). Post-implementation audit fixed 6 issues (1 medium: serving-display badge i18n; 5 low: dead state, inline import, stale threshold, 2 unused i18n keys). All 5 known limitations subsequently resolved: per-hub election via `isElected` on DTO, bound ticket display for receivers, SSE `reason` field with 6 distinct failure reasons, filter-resilient hub cap badge, and backend-sourced `maxHubsPerStore`.
+
+**Depends on:** Backend Sprint 3 APIs (`GET /available-devices`, `POST /device-tickets`, `GET /api/devices?kind=TRANSMITTER_HUB&storeId=X` with `registered` count)
+
+**Goal:** Transmitter hub detail panels are live (heartbeat, election, cap badge), and the queue page gains the device-dispatch workflow — issuing device-bound tickets, seeing the device badge on ticket rows, and handling dispatch failures.
+
+Scope:
+
+- `hub-heartbeat-panel.tsx` (§9.9.2): last-heartbeat timestamp, liveness badge (`alive` / `stale`), election state (`elected` / `standby`). 15 s polling interval.
+- `hub-cap-badge.tsx` (§9.9.1): `"2 / 3 hubs registered"` badge from the `registered` count. Tooltip explaining backend-enforced ceiling.
+- Device list page: `HubCapBadge` rendered for stores with at least one hub (§9.9.1).
+- Hub detail page: heartbeat panel (hub-only), no RF-code panel, reprovision with hub-specific confirmation (§9.9.2), dispatched-ticket panel with election note.
+- Queue page (§9.7 / §D7b):
+  - Header action button: "Dispatch via device" — disabled when no devices or no hub. Tooltip distinguishes the two disabled reasons.
+  - Device-selection `Dialog` with available receivers for the store.
+  - Per-row device `Radio` badge on ticket rows when `ticket.deviceId` is non-null, linking to `/dashboard/devices/{deviceId}`.
+  - Error toasts: `no_active_transmitter`, device busy, generic.
+  - SSE typing update: `DEVICE_DISPATCH_FAILED` in `QueueEventType`, widened `QueueSseEvent`, new event in `use-queue-events.ts`.
+- API constants (§9.5): `QUEUE.DEVICE_TICKETS(storeId)`, `QUEUE.AVAILABLE_DEVICES(storeId)`.
+- i18n keys: `devices.hub.`* (§9.9.4 full list), `queue.dispatch.`* (§9.7).
+
+Verification:
+
+- Hub detail page renders heartbeat panel with liveness badge, election state, no RF-code panel.
+- Cap badge shows correct count on device list for stores with hubs.
+- Queue page: dispatch button enabled when `dispatchReady = true` and devices available; disabled with correct tooltip otherwise.
+- Issue a device-bound ticket → ticket appears in waiting list with device badge.
+- Call next on a device-bound ticket → device badge persists in serving display.
+- Simulate `DEVICE_DISPATCH_FAILED` SSE → toast appears, ticket state unchanged.
+- Device badge click navigates to device detail.
+- Vietnamese copy is natural throughout.
+
+---
+
+### 10.3 Sprint Dependency Map
+
+```
+Backend Sprint 1 ──────► Backend Sprint 2 ──────► Backend Sprint 3
+  (Foundation +             (Approval +              (Election +
+   Registration)             Activation +              Queue Dispatch)
+                             RF Code +
+       │                     Lifecycle)                    │
+       │                        │                         │
+       ▼                        ▼                         ▼
+Frontend Sprint 1 ─────► Frontend Sprint 2 ─────► Frontend Sprint 3
+  (Shell + Tokens +         (Detail Page +           (Hub Panels +
+   Passive Register)         Lifecycle)               Queue Dispatch UI)
+```
+
+**Parallelism opportunities:**
+
+- Frontend Sprint 1 can begin as soon as Backend Sprint 1 lands its first API (`/api/devices/enrollment-tokens`); the remaining token + registration endpoints land incrementally.
+- Frontend Sprint 2 can overlap with Backend Sprint 3 — it only needs Backend Sprint 2 APIs.
+- Frontend Sprint 3 waits on Backend Sprint 3 (dispatch endpoints + SSE events).
+
+**Audit checkpoints:** Each backend sprint ends with a build + test pass; each frontend sprint ends with a UI walkthrough (golden path + edge cases from the verification list). Do not bundle sprints — verify each independently before starting the next.
+
+After all sprints ship, mark the notifier/device-domain row complete in `docs/planned/Backend Remaining Plan.md` with a link back here.
 
 ---
 
@@ -1357,3 +2005,4 @@ Items intentionally out of scope for this plan. Each is independent of the work 
 - In-field rotation of the backend command-signing key.
 - A dedicated `device_event` audit table.
 - A dedicated transmitter admin screen with hub map / heartbeat trace beyond the per-device panels in §9.9.
+

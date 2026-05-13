@@ -6,30 +6,42 @@ Merged implementation backlog from:
 - `docs/planned/Backend Audit.md` ("Open / Deferred Findings")
 - Current backend source TODO scan (`backend/src`)
 
-**Last updated**: 2026-03-25
+**Last updated**: 2026-05-11
 
 ---
 
 ## Priority Backlog
 
-### P1 — Implement Notifier Device Domain
+### P2 — Remote Device Diagnostics
 
 **Why now**
 
-- `notifier_device` table exists but domain implementation is still missing.
-- Needed for device-triggered analytics and future notifications/device management.
-- MQTT infrastructure is already in place (`core/mqtt/` package) — devices will consume MQTT messages.
+- Admin dashboard currently has no visibility into transmitter hub health (memory, signal strength, uptime, dispatch throughput).
+- All the data is already available on the hub's OLED display — this would expose it remotely.
+- Can be built on top of the existing MQTT + device infrastructure with no firmware architecture changes.
 
 **Implementation targets**
 
-- Create entity/repository/service/controller for notifier devices.
-- Support basic registration, activation/deactivation, and heartbeat/battery updates.
-- Align emitted analytics metadata for `DEVICE_TRIGGERED` where applicable.
+- Backend requests a status snapshot from the hub via MQTT request/response (e.g., `cmd/status` → `status/response`), or enrich the existing heartbeat envelope with optional diagnostic fields (heap, RSSI, uptime, dispatch count).
+- Admin dashboard "device health" view consuming these diagnostics.
 
-**Primary sources**
+---
 
-- Recap remaining: notifier device domain not yet implemented.
-- ESP-IDF v6.0 receiver codebase at `/home/thomas/esp/v6.0/esp-idf`.
+### P2 — Test Coverage
+
+**Why now**
+
+- Backend has **zero tests** — the `src/test/` directory is empty.
+- All domain implementations are complete; this is now the primary remaining gap.
+- Queue (Lua scripts, race conditions), analytics (continuous aggregates), auth (JWT, sessions), and device (MQTT listeners, dispatch) are the highest-risk areas.
+
+**Implementation targets**
+
+- Integration tests for queue lifecycle (issue → call → serve/cancel/skip/requeue).
+- Integration tests for analytics event writes and query endpoints.
+- Unit tests for JWT issuance/verification, rate limiting, and auth flows.
+- Integration tests for device registration, activation, RF code distribution, and dispatch.
+- Test infrastructure: TestContainers for PostgreSQL/TimescaleDB + Redis, or equivalent.
 
 ---
 
@@ -38,6 +50,7 @@ Merged implementation backlog from:
 
 | Item                                           | Status                | Reference                                                                                                                                                                          |
 | ---------------------------------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1 — Device Domain                             | **Done** (2026-05-11) | Full device lifecycle: 14 services, 4 controllers, 4 MQTT listeners, 2 entities, 5 Redis cache records, 7 core infra classes. 3 firmware codebases (transmitter ESP32, receiver ESP32, receiver ESP8266). |
 | P3 — MQTT Integration                          | **Done** (2026-03-22) | MQTT v5 fully implemented: `core/mqtt/` package, publishes at 4 lifecycle points, conditional beans. See `CHANGELOGS.md` MQTT migration audit.                                     |
 | P0 — Analytics Event Writes                    | **Done** (2026-03-23) | `AnalyticsEventService` writes events at all 5 lifecycle points (`TICKET_ISSUED`, `TICKET_CALLED`, `TICKET_COMPLETED`, `TICKET_CANCELLED`, `TICKET_SKIPPED`).                      |
 | P0 — Analytics Query Endpoints                 | **Done** (2026-03-23) | `AnalyticsQueryService` + `AnalyticsController`: summary, peak hours, throughput, realtime stats, overview (super admin).                                                          |
@@ -69,8 +82,35 @@ All features from `docs/planned/Features Implementation Plan.md` are now **fully
 
 ---
 
+## Current Backend Inventory (2026-05-11)
+
+### Domains (5)
+
+| Domain       | Entities                            | Services | Controllers | Storage                   |
+| ------------ | ----------------------------------- | -------- | ----------- | ------------------------- |
+| **Admin**    | Admin, AdminSession, LoginHistory   | 5        | 2           | PostgreSQL                |
+| **Analytics**| AnalyticsEvent                      | 2        | 1           | TimescaleDB hypertable    |
+| **Device**   | Device, DeviceRfCode                | 14       | 4           | PostgreSQL + Redis        |
+| **Queue**    | (Redis-only)                        | 3        | 2           | Redis                     |
+| **Store**    | Store, StoreSettings, ServiceType   | 2        | 2           | PostgreSQL                |
+
+### Core Infrastructure (10 packages)
+
+config, database, device, exception, firebase, jwt, mqtt, ratelimit, redis, security, sse
+
+### Database (11 tables)
+
+store, admin, device, device_rf_code, analytics_event, login_history, store_settings, admin_session, service_type, analytics_hourly (mat. view), analytics_daily (mat. view)
+
+### Firmware (3 codebases)
+
+- `transmitter/` — ESP32, nRF24 driver, MQTT, dispatch (29 files)
+- `receiver-esp32/` — ESP32, nRF24 driver, MQTT, vibrator (23 files)
+- `receiver-esp8266/` — ESP8266, nRF24 driver, MQTT, vibrator, recovery (22 files)
+
+---
+
 ## Suggested Execution Order
 
-1. Implement P1 notifier device domain (physical device management via MQTT).
-2. Add test coverage (P2) around queue, analytics, estimation, and auth flows.
+1. Add test coverage (P2) around queue, analytics, auth, and device flows.
 

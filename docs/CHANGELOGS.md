@@ -1,5 +1,66 @@
 # Changelogs
 
+## 2026-05-13 — Transmitter OLED/Button/LED Plan Final Audit Corrections
+
+### Summary
+Audited `docs/planned/Transmitter OLED, Button & LED Plan.md` against the live transmitter tree, `docs/walkthrough/ESP_IDF_SDK_REFERENCE.md`, vendored component headers/samples, and Context7-backed ESP-IDF v6 / Espressif Button API docs. Preserved the OLED UI style while correcting factual, logical, and API-integration issues.
+
+### Documentation changes
+- Clarified that `esp_lvgl_port` resolves to 2.7.2 from the lockfile even though the manifest declares `^2.6.0`.
+- Added a Kconfig warning that the existing RF GPIO defaults must be aligned with the checked-in `sdkconfig` before adding LED/button defaults, otherwise fresh configs can collide on GPIO 1 and GPIO 2.
+- Replaced the stale provisioning password example with a configured-password placeholder and documented the current `sdkconfig` value versus the Kconfig default.
+- Tightened LVGL locking guidance around `lvgl_port_lock()` returning `bool`, removed brittle sample line references, and corrected managed-component names for CMake `PRIV_REQUIRES`.
+- Corrected Screen 3 IP caching to use the `ip_event_got_ip_t` payload instead of reaching into `wifi.c` internals.
+- Reworked LED thread-safety wording so shared timer/event-loop state is explicitly protected instead of relying on an over-broad `gpio_set_level()` ISR-safety claim.
+
+### Files updated
+- `docs/planned/Transmitter OLED, Button & LED Plan.md`
+- `docs/CHANGELOGS.md`
+
+## 2026-05-13 — Transmitter OLED/Button Plan Memory Percentage Definition
+
+### Summary
+Resolved the Screen 1 "Memory free" ambiguity in `docs/planned/Transmitter OLED & Button Plan.md` by pinning it to a single ESP-IDF heap-capabilities formula validated against Context7's ESP-IDF v6.0 docs and the local SDK reference walkthrough.
+
+### Documentation changes
+- Replaced the previous "prefer heap percentage, otherwise absolute heap" wording with one definitive implementation: `heap_caps_get_total_size()` as denominator and `heap_caps_get_free_size()` as numerator, both using `MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL`.
+- Clarified that ESP32-C3 has no PSRAM in this design, so the displayed percentage should represent byte-addressable internal heap used by normal allocations.
+- Added verification guidance to keep fragmentation checks (`heap_caps_get_largest_free_block()`) separate from the user-facing percentage display.
+
+### Files updated
+- `docs/planned/Transmitter OLED & Button Plan.md`
+
+## 2026-05-13 — Transmitter OLED/Button Plan Follow-up Clarifications
+
+### Summary
+Performed a follow-up Context7 verification pass for the Screen 3 RSSI API and the SSD1306 contrast-control wording in `docs/planned/Transmitter OLED & Button Plan.md`.
+
+### Documentation changes
+- Restored `esp_wifi_sta_get_rssi(int *rssi)` as a valid ESP-IDF v6.0 option for Screen 3 RSSI polling after Context7 confirmed it is officially documented.
+- Tightened the SSD1306 dimming wording to say the `0x81` contrast write is a manufacturer-specific, datasheet-driven `esp_lcd_panel_io_tx_param()` usage rather than an officially provided SSD1306 sample.
+
+### Files updated
+- `docs/planned/Transmitter OLED & Button Plan.md`
+
+## 2026-05-12 — Transmitter OLED/Button Plan Audit Corrections
+
+### Summary
+Audited `docs/planned/Transmitter OLED & Button Plan.md` against the current transmitter firmware, the checked-in ESP-IDF walkthrough reference, vendored component headers/samples, and Context7-backed ESP-IDF/LVGL docs. Corrected factual mismatches, invalid or unverified API assumptions, and a few internal logic inconsistencies in the implementation plan. OLED screen layout/style guidance was intentionally preserved.
+
+### Documentation changes
+- Corrected transmitter security references from Ed25519 to the actual EC P-256 / ECDSA device identity flow used in `transmitter/main/security/device_identity.*`.
+- Brought the "existing firmware context" section in line with current MQTT behavior by adding the live heartbeat topic and the narrowed bootstrap challenge topic.
+- Reworked the GPIO section to remove the unsupported "three remaining GPIOs" claim and the assumption that internal I2C pull-ups are inherently sufficient for the final board.
+- Replaced the unverified `esp_wifi_sta_get_rssi()` guidance with `esp_wifi_sta_get_ap_info()`-based handling, and clarified that Screen 3 needs `IP_EVENT_STA_GOT_IP` in addition to the proposed custom event base.
+- Fixed the idle/dimming design so it no longer assumes LVGL will automatically track a raw GPIO button as user activity; the plan now uses explicit button-activity bookkeeping.
+- Added the missing provisioning-start event to the proposed boot-flow event model and aligned the splash/provisioning transitions with it.
+- Corrected the button/recovery flow so the two-stage long press uses explicit start/release handling instead of an underspecified callback path.
+- Removed or softened unverified runtime numbers and over-strong claims, including the hardcoded free-heap baseline, the arbitrary post-integration heap threshold, and the incorrect button debounce default.
+- Fixed smaller plan inconsistencies such as direct-call display API comments that conflicted with the document's event-observer architecture, and the overlay timer example that would otherwise allocate a new timer per dispatch event.
+
+### Files updated
+- `docs/planned/Transmitter OLED & Button Plan.md`
+
 ## 2026-05-07 — Known Limitation Amendments (Backend + Frontend)
 
 ### Summary

@@ -57,6 +57,7 @@ yarn format               # biome format --write
 - The frontend should be written in a way that is easy to understand and maintain.
 - The frontend UI should be modern, coherent to current design (refer strictly to `docs/walkthrough/Web Styles.md`), with breathability.
 - Only use the UI components existing in the project. Do not create new UI components. Only crawl new components from shadcn/ui if necessary.
+- Use Mermaid diagrams instead of raw ASCII/text-art in documentation files.
 
 ### Vietnamese copy rules (i18n)
 
@@ -76,7 +77,7 @@ When unsure about Vietnamese phrasing, propose the copy in plain text in chat an
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **notiguide** (15104 symbols, 26731 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **notiguide** (15426 symbols, 29096 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

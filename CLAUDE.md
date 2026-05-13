@@ -113,6 +113,7 @@ Currently scaffolded with default create-next-app structure; implementation plan
 - The frontend UI should be modern, coherent to current design (refer strictly to `docs/walkthrough/Web Styles.md`), with breathability.
 - The physical device domain (`receiver`) has been set up using ESP-IDF v6.0. You can always refer the source code of ESP-IDF v6.0 in '/home/thomas/esp/v6.0/esp-idf'.
 - Only use the UI components existing in the project. Do not create new UI components. Only crawl new components from shadcn/ui if necessary.
+- Use Mermaid diagrams instead of raw ASCII/text-art in documentation files.
 
 ### Vietnamese copy rules (i18n)
 
@@ -132,7 +133,7 @@ When unsure about Vietnamese phrasing, propose the copy in plain text in chat an
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **notiguide** (15104 symbols, 26731 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **notiguide** (15426 symbols, 29096 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

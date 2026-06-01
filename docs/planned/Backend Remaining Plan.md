@@ -6,26 +6,11 @@ Merged implementation backlog from:
 - `docs/planned/Backend Audit.md` ("Open / Deferred Findings")
 - Current backend source TODO scan (`backend/src`)
 
-**Last updated**: 2026-05-11
+**Last updated**: 2026-05-17
 
 ---
 
 ## Priority Backlog
-
-### P2 — Remote Device Diagnostics
-
-**Why now**
-
-- Admin dashboard currently has no visibility into transmitter hub health (memory, signal strength, uptime, dispatch throughput).
-- All the data is already available on the hub's OLED display — this would expose it remotely.
-- Can be built on top of the existing MQTT + device infrastructure with no firmware architecture changes.
-
-**Implementation targets**
-
-- Backend requests a status snapshot from the hub via MQTT request/response (e.g., `cmd/status` → `status/response`), or enrich the existing heartbeat envelope with optional diagnostic fields (heap, RSSI, uptime, dispatch count).
-- Admin dashboard "device health" view consuming these diagnostics.
-
----
 
 ### P2 — Test Coverage
 
@@ -62,6 +47,7 @@ Merged implementation backlog from:
 | Analytics Frontend Dashboard                   | **Done** (2026-03-23) | Store analytics page + super admin overview page. Components: `realtime-stats`, `summary-cards`, `peak-hours-chart`, `throughput-chart`, `store-ranking-table`, `period-selector`. |
 | Jump-Call Feature                              | **Done** (2026-03-25) | `allowJumpCall` store field + `callSpecificTicket` endpoint + Lua script + stacked serving display.                                                                                |
 | Features Implementation Plan                   | **Done** (2026-03-25) | All 7 features fully implemented (see breakdown below). Verified in full-repo audit (2026-03-25).                                                                                  |
+| P2 — Remote Device Diagnostics                 | **Done** (2026-05-17) | Firmware heartbeat enrichment (heap, RSSI, uptime, dispatch counters, IP) + backend `HubDiagnosticsService` (MQTT ingest, USB relay, health summary) + frontend diagnostics panel and hub health card. See companion plans and joined audit in `CHANGELOGS.md`. |
 
 
 ### Features Implementation Plan — Breakdown
@@ -90,7 +76,7 @@ All features from `docs/planned/Features Implementation Plan.md` are now **fully
 | ------------ | ----------------------------------- | -------- | ----------- | ------------------------- |
 | **Admin**    | Admin, AdminSession, LoginHistory   | 5        | 2           | PostgreSQL                |
 | **Analytics**| AnalyticsEvent                      | 2        | 1           | TimescaleDB hypertable    |
-| **Device**   | Device, DeviceRfCode                | 14       | 4           | PostgreSQL + Redis        |
+| **Device**   | Device, DeviceRfCode                | 16       | 4           | PostgreSQL + Redis        |
 | **Queue**    | (Redis-only)                        | 3        | 2           | Redis                     |
 | **Store**    | Store, StoreSettings, ServiceType   | 2        | 2           | PostgreSQL                |
 
@@ -104,7 +90,7 @@ store, admin, device, device_rf_code, analytics_event, login_history, store_sett
 
 ### Firmware (3 codebases)
 
-- `transmitter/` — ESP32, nRF24 driver, MQTT, dispatch (29 files)
+- `transmitter/` — ESP32-C3, nRF24 driver, MQTT, dispatch, diagnostics, OLED, serial (39 files)
 - `receiver-esp32/` — ESP32, nRF24 driver, MQTT, vibrator (23 files)
 - `receiver-esp8266/` — ESP8266, nRF24 driver, MQTT, vibrator, recovery (22 files)
 
@@ -112,5 +98,5 @@ store, admin, device, device_rf_code, analytics_event, login_history, store_sett
 
 ## Suggested Execution Order
 
-1. Add test coverage (P2) around queue, analytics, auth, and device flows.
+1. Add test coverage (P2) around queue, analytics, auth, and device flows (including the new diagnostics service).
 

@@ -114,6 +114,8 @@ Currently scaffolded with default create-next-app structure; implementation plan
 - The physical device domain (`receiver`) has been set up using ESP-IDF v6.0. You can always refer the source code of ESP-IDF v6.0 in '/home/thomas/esp/v6.0/esp-idf'.
 - Only use the UI components existing in the project. Do not create new UI components. Only crawl new components from shadcn/ui if necessary.
 - Use Mermaid diagrams instead of raw ASCII/text-art in documentation files.
+- All warning/status alert boxes must follow the canonical patterns defined in `docs/walkthrough/Web Styles.md` § "Status Alert Boxes". Use `text-warning` (not `text-warning-foreground`) for transparent-background alerts. Always include `dark:` overrides.
+- All hyperlinks must follow the link patterns in `docs/walkthrough/Web Styles.md` § "Hyperlink Patterns". Never use bare `hover:underline` — use persistent subtle underline with hover transition.
 
 ### Vietnamese copy rules (i18n)
 

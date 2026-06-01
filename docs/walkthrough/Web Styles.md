@@ -195,3 +195,56 @@ Material Design uses glass-adjacent concepts through its elevation system:
 | Layering | Avoid glass-on-glass; glass works best over solid or gradient backgrounds |
 | Dark mode | Lower opacity (0.3-0.5), use inset glows, and tint shadows darker |
 
+---
+
+## Status Alert Boxes
+
+Colored alert/warning boxes are used across the app for inline status messages, caution notices, and one-time warnings. They **must** follow a single consistent pattern per severity — never invent a new variant.
+
+### Canonical Patterns
+
+| Severity | Class pattern |
+|----------|---------------|
+| Warning | `rounded-xl border border-warning/40 bg-warning/15 text-warning dark:border-warning/50 dark:bg-warning/20` |
+| Destructive | `rounded-xl border border-destructive/40 bg-destructive/10 text-destructive dark:border-destructive/50 dark:bg-destructive/15` |
+| Success | `rounded-xl border border-success/40 bg-success/10 text-success dark:border-success/50 dark:bg-success/15` |
+
+### Rules
+
+- **Use `text-warning`** (amber/yellow), NOT `text-warning-foreground` (dark brown). The foreground token is for text on solid warning backgrounds (buttons), not for alert boxes with transparent backgrounds.
+- **Always include `dark:` border and background overrides** — light-mode-only boxes look broken in dark theme.
+- **Use `rounded-xl`** for alert boxes, matching the rest of the glass design language.
+- **Icons** inside alert boxes inherit color from the parent `text-{severity}` — do not re-apply `text-warning` on the icon.
+- Padding: `p-3` (compact) or `px-3.5 py-3` (with icon). Use `gap-2.5` between icon and text.
+
+---
+
+## Hyperlink Patterns
+
+All internal links follow a consistent styling scheme to feel modern and cohesive with the glass design.
+
+### Breadcrumb / Navigation Links
+
+Used for parent-page navigation and sub-page tabs:
+
+```
+text-sm font-medium text-primary underline decoration-primary/30 underline-offset-4 transition-colors hover:decoration-primary/70
+```
+
+Breadcrumb separators (`/`, `·`) use `text-muted-foreground/50` for a subtle, non-competing appearance.
+
+### Table / Inline Links
+
+Used for clickable items inside tables or compact UI:
+
+```
+text-primary underline decoration-primary/30 underline-offset-4 transition-colors hover:decoration-primary/70
+```
+
+### Rules
+
+- **Never** use bare `hover:underline` — the underline should always be present with a subtle opacity (`decoration-primary/30`) and become more visible on hover (`decoration-primary/70`).
+- **Always** include `underline-offset-4` for breathing room between text and underline.
+- **Always** include `transition-colors` for smooth hover animation.
+- Breadcrumb and tab links add `font-medium` for scannability.
+

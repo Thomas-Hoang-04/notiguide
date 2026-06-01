@@ -1,5 +1,1062 @@
 # Changelogs
 
+## Device Rename & Queue Dispatch Refresh
+
+### Web Frontend
+- Added inline rename on device detail page — pencil icon next to assigned name, Enter/Escape to save/cancel, PATCH `/api/devices/{id}/name` propagates to transmitter hub via MQTT
+- Added `renameDevice()` API function, `RenameDeviceRequest` type, and `RENAME` route constant
+- Fixed queue page "Send via device" button not updating after serve/cancel — SSE handler for `TICKET_SERVED`, `TICKET_CANCELLED`, `TICKET_SKIPPED`, `TICKET_REQUEUED` now refetches device availability
+- Added manual refresh button (RefreshCcw icon) next to "Dispatch via device" on queue page header
+- Added i18n strings for rename (`devices.rename.*`) and dispatch refresh (`queue.dispatch.refresh`) in both `en.json` and `vi.json`
+
+## Passive Device Channel Inversion Fix
+
+### Backend
+- Swapped PT2272 toggle/detoggle channel defaults: toggle (activate) = channel 1, detoggle (deactivate) = channel 0 — was inverted, causing CALL to deactivate and STOP to activate
+- Changed in both `application.yaml` and `DeviceCommandSigningProperties` defaults
+- Affects both MQTT dispatch (`TransmitterDispatchService.patchRfCode()`) and USB dispatch (`UsbDispatchPayloadService.preparePayload()`)
+
+## Roster Band String Fix
+
+### Transmitter Firmware
+- Fixed `band_label()` in `roster_sync.c` returning `"2.4G"` (dot) instead of `"2_4G"` (underscore) — mismatched the backend's `bandToKind()` parser, causing all 2.4GHz receivers to be skipped during roster sync
+
+## Cluster Roster Sync
+
+**Spec:** `docs/spec/Cluster Roster Sync Spec.md`
+
+### Prerequisites
+- Fixed `roster_set_name()` to bump roster `seq` and set `pending = true` (was missing, label changes never triggered sync)
+- Increased MQTT buffer from 2048 to 8192 bytes and fragment limit from 4096 to 8192 (required for 32-receiver encrypted roster payloads)
+
+### Backend
+- Added `store_id` field to bootstrap activation result envelope (`ResultEnvelope`, `DeviceMqttPublisher.publishResult()`)
+- Added `storeId` parameter to `DeviceActivationService` → `publishResult()` call chain
+- Required `store_id` for transmitter hub activation results and documented the reactivation/backfill rollout for already-activated hubs
+
+### Transmitter Firmware
+- Added `store_id` / `has_store_id` fields to `device_config_t`, persisted in NVS during activation
+- Updated `device_config_commit_activation()` to accept and store `store_id`
+- Updated `handle_bootstrap_result()` in `mqtt.c` to extract `store_id` from activation response
+- Added `CONFIG_TRANSMITTER_CLUSTER_ROSTER_EXPIRY_S` Kconfig entry (default 7 days)
+- Added `mqtt_publish_retained_v5()` function for MQTT v5 property-aware retained publishes
+- Registered `pair/roster_cluster.c` in `transmitter/main/CMakeLists.txt`
+- Created `roster_cluster.c` / `roster_cluster.h` module:
+  - AES-256-GCM encryption with HKDF-SHA256 key derivation from pairing PSK
+  - Encrypted retained MQTT publish to `{prefix}/transmitter/cluster/{storeId}/roster`
+  - Slot-level union merge with seq-based conflict resolution
+  - Strict inbound roster JSON validation before marking parsed entries occupied
+  - Self-publish detection (publisher_id + seq comparison)
+  - Handles concurrent multi-hub pairing without data loss
+- Added cluster topic subscription with `rh=0` (retain handling) in `mqtt_subscribe_current_phase()`
+- Added cluster topic routing in `route_message()` (binary payload, before hub-specific topics)
+- Added `roster_cluster_publish()` calls at all roster mutation sites (pairing, unpair, label, MQTT commands, OLED delete, serial delete, MQTT connect)
+- Guarded connect-time publish with `seq > 0` to prevent fresh hubs from overwriting valid retained messages
+
+### Post-Implementation Audit Fixes
+- Heap-allocated `parsed_cluster_roster_t` in `roster_cluster_handle_message()` to prevent stack overflow on the 6KB MQTT task stack (~4.4KB struct with 32 receivers)
+- Zeroed HKDF intermediate `prk` after key derivation in `derive_aes_key()` (crypto hygiene)
+
+## Transmitter Roster Delete
+
+**Spec:** `docs/spec/Transmitter Roster Delete Spec.md`
+
+### Transmitter Firmware
+- Added `TX_EVENT_ROSTER_CHANGED` event with `roster_change_event_t` payload
+- Added delete-mode overlay (OLED): triple-click on Screen 5 to enter, single-click to navigate, hold 2s to confirm delete, double-click to exit, 30s auto-timeout
+- Used `esp_timer` for post-delete feedback/resume; no blocking calls run from the `iot_button` callback path
+- Added `display_enter_delete_mode()`, `display_delete_mode_next()`, `display_delete_mode_exit()`, `display_delete_mode_confirm()`, `display_delete_mode_is_active()` public APIs
+- Declared delete-mode public helpers unconditionally and added pairing-disabled no-op implementations for OLED-enabled / pairing-disabled builds
+- Added `delete_mode_overlay_t` widget struct and `screens_create_delete_mode_overlay()` builder
+- Wired triple-click (`BUTTON_MULTIPLE_CLICK` clicks=3) and 2s long-press callbacks in `controls.c`
+- Existing single/double/long-press callbacks now check `display_delete_mode_is_active()` and route accordingly
+- Added serial `roster.list` command — returns all occupied slots with name, band, MAC, paired_at_ms
+- Added serial `roster.unpair` command — removes a receiver by slot number, returns removed name
+- Added `event.roster_changed` serial event forwarding for add/remove/rename from any source
+- Posted `TX_EVENT_ROSTER_CHANGED` from OLED delete, serial unpair, MQTT unpair, MQTT label, and new pairing
+- If Cluster Roster Sync is implemented in the same branch, OLED delete and serial unpair also publish the encrypted retained cluster roster after local mutation
+
+### Web Frontend
+- Added `RosterReceiver`, `RosterListResult`, `RosterUnpairPayload`, `RosterUnpairResult` types to serial types
+- Added `roster.list` and `roster.unpair` to `SerialCommandMap`
+- Added `event.roster_changed` to serial event listeners in `use-serial.ts` and `usb-control-panel.tsx`
+- Created `hub-roster-panel.tsx` — displays paired receivers in USB control panel with delete buttons and confirmation dialog
+- Added `devices.usb.roster.*` i18n keys (English + Vietnamese)
+
+### Backend
+- No changes required — existing `RosterSyncListener.deleteUnpairedReceivers()` handles DB cleanup via MQTT roster sync
+
+---
+
+## 2026-06-01 — Planned Roster Sync/Delete Plan Amendments
+
+### Rationale
+
+The two roster plan documents were amended after audit to close implementation blockers before code work starts: ESP-MQTT naming/API accuracy, transmitter `store_id` lifecycle, cluster source registration, cluster merge correctness, strict inbound roster validation, non-blocking OLED delete feedback, complete roster-change event coverage, pairing-disabled build compatibility, and cluster publish consistency for local delete paths.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/Cluster Roster Sync Plan.md` | MODIFIED | Added existing-hub rollout/backfill requirement, corrected ESP-MQTT terminology, hardened `store_id` persistence/reset flow, registered `roster_cluster.c` in CMake, fixed merge comparisons to use the pre-merge local seq, validated incoming RF hex before occupancy, reconciled label publish success-block ordering, documented HKDF implementation alignment, and added OLED/serial delete cluster publish integration |
+| `docs/planned/Transmitter Roster Delete Plan.md` | MODIFIED | Replaced blocking delete feedback delay with `esp_timer`, made delete helpers and `SCREEN_RECEIVERS` references safe for pairing-disabled OLED builds, required roster-change events from pairing/MQTT/delete mutation sources, kept cluster calls out of delete-only snippets, displayed paired timestamp in the roster panel, and documented cluster publish integration for OLED and serial unpair |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the documentation amendment scope and skipped build/test steps |
+
+### Skipped
+| Task | Reason |
+|---|---|
+| Build, lint, and test commands | Not run per repository instruction: "Do not attempt to build anything after implementation"; changes are documentation-only |
+
+---
+
+## 2026-06-01 — Hub-Paired Receiver Lifecycle Fix
+
+### Rationale
+
+Hub-paired receivers have `hub_slot` but no direct receiver `public_id`. Decommissioning one through `POST /api/devices/{id}/lifecycle` incorrectly entered the direct-device lifecycle branch and threw `device_not_active` before publishing the existing transmitter `cmd/unpair` command.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../service/DeviceLifecycleService.kt` | MODIFIED | Treat hub-paired receivers as locally managed lifecycle targets; decommission now saves local status and publishes transmitter unpair by slot instead of requiring receiver `public_id` |
+| `backend/.../service/DeviceLifecycleServiceTest.kt` | CREATED | Added regression coverage for decommissioning a hub-paired receiver with `public_id = null`, verifying `cmd/unpair` is published to the active hub |
+| `backend/.gitignore` | MODIFIED | Unignored the backend Kotlin test package path so new tests under `com/thomas/notiguide` are trackable while preserving the existing root `notiguide/` ignore rule |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the lifecycle fix and focused test coverage |
+
+### Skipped
+| Task | Reason |
+|---|---|
+| Full backend build | Not run per repository instruction: "Do not attempt to build anything after implementation" |
+
+---
+
+## 2026-06-01 — Remove `hardware_model` from Device Domain
+
+Spec: `docs/spec/Remove Device Hardware Model Spec.md`
+Plan: `docs/planned/Remove Device Hardware Model Plan.md`
+
+### Rationale
+
+The `hardware_model` column was a denormalized derivative of `kind`. After local pairing, `RosterSyncListener` filled it with incorrect values (mapping `433M` → `PT2272` when hub-paired receivers are ESP8266/ESP32-C3). The column was `NOT NULL`, forcing every insert path to supply a value even when the correct value is unknown.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../db/migration/V2__add_hub_slot.sql` | MODIFIED | Appended `ALTER TABLE device DROP COLUMN IF EXISTS hardware_model` and `DROP TYPE IF EXISTS device_hardware_model` |
+| `backend/.../db/schema.sql` | MODIFIED | Removed `device_hardware_model` enum type and `hardware_model` column from `device` table |
+| `backend/.../types/DeviceHardwareModel.kt` | DELETED | Enum class (`ESP_01`, `ESP32_C3`, `PT2272`) removed entirely |
+| `backend/.../entity/Device.kt` | MODIFIED | Removed `hardwareModel` field, `equals()`, `hashCode()` entries |
+| `backend/.../dto/DeviceDto.kt` | MODIFIED | Removed `hardwareModel` field |
+| `backend/.../dto/DeviceDetailDto.kt` | MODIFIED | Removed `hardwareModel` field |
+| `backend/.../core/database/R2DBCConfig.kt` | MODIFIED | Removed `DeviceHardwareModelWriteConverter`, enum codec registration |
+| `backend/.../service/DeviceQueryService.kt` | MODIFIED | Removed `d.hardware_model` from SQL SELECTs, `mapRow()`, `toDetail()` |
+| `backend/.../listener/RosterSyncListener.kt` | MODIFIED | Removed `bandToHardwareModel()`, simplified `upsertRosterReceiver()` — removed `hardware_model` from INSERT/UPDATE SQL |
+| `backend/.../service/DeviceRegistrationService.kt` | MODIFIED | Removed `isLegalHardwarePair()`, `hardwareModel` from `ParsedRegistration`, simplified receiver/transmitter registration parsing. Kept `hardware_model` in MQTT wire-format classes (hub firmware still sends it) |
+| `backend/.../service/PassiveDeviceRegistrationService.kt` | MODIFIED | Simplified validation to kind-only check, removed `hardwareModel` from `Device()` constructor |
+| `backend/.../request/PassiveDeviceRegistrationRequest.kt` | MODIFIED | Removed `hardwareModel` field |
+| `web/src/types/device.ts` | MODIFIED | Removed `DeviceHardwareModel` type, `hardwareModel` from `DeviceDto` and `PassiveDeviceRegistrationRequest` |
+| `web/src/features/device/device-filter-bar.tsx` | MODIFIED | Removed hardware filter props, `HARDWARE_OPTIONS`, `getHardwareLabel`, hardware `<Select>` dropdown |
+| `web/src/app/[locale]/dashboard/devices/page.tsx` | MODIFIED | Removed `hardwareFilter` state, hardware filter logic, filter bar props |
+| `web/src/features/device/device-list-table.tsx` | MODIFIED | Removed hardware column header, skeleton cell, data cell; updated `colSpan` 6→5 |
+| `web/src/app/[locale]/dashboard/devices/[id]/page.tsx` | MODIFIED | Removed hardware model display block |
+| `web/src/features/device/passive-device-form-dialog.tsx` | MODIFIED | Removed `hardwareModel: "PT2272"` from form submission |
+| `web/src/messages/en.json` | MODIFIED | Removed `columnHardware`, `filterHardware`, `detail.hardware` keys |
+| `web/src/messages/vi.json` | MODIFIED | Removed matching Vietnamese keys |
+
+---
+
+## 2026-06-01 — Backend & Frontend Local Pairing Integration
+
+Plan: `docs/planned/Backend & Frontend Local Pairing Plan.md`
+
+### Post-Implementation Audit Fixes
+| Issue | Severity | Fix |
+|---|---|---|
+| Hub-paired dispatch unreachable — `receiver.publicId == null` guard blocked slot branch | CRITICAL | Split null guard: check receiver/hub first, hubSlot branch, then publicId check for full-payload path |
+| `RosterSyncListener.lookupHub()` missing status filter | IMPORTANT | Added `AND status = 'ACTIVE'` to hub lookup query |
+| Frontend `showReprovision` allowed for hub-paired devices | IMPORTANT | Added `device.hubSlot == null` condition |
+| `handleTransmitRejection` used hardcoded event type string | IMPORTANT | Changed to `QueueEventType.DEVICE_DISPATCH_FAILED.name` |
+| `PassiveDeviceRegistrationService` used old exact-match collision | IMPORTANT | Changed to `findMaskedCollision` for proper bit-overlap comparison |
+| `findCollision` 433M branch became dead code | CLEANUP | Renamed to `findExact24GCollision`, removed unused 433M branch and `DeviceKind` import; moved `findMaskedCollision` + `toBigEndianInt` from `RfCodeService` to `DeviceRfCodeRepository` for shared access |
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/resources/db/migration/V2__add_hub_slot.sql` | CREATED | Migration adding `hub_slot SMALLINT` and `last_roster_seq INT` columns to `device` table |
+| `backend/src/main/resources/db/schema.sql` | MODIFIED | Added `hub_slot` and `last_roster_seq` columns to `CREATE TABLE device` for fresh installs |
+| `backend/.../entity/Device.kt` | MODIFIED | Added `hubSlot: Short?` and `lastRosterSeq: Int?` fields with `equals`/`hashCode` |
+| `backend/.../repository/DeviceRepository.kt` | MODIFIED | Added `findActiveHubByStore(storeId): Device?` suspend query method |
+| `backend/.../core/device/DeviceCanonical.kt` | MODIFIED | Added `rosterAck()` and `slotDispatch()` canonical builders |
+| `backend/.../core/device/DeviceMqttPublisher.kt` | MODIFIED | Added `publishRosterAck`, `publishLabel`, `publishUnpair` methods |
+| `backend/.../dto/DeviceDto.kt` | MODIFIED | Added `hubSlot: Short?` field |
+| `backend/.../dto/DeviceDetailDto.kt` | MODIFIED | Added `hubSlot: Short?` field |
+| `backend/.../dto/DispatchTrackingRecord.kt` | CREATED | Shared data class for dispatch tracking Redis key serialization |
+| `backend/.../service/DeviceQueryService.kt` | MODIFIED | Added `d.hub_slot` to SQL SELECT clauses, mapper, `toDetail`; added `renameDevice()` with hub label push; added `DeviceRepository` and `DeviceMqttPublisher` dependencies |
+| `backend/.../listener/RosterSyncListener.kt` | CREATED | MQTT listener for `roster/update` — upserts hub-paired devices, deletes unmatched slots, publishes signed ACK |
+| `backend/.../service/TransmitterDispatchService.kt` | MODIFIED | Added hub-slot branch before RF code lookup; added `handleSlotDispatch()` with `SlotDispatchEnvelope`; added dispatch tracking Redis key write; added `ObjectMapper` dependency |
+| `backend/.../service/DeviceDispatchService.kt` | MODIFIED | `isDispatchableDevice` now accepts `hubSlot != null` (hub-paired devices without RF codes) |
+| `backend/.../core/redis/RedisKeyManager.kt` | MODIFIED | Added `dispatchTracking(dispatchId)` key builder |
+| `backend/.../listener/TransmitterOperationalListener.kt` | MODIFIED | Added `QueueEventBroadcaster` dependency; added `handleTransmitRejection()` for hub rejection ACKs — releases busy key, emits `DEVICE_DISPATCH_FAILED` |
+| `backend/.../service/DeviceLifecycleService.kt` | MODIFIED | Added `publishUnpairIfHubPaired()` — sends unpair MQTT command when hub-paired device is decommissioned |
+| `backend/.../controller/DeviceAdminController.kt` | MODIFIED | Added `PATCH /{id}/name` rename endpoint |
+| `backend/.../request/RenameDeviceRequest.kt` | CREATED | Validated request DTO for device rename |
+| `backend/.../repository/DeviceRfCodeRepository.kt` | MODIFIED | Added `findAll433MDecryptedInStore()` and `Decrypted433MRecord` for masked collision check |
+| `backend/.../service/RfCodeService.kt` | MODIFIED | Added `findMaskedCollision()` with bit-overlap comparison; replaced 433M collision call site to use masked check |
+| `web/src/types/device.ts` | MODIFIED | Added `hubSlot: number \| null` to `DeviceDto` |
+| `web/src/features/device/device-list-table.tsx` | MODIFIED | Added hub-paired indicator ("Hub-paired · Slot N") after device name |
+| `web/src/app/[locale]/dashboard/devices/[id]/page.tsx` | MODIFIED | Added pairing mode badge; disabled RF code editor for hub-paired devices |
+| `web/src/messages/en.json` | MODIFIED | Added `hubPaired`, `detail.pairingMode` keys |
+| `web/src/messages/vi.json` | MODIFIED | Added `hubPaired`, `detail.pairingMode` keys (Vietnamese) |
+
+### Skipped
+| Task | Reason |
+|---|---|
+| Task 17 (Frontend label push on rename) | No frontend changes needed — backend handles MQTT label push after DB update |
+| Task 18 (Subscribe hub to roster/update) | Covered by `RosterSyncListener` which registers its own MQTT subscription |
+| Task 19 (Build & lint verification) | Per CLAUDE.md: "Do not attempt to build anything after implementation" |
+
+## 2026-06-01 — Dispatch & Pairing Protocol Robustness
+
+Spec: `docs/spec/Dispatch & Pairing Protocol Robustness Spec.md`
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `transmitter/main/dispatch/radio_supervisor.h` / `.c` | MODIFIED | `radio_tx_send()` now accepts `RADIO_ACTION_START` / `RADIO_ACTION_STOP`; 433 MHz action is encoded by callers in payload bits, while 2.4 GHz action is passed through to nRF24 |
+| `transmitter/main/nrf24/nrf24_transmitter.h` / `.c` | MODIFIED | `nrf24_tx_send()` now builds a dynamic `{magic_hi, magic_lo, action}` payload instead of a fixed toggle payload |
+| `transmitter/main/dispatch/dispatch.c` | MODIFIED | Slot dispatch validates `call` / `stop`, normalizes the 433 MHz action bit, maps actions to `RADIO_ACTION_*`, and passes explicit start for full-payload dispatch |
+| `transmitter/main/serial/serial_protocol.c` | MODIFIED | Serial transmit dispatch passes `RADIO_ACTION_START` to the updated radio API |
+| `transmitter/main/pair/espnow_pair_host.c` | MODIFIED | `generate_rf_code()` clears the 433 MHz MSB inside the generation loop; `pair_ack_t` carries `nonce_tag[4]`; new `pair_saved_t` / `PAIR_MSG_SAVED`; roster commit is gated on PAIR_SAVED slot + nonce validation and stale ACK/SAVED event bits are cleared before each wait window |
+| `receiver-esp32/main/trigger/rf_trigger.c` | MODIFIED | 433 MHz frames use a 31+1 code/action scheme with `vibrator_set_pulsing`; nRF24 packets now read the third byte as explicit action |
+| `receiver-esp32/main/pair/espnow_pair.c` | MODIFIED | PAIR_ACK includes a nonce tag and PAIR_SAVED is sent best-effort after successful NVS save, with teardown delayed until the ESP-NOW send callback returns or times out |
+| `receiver-esp8266/main/trigger/rf_trigger.c` | MODIFIED | 433 MHz trigger handling uses the same 31+1 code/action scheme, rejects frames shorter than the stored code width, and uses explicit `vibrator_set_pulsing` |
+| `receiver-esp8266/main/pair/espnow_pair.c` | MODIFIED | PAIR_ACK includes a nonce tag and PAIR_SAVED is sent best-effort after successful NVS save, with teardown delayed until the ESP-NOW send callback returns or times out |
+| `receiver-esp32/main/trigger/rf_trigger.h` | MODIFIED | Renamed `RF_TRIGGER_TOGGLE_MAGIC_HI/LO` → `RF_TRIGGER_DISPATCH_MAGIC_HI/LO` to match transmitter naming |
+| `receiver-esp32/main/vibrator/vibrator.h` / `.c` | MODIFIED | Removed dead `vibrator_toggle_pulsing` (all callers now use `vibrator_set_pulsing`) |
+| `receiver-esp8266/main/vibrator/vibrator.h` / `.c` | MODIFIED | Removed dead `vibrator_toggle_pulsing` (same as ESP32) |
+| `receiver-esp32/main/trigger/rf_trigger.c` | MODIFIED | Renamed `s_last_toggle_us` → `s_last_trigger_us` and `RF_TRIGGER_TOGGLE_DEBOUNCE_US` → `RF_TRIGGER_DEBOUNCE_US` |
+| `receiver-esp8266/main/trigger/rf_trigger.c` | MODIFIED | Same debounce variable/define rename as ESP32 |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the dispatch and pairing protocol robustness implementation |
+
+### Verification
+- API syntax verified with Context7 and official Espressif docs for ESP-IDF v6.0 ESP-NOW, ESP8266 RTOS SDK ESP-NOW callback shape, and FreeRTOS event groups.
+- Post-implementation review: no critical bugs. Two important cleanup items (magic constant naming inconsistency, dead vibrator toggle code) and one minor naming issue (debounce variable) fixed in review pass.
+- Not run: build/lint/test commands intentionally skipped per repository instruction not to attempt post-implementation builds in this flow.
+
+## 2026-06-01 — Pairing & Dispatch Firmware Robustness Fixes
+
+Spec: `docs/spec/Pairing & Dispatch Robustness Fixes Spec.md`
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `transmitter/main/pair/espnow_pair_host.c` | MODIFIED | PAIR_ACK handler now validates slot field matches offered slot, rejects stale/mismatched ACKs; roster commit moved from after PAIR_ACK to after PAIR_CONFIRM send success, prevents ghost NVS entries on CONFIRM failure |
+| `receiver-esp32/main/pair/espnow_pair.c` | MODIFIED | Encrypted hub ESP-NOW peer deleted before retry `continue` on all 6 failure paths after `add_hub_peer`, prevents plaintext challenge rejection on pairing retry |
+| `receiver-esp8266/main/pair/espnow_pair.c` | MODIFIED | Same encrypted peer cleanup as ESP32 receiver on all 7 failure paths (including NVS save failure, found in post-implementation audit); `validate_offer()` rejects offers with `rf_band != 0` (ESP8266 is 433 MHz only, returns `ESP_ERR_NOT_SUPPORTED`) |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the pairing robustness fix set |
+
+### Verification
+- Not run: build/lint/test commands intentionally skipped per repository instruction not to attempt post-implementation builds in this flow.
+
+## 2026-05-31 — ESP-NOW Pairing Schema Fixes
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `transmitter/main/pair/espnow_pair_host.c` | MODIFIED | Changed pairing bootstrap to send `PAIR_CHALLENGE` over an unencrypted peer before upgrading to encrypted unicast; reuses an existing roster entry for the same receiver MAC/band when retrying after lost confirm; persists hub roster before sending `PAIR_CONFIRM` |
+| `receiver-esp32/main/pair/espnow_pair.c` | MODIFIED | Made channel-set failures non-fatal during scan and stopped saving pairing state unless `PAIR_CONFIRM` is received |
+| `receiver-esp32/main/trigger/rf_trigger.c` | MODIFIED | Interprets 433 MHz RF code bytes as big-endian to match the transmitter wire format |
+| `receiver-esp8266/main/pair/espnow_pair.c` | VERIFIED / NO DIFF | Current file already stores paired 433 MHz RF codes as big-endian integers and skips saving pairing state unless `PAIR_CONFIRM` is received |
+| `docs/spec/Local Pairing & Hub-Managed Dispatch Spec.md` | MODIFIED | Documented plaintext request/challenge bootstrap, encrypted post-challenge pairing messages, confirm-gated receiver persistence, and `schema_version` in roster ACK payloads |
+| `docs/planned/Backend & Frontend Local Pairing Plan.md` | MODIFIED | Added an explicit `RosterAckEnvelope` shape requiring `schema_version = 1` |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the ESP-NOW pairing/schema fix set |
+
+### Verification
+- Not run: build/lint/test commands intentionally skipped per repository instruction not to attempt post-implementation builds in this flow.
+
+## 2026-05-31 — Local Pairing Plan Ordering Note
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/Backend & Frontend Local Pairing Plan.md` | MODIFIED | Added explicit ordering-preservation requirements for the `hubSlot` dispatch branch so hub-paired receivers bypass RF-code lookup and the existing full-payload path remains reserved for passive/server-managed receivers |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the plan-documentation update |
+
+### Verification
+- Not run: documentation-only change; build/lint/test commands intentionally skipped per repository instruction.
+
+## 2026-05-26 — Critical Bug Fixes
+
+Three critical fixes across backend and receiver firmware. Spec: `docs/spec/Critical Bug Fixes Spec.md`.
+
+### Backend (`backend/`)
+- **`StoreService.kt`**: Fixed NPE on store creation — `save()` returns the `@Id` column but not the DB-generated `publicId`. Added re-fetch via `findById()` after save within the same `@Transactional` to get the full row before calling `toDto()`.
+
+### Receiver-ESP32 (`receiver-esp32/`)
+- **`sdkconfig`**: Fixed nRF24 GPIO pin collision — `CONFIG_RECEIVER_NRF24_IRQ` and `CONFIG_RECEIVER_VIBRATOR_GPIO` were both GPIO 1 (typo). Changed IRQ to GPIO 10. This caused `invalid SETUP_AW: 0xff` after provisioning.
+- **`main.c`**: Added defensive `rf_trigger_stop_output()` call after `rf_trigger_init()` to guarantee vibrator starts in known-off state.
+- **`sdkconfig`**: Increased `CONFIG_ESP_MAIN_TASK_STACK_SIZE` from 6144 to 8192 (matching transmitter). The smaller stack caused panic reboots during provisioning on ESP32-C3.
+
+### Out of Scope (deferred)
+- Transmitter LED pattern during pending activation — needs separate investigation
+
+## 2026-05-22 — WiFi Test for Receivers
+
+Implements the `provision.test_wifi` serial command on both receiver platforms. Spec: `docs/spec/WiFi Test for Receivers Spec.md`.
+
+### Receiver-ESP32 (`receiver-esp32/`)
+- **`network/wifi.h` + `wifi.c`**: Added `wifi_start_sta_test(ssid, pwd, timeout)` — one-shot STA test reusing existing WiFi infrastructure with caller-specified timeout (mirrors `wifi_start_sta` but takes raw strings, no power-save)
+- **`serial/serial_protocol.c`**: Replaced `handle_test_wifi` stub with full implementation — `already_connected` guard, `esp_wifi_sta_get_rssi()` for RSSI, `esp_netif_get_ip_info()` for IP, `wifi_stop()` cleanup
+
+### Receiver-ESP8266 (`receiver-esp8266/`)
+- **`network/wifi.h` + `wifi.c`**: Added `wifi_start_sta_test(ssid, pwd, timeout)` — same pattern adapted for ESP8266 RTOS SDK (uses `timeout` instead of `portMAX_DELAY`, NULL password support for open networks)
+- **`serial/serial_protocol.c`**: Replaced `handle_test_wifi` stub with full implementation — `esp_wifi_sta_get_ap_info()` for RSSI, `tcpip_adapter_get_ip_info()` for IP, updated dispatch to pass payload parameter
+
+## 2026-05-21 — USB Provisioning Receiver Extension
+
+Extends USB serial provisioning to support both ESP32-C3 and ESP8266 receiver modules alongside the existing ESP32-C3 transmitter. Spec: `docs/planned/USB Provisioning Receiver Extension Spec.md`.
+
+### Frontend (`web/`)
+- **`types.ts`**: Added `FTDI_USB_FILTER` (0x0403:0x6001), `ALL_DEVICE_FILTERS` array, `device_kind` field to `IdentifyPayload`, `isReceiverKind()` helper, `retry` command to `SerialCommandMap`. Imports `DeviceKind` from `@/types/device` (no re-declaration).
+- **`use-serial.ts`**: `openPort()` now sends `identify` first (not `status`) to detect device kind. Exposes `identifyPayload`, `deviceKind` (derived), `isNativeUsbPort`. Status polling only starts for transmitters. All filters expanded to `ALL_DEVICE_FILTERS`. State cleared on all disconnect paths.
+- **`usb-provision-dialog.tsx`**: Removed own `identify` call — reads `identifyPayload` from hook. Device type row added to info card. Hub name field hidden for receivers. Validation skips `assignedName` for receivers. Restart detection branches by `isNativeUsbPort` (native USB re-enumerates, FTDI stays open). Pending device polling and approval use correct device kind. Receivers auto-named from MAC.
+- **i18n**: Added `detecting`, `device_type`, `type_transmitter_hub`, `type_receiver_433m`, `type_receiver_2_4g` keys. Updated `provision_desc` to be device-generic.
+
+### Transmitter (`transmitter/`)
+- **`serial_protocol.c`**: Added `device_kind: "TRANSMITTER_HUB"` to `handle_identify` response.
+
+### Receiver-ESP32 (`receiver-esp32/`)
+- **New `serial/serial_protocol.h` + `.c`**: Async background FreeRTOS task (same pattern as transmitter). Commands: `ping`, `identify`, `provision`, `provision.test_wifi` (deferred — returns `not_supported`), `factory_reset`, `retry`. Uses `usb_serial_jtag_driver_install()` + `usb_serial_jtag_vfs_use_driver()` (ESP-IDF v6.0). Handlers return bool; device only restarts on success. Torn down via `serial_protocol_stop()`.
+- **`main.c`**: Added `serial_protocol_init()` before boot-state switch, `serial_protocol_stop()` before idle loop. SoftAP + HTTP provisioning kept as backup (no deletions).
+- **`Kconfig.projbuild`**: Added `CONFIG_RECEIVER_FIRMWARE_VERSION`.
+- **`CMakeLists.txt`**: Added `serial/serial_protocol.c` and `esp_driver_usb_serial_jtag`.
+
+### Receiver-ESP8266 (`receiver-esp8266/`)
+- **New `serial/serial_protocol.h` + `.c`**: Synchronous blocking (saves ~4KB RAM). UART0 at 115200 8N1 via `uart_driver_install`. Commands: same as ESP32 receiver. Uses `device_config_store_provisioning(&prov)` with pointer assignment (not strncpy). Factory reset uses `device_config_erase_runtime()`. Hardcodes `device_kind: "RECEIVER_433M"` (ESP-01 hardware constraint).
+- **`main.c`**: Replaced all `provision_run_recovery_mode()` calls with `run_serial_provisioning()`. Removed `handle_recovery_result()`.
+- **Deleted**: `provision/http_server.c`, `http_server.h`, `recovery.c`, `recovery.h`, `index.html`, `index.html.gz`.
+- **`wifi.c` + `wifi.h`**: Removed `wifi_start_softap()` and SoftAP event handler.
+- **`CMakeLists.txt`**: Removed provisioning sources, added serial source.
+- **`component.mk`**: Updated src/include dirs from `provision` to `serial`.
+
+### Audit fixes
+- ESP32 receiver: `handle_provision`, `handle_factory_reset`, `handle_retry` now return `bool`; device only restarts on success (was unconditional).
+- ESP8266 receiver: `wifi_pwd` defaults to empty string if NULL (was passing NULL to `device_config_store_provisioning`, which rejects it).
+
+## 2026-05-21 — Device UX & RF Code Fix
+
+### Backend
+- Fixed `RfCodeService.resolveRequestedBits` throwing `width_out_of_range` for 433MHz receivers when `rfCodeBits` is null — now falls back to `defaultBits433m` (matching `autoIssue` behavior)
+
+### Frontend
+- Added reload button (RefreshCcw, outline variant) next to device list page title
+- Added 15-second auto-polling when `PENDING_RF_CODE` devices are present in the list
+- Added static "Waiting for device..." label for `PENDING_RF_CODE` rows in pending review card
+- Bumped approve/reject buttons from `icon-sm` to `icon-lg` in pending review card
+- Bumped back arrow from `size-4`/`size-8` to `size-5`/`size-9` consistently across all pages (device detail, pending review, enrollment tokens, store analytics)
+
+## 2026-05-20 — USB Provisioning First-Pair Fix
+
+### Summary
+Fixed a bug where first-time USB pairing in the provisioning dialog required two connect attempts. The ESP32-C3's CDC-ACM enumeration reset caused `port.open()` to fail on the first try, and the dialog's step machine reset to the "Connect USB" prompt.
+
+### Changes Applied
+
+#### Fresh-port fallback in `useSerial().connect()` (`use-serial.ts`)
+- After `requestPort()` succeeds, `openPort()` is attempted on the returned port
+- If the first attempt fails (common on first-time pairing due to CDC-ACM USB enumeration reset), the original port object is stale — retrying it does not help
+- Instead, waits 2 seconds for USB re-enumeration, then calls `navigator.serial.getPorts()` to obtain a fresh port reference by matching VID/PID
+- If a fresh port is found, `openPort()` is attempted on it
+- `manualConnectRef` stays true throughout the entire flow, preventing interference from `navigator.serial` connect events
+- `portState` is set to `"opening"` during the 2-second wait to keep the connect button disabled
+
+#### Reactive connect step in provisioning dialog (`usb-provision-dialog.tsx`)
+- Removed the `"identify"` provision step and its dedicated spinner rendering
+- Replaced `handleConnect()` try/catch step machine with a reactive `useEffect` that watches `portState`
+- When `portState` becomes `"open"` during the connect step, the effect sends the `identify` command and transitions to the form only on success
+- Connect button is fire-and-forget (`void connect().catch(() => {})`), disabled with spinner while `portState !== "closed"`
+- Follows the same reactive pattern used by the device detail page
+
+### Files updated
+- `web/src/lib/serial/use-serial.ts` — retry loop in `connect()`
+- `web/src/features/device/usb-provision-dialog.tsx` — reactive connect step
+- `docs/CHANGELOGS.md`
+
+---
+
+## 2026-05-19 — Fix MQTT Topic Prefix (All Firmware)
+
+### Problem
+All three firmware projects (transmitter, receiver-esp32, receiver-esp8266) published and subscribed to bare MQTT topics (e.g., `transmitter/bootstrap/register`). The backend prepends a configurable prefix (`notiguide/` by default via `MqttProperties.topicPrefix`). Firmware and backend could not communicate over MQTT at all — bootstrap messages, heartbeats, acks, and commands were all silently lost.
+
+### Fix
+Added `CONFIG_*_MQTT_TOPIC_PREFIX` Kconfig string option (default `"notiguide"`) to each firmware project. Defined a compile-time concatenation macro `TOPIC_PREFIX` that prepends the configured value to every topic string.
+
+### Files changed
+
+**transmitter:**
+- `main/Kconfig.projbuild` — added `TRANSMITTER_MQTT_TOPIC_PREFIX` config entry
+- `main/network/mqtt.c` — added `TOPIC_PREFIX` macro, updated 12 topic strings + strncmp
+- `main/network/heartbeat.c` — added `TOPIC_PREFIX` macro, updated 1 topic string
+- `main/dispatch/dispatch.c` — added `TOPIC_PREFIX` macro, updated 2 topic strings
+
+**receiver-esp32:**
+- `main/Kconfig.projbuild` — added `RECEIVER_MQTT_TOPIC_PREFIX` config entry
+- `main/network/mqtt.c` — added `TOPIC_PREFIX` macro, updated 10 topic strings
+
+**receiver-esp8266:**
+- `main/Kconfig.projbuild` — added `RECEIVER_MQTT_TOPIC_PREFIX` config entry
+- `main/network/mqtt.c` — added `TOPIC_PREFIX` macro, updated 11 topic strings + strncmp
+
+### Backend: Fix `listDevices` NPE on null RF code columns
+- `DeviceQueryService.mapRow` used `Int::class.java` (primitive `int`) and `Long::class.java` (primitive `long`) for nullable R2DBC columns `rf_version` and `registered_count`
+- R2DBC cannot return null for Java primitive types — throws `NullPointerException` when LEFT JOIN yields NULL (transmitter hubs have no RF code row)
+- Fixed: `Int::class.javaObjectType` (boxed `Integer`) and `Long::class.javaObjectType` (boxed `Long`) allow null values
+- This was blocking the USB provisioning flow: `pollForPendingDevice` calls `listDevices` which crashed before finding the new PENDING device
+
+### Audit
+- Zero bare topic strings remain across all firmware projects
+- All firmware topic patterns verified against backend listener/publisher topics
+- Buffer sizes confirmed safe (longest prefixed topic ~52 chars, all buffers 128+ bytes)
+- `strncmp` magic numbers replaced with compile-time `sizeof(...) - 1`
+
+## 2026-05-19 — Analytics Back Button & Skeleton Loading
+
+**Back button (SUPER_ADMIN only)**
+- Added `showBackButton` prop to `StoreAnalytics` component
+- `[storeId]/page.tsx` passes `showBackButton` for SUPER_ADMIN drill-down
+- Uses same ArrowLeft icon-link pattern as devices page
+- Links back to `/dashboard/analytics` (the overview)
+- Regular admins viewing their own store analytics do not see the button
+
+**Skeleton loading**
+- Replaced all "Loading" text / `null` / "No Data" loading fallbacks with section-shaped skeletons
+- `StorePeriodStats`: 4 glass-card skeletons with value+label pulse lines
+- `SummaryCards`: glass-card with title skeleton + 2×4 grid of skeleton pairs
+- `OutcomeChart`, `WaitDistributionChart`, `PeakHoursChart`, `ThroughputChart`: glass-card with full-height skeleton block
+- `HourlyHeatmap`: glass-card with wide skeleton block
+- All use existing shadcn `Skeleton` component (`animate-pulse bg-muted`)
+- Loading and no-data states are now separate (skeleton vs "No Data" text)
+- `OverviewThroughputChart`, `StoreComparisonChart`, `StoreWaitChart`: glass-card with full-height skeleton block
+- `StoreRankingTable`: glass-card with title/dropdown skeleton header + 3 row-sized skeleton lines
+
+**i18n**
+- Added `analytics.backToOverview`: EN "Back to overview" / VI "Quay lại tổng quan"
+
+## 2026-05-19 — Device Tab Nav Component, Back Arrow & Active State
+
+### Summary
+Extracted device subtab pill bar into a shared `DeviceTabNav` component used across all three device pages (all, pending, tokens) with teal-filled active state matching the analytics period selector. Replaced breadcrumb text links on sub-pages with a back arrow button. Added "All" tab with i18n keys.
+
+### Changes
+- **`device-tab-nav.tsx`** — New shared component: `glass-panel` pill bar with 3 tabs (All, Pending, Tokens). Active tab uses `variant="default"` (teal fill), inactive uses `variant="ghost"`.
+- **`devices/page.tsx`** — Replaced inline pill bar with `<DeviceTabNav active="all" />`. Removed unused `Link`, `cn`, `buttonVariants` imports.
+- **`devices/pending/page.tsx`** — Replaced breadcrumb with back arrow + heading + `<DeviceTabNav active="pending" />`.
+- **`devices/tokens/page.tsx`** — Same: back arrow + heading + `<DeviceTabNav active="tokens" />`.
+- **`devices/[id]/page.tsx`** — Replaced breadcrumb with back arrow + heading (both detail and not-found views).
+- **`en.json`** / **`vi.json`** — Added `devices.allTab`: "All" / "Tất cả".
+
+### Files changed
+- `web/src/features/device/device-tab-nav.tsx` (new)
+- `web/src/app/[locale]/dashboard/devices/page.tsx`
+- `web/src/app/[locale]/dashboard/devices/pending/page.tsx`
+- `web/src/app/[locale]/dashboard/devices/tokens/page.tsx`
+- `web/src/app/[locale]/dashboard/devices/[id]/page.tsx`
+- `web/src/messages/en.json`
+- `web/src/messages/vi.json`
+- `docs/CHANGELOGS.md`
+
+## 2026-05-19 — Device Subtabs Pill Bar & Breadcrumb Rebalance
+
+### Summary
+Replaced device page subtab links ("Chờ duyệt" · "Mã đăng ký") with a `glass-panel` pill bar matching the analytics period selector pattern. Rebalanced breadcrumb proportions on all device sub-pages — link bumped to `text-lg`, heading reduced to `text-xl`, aligned on baseline.
+
+### Changes
+- **`devices/page.tsx`** — Subtab links replaced with `glass-panel` pill bar using `buttonVariants({ variant: "ghost", size: "sm" })` + `Link`. Added `cn` and `buttonVariants` imports.
+- **`devices/[id]/page.tsx`** — Breadcrumb link `text-sm` → `text-lg font-semibold`, heading `text-2xl` → `text-xl`, container `items-center` → `items-baseline`, gap tightened. Applied to both detail and not-found views.
+- **`devices/pending/page.tsx`** — Same breadcrumb rebalance.
+- **`devices/tokens/page.tsx`** — Same breadcrumb rebalance.
+
+### Files changed
+- `web/src/app/[locale]/dashboard/devices/page.tsx`
+- `web/src/app/[locale]/dashboard/devices/[id]/page.tsx`
+- `web/src/app/[locale]/dashboard/devices/pending/page.tsx`
+- `web/src/app/[locale]/dashboard/devices/tokens/page.tsx`
+- `docs/CHANGELOGS.md`
+
+## 2026-05-19 — Device UI Polish (Warning Boxes & Links)
+
+### Summary
+Reworked warning boxes and hyperlink styling across the device domain to match the modern design patterns used elsewhere in the app.
+
+### Changes
+- **`enrollment-token-dialog.tsx`** — Warning box updated from old variant (`text-warning-foreground`, `bg-warning/10`, `rounded-lg`, no dark border) to canonical pattern (`text-warning`, `bg-warning/15`, `rounded-xl`, `dark:border-warning/50 dark:bg-warning/20`).
+- **`usb-control-panel.tsx`** — Same warning box fix (old `text-warning-foreground` → `text-warning`, added dark overrides).
+- **`usb-provision-dialog.tsx`** — Same warning box fix.
+- **`devices/page.tsx`** — Tab links (`pendingTab`, `tokensTab`) upgraded from plain `text-primary hover:underline` to persistent subtle underline with hover transition. Separator dot softened.
+- **`devices/[id]/page.tsx`** — Breadcrumb link upgraded (both not-found and detail views). Separator `/` softened.
+- **`devices/pending/page.tsx`** — Breadcrumb link upgraded, separator softened.
+- **`devices/tokens/page.tsx`** — Breadcrumb link upgraded, separator softened.
+- **`device-list-table.tsx`** — Device name link in table upgraded to subtle underline pattern.
+- **`hub-health-card.tsx`** — "Manage devices" link upgraded to subtle underline pattern.
+- **`docs/walkthrough/Web Styles.md`** — Added "Status Alert Boxes" and "Hyperlink Patterns" sections documenting canonical patterns.
+- **`CLAUDE.md`** — Added notes requiring adherence to alert box and hyperlink patterns.
+
+### Files changed
+- `web/src/features/device/enrollment-token-dialog.tsx`
+- `web/src/features/device/usb-control-panel.tsx`
+- `web/src/features/device/usb-provision-dialog.tsx`
+- `web/src/app/[locale]/dashboard/devices/page.tsx`
+- `web/src/app/[locale]/dashboard/devices/[id]/page.tsx`
+- `web/src/app/[locale]/dashboard/devices/pending/page.tsx`
+- `web/src/app/[locale]/dashboard/devices/tokens/page.tsx`
+- `web/src/features/device/device-list-table.tsx`
+- `web/src/features/device/hub-health-card.tsx`
+- `docs/walkthrough/Web Styles.md`
+- `CLAUDE.md`
+- `docs/CHANGELOGS.md`
+
+## 2026-05-19 — Analytics Custom Date Range Support & Clear Button
+
+### Summary
+Fixed 400 error when selecting custom date ranges in analytics (`No enum constant Period.CUSTOM`), added custom date range support to all analytics endpoints, added a clear button to reset custom date selection, and fixed throughput/peak-hours/heatmap charts ignoring custom date ranges (previously mapped to nearest D7/D30/D90 bucket).
+
+### Changes
+- **`AnalyticsController`** — All endpoints now accept optional `from`/`to` (`LocalDate`) query params alongside the existing `period`/`range` enum params. When `from`/`to` are provided, they take precedence.
+- **`AnalyticsQueryService`** — Added `resolveTimeRange()` helper that unifies custom date ranges, period presets, and range presets into a single `(OffsetDateTime, OffsetDateTime)` pair. All public methods updated to accept optional `from`/`to` alongside their enum param.
+- **`web/src/features/analytics/api.ts`** — `periodParam()` now returns `from=...&to=...` for custom ranges (no longer sends `CUSTOM` as a period value). `rangeParam()` also returns `from=...&to=...` for custom ranges instead of mapping to nearest D7/D30/D90 bucket.
+- **`web/src/lib/constants.ts`** — Analytics route builders now accept a generic query string parameter instead of typed `period`/`range` values.
+- **`web/src/features/analytics/date-range-picker.tsx`** — Added X button to clear custom date selection and reset to TODAY preset.
+
+### Post-implementation audit
+- Fixed `dateQueryParams` accepting `PeriodOrRange` with dead `return ""` branch — renamed to `customQueryParams` with `DateRange` parameter type.
+- Changed `resolveTimeRange` fallback from silent `Period.TODAY` default to `IllegalArgumentException` when no params are provided (400 via global handler).
+- Verified all 7 frontend→backend call paths produce correct query strings for both preset and custom-range scenarios.
+- Verified `period-stats.tsx` uses the `PeriodOrRange` prop from local state, not the response `period` field — unaffected by `"custom"` label change.
+- Verified dashboard page (`page.tsx`) hardcoded `"WEEK"` calls route correctly through `periodParam`/`rangeParam`.
+- Verified partial custom ranges (only `from` or only `to`) hit the `IllegalArgumentException` fallback correctly.
+
+### Files changed
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/analytics/controller/AnalyticsController.kt`
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/analytics/service/AnalyticsQueryService.kt`
+- `web/src/features/analytics/api.ts`
+- `web/src/features/analytics/date-range-picker.tsx`
+- `web/src/lib/constants.ts`
+- `docs/CHANGELOGS.md`
+
+---
+
+## 2026-05-19 — Rate-Limit CORS and Refresh Logout Hardening
+
+### Summary
+Stopped rate-limit responses from appearing as opaque CORS failures in the admin app, and prevented transient refresh failures from clearing auth cookies.
+
+### Changes
+- **`RateLimitFilter`** — Added CORS headers to direct `429 Too Many Requests` responses when the request origin is configured as allowed, including credentials support, rate-limit header exposure, and `Vary` entries.
+- **`web/src/lib/api.ts`** — Split silent refresh outcomes into refreshed, unauthorized, and transient failure states. Network/CORS/rate-limit failures during refresh now surface as network errors without calling logout or clearing cookies; real `401`/`403` refresh rejection still logs the user out.
+- **Skipped rate-limit multiplier changes** — Per follow-up direction, the x5-x10 tier limit adjustment remains a separate deployment/config decision.
+
+### Verification
+- Static source audit only; project instructions say not to build after implementation.
+- GitNexus impact analysis reported LOW risk for `RateLimitFilter` and CRITICAL risk for the shared web `api()` helper; the frontend change was kept to the refresh-failure branch only.
+
+### Files changed
+- `backend/src/main/kotlin/com/thomas/notiguide/core/ratelimit/RateLimitFilter.kt`
+- `web/src/lib/api.ts`
+- `docs/CHANGELOGS.md`
+
+---
+
+## 2026-05-19 — Device MQTT Publisher Bean Registration Fix
+
+### Summary
+Fixed backend startup failure where `DeviceRegistrationService` required `DeviceMqttPublisher`, but no qualifying bean was available during Spring context initialization.
+
+### Changes
+- **`DeviceMqttPublisher`** — Removed scanned-component conditional registration so the publisher is plain MQTT publishing logic.
+- **`MqttConfig`** — Registered `DeviceMqttPublisher` as an explicit MQTT configuration bean alongside `MqttClientManager` and `MqttPublisher`, making registration deterministic when `mqtt.broker` enables MQTT configuration.
+
+### Verification
+- Static source audit only; project instructions say not to build after implementation.
+- GitNexus impact analysis reported MEDIUM risk for `DeviceMqttPublisher` and LOW risk for `MqttConfig`; no HIGH/CRITICAL risk warnings were returned.
+
+### Files changed
+- `backend/src/main/kotlin/com/thomas/notiguide/core/device/DeviceMqttPublisher.kt`
+- `backend/src/main/kotlin/com/thomas/notiguide/core/mqtt/MqttConfig.kt`
+- `docs/CHANGELOGS.md`
+
+---
+
+## 2026-05-17 — 433 MHz RF Trigger Debounce + Receiver Symmetry Fixes
+
+### Summary
+Ported the 750ms debounce from the ESP8266 receiver to the ESP32 receiver's `rf_trigger_on_frame`, upgraded the debounce period to 1200ms on both receiver types, and fixed several behavioral discrepancies between ESP32 and ESP8266 433 MHz trigger paths discovered during a cross-platform symmetry audit.
+
+### Debounce port (both receivers)
+- **ESP32 `rf_trigger.c`** — Added `esp_timer.h`/`esp_log.h` includes, `RF_TRIGGER_TOGGLE_DEBOUNCE_US` (1200ms), static `s_last_toggle_us` timestamp, debounce guard + return-value check on `vibrator_toggle_pulsing` + match/error logging in `rf_trigger_on_frame`.
+- **ESP8266 `rf_trigger.c`** — Updated `RF_TRIGGER_TOGGLE_DEBOUNCE_US` from 750ms to 1200ms.
+
+### Fix 1 — ESP8266 vibrator mutex (CRITICAL)
+The ESP8266 vibrator pulse task read/wrote `vibrator_pulsing` and `vibrator_active` without synchronization, racing with the public API (`vibrator_set_pulsing`, `vibrator_toggle_pulsing`, etc.). Ported the ESP32's mutex pattern: added `SemaphoreHandle_t state_lock` to `VibratorHandler`, wrapped all state access in `vibrator_lock`/`vibrator_unlock` in both the pulse task and every public function, and cleaned up the lock in `vibrator_deinit` using the same save-and-release sequence as the ESP32.
+
+### Fix 2 — ESP8266 recv_pending flag (CRITICAL)
+The ESP8266 `recv_available()` checked `recv_value != 0` as a frame-ready signal. If a valid RF code decoded to numeric value 0 (all bits zero), the frame was silently dropped. Added `bool recv_pending` to `RFHandler`, set it in `recv_proto()` on successful decode, checked it in `recv_available()`, and cleared it in `reset_recv()` — matching the ESP32 pattern.
+
+### Fix 3 — ESP32 code matching (MEDIUM, no change needed)
+The ESP32's `rf_trigger_on_frame` reconstructs a `uint32_t` from `code[0..3]` regardless of `code_len`. Audited and confirmed safe: `rf_trigger_set` zeroes the array before copy, so bytes beyond `code_len` are 0, and the mask is correctly computed from `bits`. Current protocols are all ≤32 bits.
+
+### Fix 4 — ESP8266 callback warning (MEDIUM)
+The ESP8266 dispatches decoded frames through a function pointer that must be explicitly registered. If missed, frames decoded but never reached the trigger matcher — silently. Added `ESP_LOGW` when a frame decodes but no callback is registered.
+
+### Files changed
+- `receiver-esp32/main/trigger/rf_trigger.c`
+- `receiver-esp8266/main/trigger/rf_trigger.c`
+- `receiver-esp8266/main/vibrator/vibrator.h`
+- `receiver-esp8266/main/vibrator/vibrator.c`
+- `receiver-esp8266/main/rf/rf_common.h`
+- `receiver-esp8266/main/rf/rf_receiver.c`
+- `docs/CHANGELOGS.md`
+
+---
+
+## 2026-05-17 — IDE Diagnostics Cleanup
+
+### Summary
+Fixed IDE-reported issues and follow-up audit findings: dead code, floating promises, duplicate React import style, dashboard health freshness, and duplicated store-selection code across two dialogs.
+
+### Changes
+- **Deleted `web/src/features/device/hub-heartbeat-panel.tsx`** — dead code with no importers, fully superseded by `hub-diagnostics-panel.tsx`.
+- **Fixed floating promises** in `serial-protocol.ts` (`runReadLoop()`) and `use-serial.ts` (`disconnect()`, `openPort().catch()`) by adding `void` prefix for intentional fire-and-forget calls.
+- **Fixed `import React` to `import type React`** in `hub-diagnostics-panel.tsx` (biome `useImportType` rule).
+- **Restored `StoreSelectField`** for the duplicated store selector pattern shared by `approve-dialog.tsx` and `usb-provision-dialog.tsx`, because the project linter flags the inline duplication.
+- **Added dashboard hub-health polling** in `hub-health-card.tsx` so liveness/health warnings do not freeze after the initial dashboard load. The poll pauses while the tab is hidden and refreshes when visible again.
+
+### Verification
+- `yarn lint` — passed.
+- `yarn tsc --noEmit` — passed.
+
+### Files changed
+- `web/src/features/device/hub-heartbeat-panel.tsx` (deleted)
+- `web/src/features/device/hub-diagnostics-panel.tsx`
+- `web/src/features/device/store-select-field.tsx`
+- `web/src/features/device/approve-dialog.tsx`
+- `web/src/features/device/hub-health-card.tsx`
+- `web/src/features/device/usb-provision-dialog.tsx`
+- `web/src/lib/serial/serial-protocol.ts`
+- `web/src/lib/serial/use-serial.ts`
+- `docs/CHANGELOGS.md`
+
+---
+
+## 2026-05-17 — Admin Web Serial Audit Amendments
+
+### Summary
+Audited the recent admin-web serial typing, Web Serial gating, USB diagnostics relay, and hub diagnostics UI changes for logical consistency, API accuracy, UI-rule adherence, and integration with the current backend/frontend flow.
+
+### Findings & Fixes Applied
+- Centralized Web Serial support detection in `web/src/lib/serial/support.ts` and required both a secure context and `navigator.serial` before rendering USB entry points.
+- Updated `web/src/app/[locale]/dashboard/devices/page.tsx` and `web/src/lib/serial/use-serial.ts` to use the shared support gate, avoiding divergent USB availability behavior between the devices list and detail page.
+- Added error handling for automatic reconnects from `navigator.serial` `connect` events so a failed background open does not leave an unhandled promise rejection or stale port state.
+- Clamped USB-relayed `freeHeapPct` in `usb-control-panel.tsx` to the backend-validated `0..100` range before posting diagnostics.
+- Replaced nested shadcn `Card` metric tiles in `hub-diagnostics-panel.tsx` with simple bordered metric blocks to keep the diagnostics panel aligned with the project UI rules.
+
+### Verification
+- `web/yarn lint` — passed.
+- `web/yarn tsc --noEmit` — passed.
+- Web Serial behavior checked against current MDN documentation for secure contexts, transient activation on `requestPort()`, `getPorts()` permission behavior, and bubbled `connect`/`disconnect` events.
+
+### Files updated
+- `web/src/lib/serial/support.ts`
+- `web/src/lib/serial/use-serial.ts`
+- `web/src/app/[locale]/dashboard/devices/page.tsx`
+- `web/src/features/device/usb-control-panel.tsx`
+- `web/src/features/device/hub-diagnostics-panel.tsx`
+- `docs/CHANGELOGS.md`
+
+---
+
+## 2026-05-17 — Web Serial Plan Gap Fixes
+
+### Summary
+Audit of `docs/planned/Web Serial Plan.md` against the implemented codebase found two gaps: (1) unused/untyped serial protocol types, and (2) missing `navigator.serial` connect/disconnect event listeners. Both fixed.
+
+### Changes Applied
+
+#### Type-safe serial command map (`web/src/lib/serial/types.ts`)
+- Added `SerialCommandMap` interface mapping each of the 9 firmware commands to its exact payload and response types
+- Removed unused `SerialRequest` and `SerialEvent` envelope interfaces (never imported outside `types.ts`)
+- Removed `SerialCommandType` and `SerialEventType` union types (replaced by `keyof SerialCommandMap`)
+- All payload types (`ProvisionPayload`, `TestWifiPayload`, `UpdateMqttPayload`, `TransmitPayload`, `LifecyclePayload`) and response types (`LifecycleResult`, `RestartResult`, `PingResult`, `TransmitResult`) are now alive through the map — never imported directly but enforced at compile time
+
+#### Type-safe `send()` and `sendCommand()` (`serial-protocol.ts`, `use-serial.ts`)
+- `SerialProtocol.send()` signature changed from `send<T>(type: string, payload?: object)` to `send<K extends keyof SerialCommandMap>(type, ...args)` — payload is required/forbidden based on the command, response type inferred automatically
+- `useSerial().sendCommand()` and `UseSerialReturn.sendCommand` updated to match
+- `handleProtocolMessage()` now uses typed `SerialResponse` assertion instead of untyped `any`
+
+#### Consumer component updates
+- `usb-dispatch-dialog.tsx`: updated `sendCommand` prop type to use `SerialCommandMap`; removed explicit `<TransmitResult>` generics and `satisfies TransmitPayload` assertions (now inferred); removed unused `TransmitPayload` import
+- `usb-provision-dialog.tsx`: removed explicit `<IdentifyPayload>` and `<TestWifiResult>` generics from `sendCommand` calls (now inferred); kept `IdentifyPayload` and `TestWifiResult` imports for state variable typing
+- `usb-control-panel.tsx`: no changes needed — existing `sendCommand("factory_reset")`, `sendCommand("lifecycle", ...)`, `sendCommand("update_mqtt", ...)` calls type-check cleanly against the new map
+
+#### `navigator.serial` connect/disconnect events (`use-serial.ts`)
+- Added `useEffect` that registers `navigator.serial.addEventListener("disconnect", ...)` and `navigator.serial.addEventListener("connect", ...)` when Web Serial is available
+- Disconnect handler: if the disconnected port matches `portRef.current`, stops polling, disconnects protocol, clears state, and transitions to "closed"
+- Connect handler: if currently in "closed" state and the reconnecting port matches the ESP32-C3 VID/PID filter, auto-opens it via `openPort()`
+- Verified against WICG Serial API spec via Context7 (`event.target` is the `SerialPort` instance)
+
+### Files updated
+- `web/src/lib/serial/types.ts` — command map, removed dead types
+- `web/src/lib/serial/serial-protocol.ts` — typed `send()`, typed `handleProtocolMessage()`
+- `web/src/lib/serial/use-serial.ts` — typed `sendCommand()`, navigator.serial events
+- `web/src/features/device/usb-dispatch-dialog.tsx` — typed prop, removed explicit generics
+- `web/src/features/device/usb-provision-dialog.tsx` — removed explicit generics
+
+---
+
+## 2026-05-17 — Firmware ↔ Backend/Frontend Joined Audit
+
+### Summary
+Cross-domain audit between the firmware diagnostics heartbeat implementation (`docs/planned/Firmware Diagnostics Heartbeat Plan.md`) and the backend/frontend diagnostics implementation (`docs/planned/Remote Device Diagnostics Plan.md`). Verified field-by-field data contract alignment across MQTT heartbeat, serial status, USB relay, Redis cache, and frontend display.
+
+### Findings & Fixes Applied
+- **RSSI boundary off-by-one** in `hub-diagnostics-panel.tsx`: `rssiSeverityClass()` and the signal label function used strict `>` comparisons at -65 and -75 boundaries, misclassifying exact boundary values. Plan defines Good as `-65..-50` (inclusive) and Fair as `-75..<-65` (inclusive of -75). Fixed both functions to use `>=` at these boundaries.
+
+### Verified Correct
+- MQTT heartbeat JSON keys match backend `@JsonProperty` annotations on `HeartbeatDiagPayload`.
+- Backend `recordMqttDiagnostics()` correctly passes `wifiConnected = null` and `firmwareVersion = null` for MQTT source (neither field is in the heartbeat payload).
+- Serial `status` response fields (`total_heap`, `dispatch_daily`, `dispatch_total`) placed after `free_heap` and before `firmware_version` per plan.
+- Frontend `StatusPayload` marks new fields as optional for backward compatibility with older firmware.
+- USB relay `freeHeapPct` calculation uses `MALLOC_CAP_DEFAULT` for both `free_heap` and `total_heap` (consistent cap set).
+- MQTT heartbeat `heap_pct` uses `MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL` to match OLED dashboard (intentionally different cap set from serial path, documented in plan).
+- Backend relay request validation (`@Min`/`@Max` constraints) covers full expected value ranges.
+- Backend health warning thresholds (`<= 35` heap, `< -65` RSSI, `>= 7d` uptime) correctly aggregate plan severity ranges.
+- Frontend heap and uptime severity thresholds match plan exactly.
+- Dispatch counter module uses correct NVS namespace `"display"` with original keys for migration compatibility.
+- `dispatch_counters_flush()` called in both restart paths (main.c and controls.c recovery).
+- `display.h` removed `display_notify_dispatch()`; `display.c` reads shared counters via `dispatch_counters_get()`.
+- `CMakeLists.txt` places `diagnostics/dispatch_counters.c` in always-built SRCS list, not inside OLED guard.
+- cJSON error handling in heartbeat.c correctly manages ownership (separate deletes before `AddItemToObject`, root-only delete after).
+- ESP-IDF API usage verified via Context7 (v6.0): `esp_timer_get_time()` returns µs, `esp_wifi_sta_get_rssi()` signature and connection guard, heap caps functions.
+- MQTT topic prefix gap (firmware publishes unprefixed, backend subscribes with prefix) documented as external dependency in plan — not a code bug.
+- Backend/frontend DTOs (`HubDiagnosticsDto`, `HubHealthSummaryResponse`, `HubWarningDto`, `DeviceDiagnosticsRelayRequest`) have matching field names and types across Kotlin and TypeScript.
+
+### Files updated
+- `web/src/features/device/hub-diagnostics-panel.tsx` — RSSI boundary fix
+- `docs/CHANGELOGS.md`
+
+### Skipped
+- No build/test commands run, per repository instruction.
+
+## 2026-05-17 — Remote Device Diagnostics Plan Audit
+
+### Summary
+Audited and amended `docs/planned/Remote Device Diagnostics Plan.md` against the current backend device flow, frontend Web Serial implementation, `docs/walkthrough/Web Styles.md`, AGENTS.md UI/i18n rules, and Context7 Web Serial API documentation.
+
+### Findings & Fixes Applied
+- Corrected stale frontend API routing guidance by adding explicit `API_ROUTES.DEVICES.DIAGNOSTICS(id)` and `API_ROUTES.DEVICES.HUB_HEALTH` constants instead of treating `API_ROUTES.DEVICES` as a string.
+- Moved USB diagnostics relay planning out of the nonexistent `usb-control-panel.tsx` state setter path and into a `useEffect` that watches the current `useSerial()` `deviceState`.
+- Added a backend public-id validation requirement for USB relay so a mismatched connected hub cannot update the selected device record.
+- Replaced the earlier `DeviceQueryService` write-heavy design with a dedicated `HubDiagnosticsService`, keeping query/detail loading separate from diagnostics writes and health summaries.
+- Renamed the diagnostics memory field to `freeHeapPct` to match the actual firmware meaning of `heap_pct`.
+- Replaced raw Tailwind color classes with semantic token classes from the web style guide.
+- Scoped dashboard hub health to active transmitter hubs only, avoiding false offline counts for pending or suspended devices.
+- Added bilingual i18n key guidance under `devices.hub.diagnostics` and `devices.hub.health`, with mirrored EN/VI structure.
+- Added an explicit MQTT topic-prefix compatibility note: backend diagnostics depend on the transmitter/broker publishing to the backend's configured prefixed topic path.
+- Captured Web Serial browser constraints from Context7 WICG/MDN docs: user activation, secure context, Permissions-Policy, and browser support still govern USB relay availability.
+
+### Files updated
+- `docs/planned/Remote Device Diagnostics Plan.md`
+- `docs/CHANGELOGS.md`
+
+### Skipped
+- No build/test commands run, per repository instruction.
+
+## 2026-05-17 — Remote Device Diagnostics Implementation Audit
+
+### Summary
+Audited the recent backend/web implementation of `docs/planned/Remote Device Diagnostics Plan.md` for plan adherence, logical consistency, UI/i18n rules, and integration with the current codebase.
+
+### Findings & Fixes Applied
+- Tightened USB diagnostics relay validation: backend now rejects relay requests when the selected hub record has no `publicId`, instead of accepting any submitted serial `publicId` for that record.
+- Replaced hardcoded English relative-time strings in `hub-diagnostics-panel.tsx` with `next-intl` `format.relativeTime(...)` and `useNow(...)`.
+- Adjusted Vietnamese diagnostics copy from `Heartbeat gần nhất` to the more natural `Tín hiệu gần nhất`.
+
+### Verification
+- `web/yarn lint` — passed.
+- `web/npx tsc --noEmit` — passed.
+
+## 2026-05-17 — Web Serial Plan Implementation (All 4 Phases)
+
+### Summary
+Implemented and re-audited `docs/planned/Web Serial Plan.md` across frontend (Next.js) and backend (Kotlin/Spring Boot). Adds Web Serial API support to the admin dashboard for USB-connected ESP32-C3 transmitter hubs: provisioning, RF dispatch, lifecycle control, MQTT credential updates, factory reset, and live diagnostics.
+
+### Phase 1 — Frontend Serial Library
+- **`web/src/lib/serial/types.ts`** — TypeScript interfaces for all serial message types (request/response/event envelopes, command payloads, response payloads, hardware constants)
+- **`web/src/lib/serial/serial-protocol.ts`** — `SerialProtocol` class: line-buffered read loop, JSON-lines discrimination (protocol vs console output with try/catch fallback), request/response correlation by UUID with 10s timeout, event dispatch via `EventTarget`
+- **`web/src/lib/serial/use-serial.ts`** — React hook: `canUseSerial` (feature detection via `useEffect`), `portState`, `connect()` (with ESP32-C3 VID/PID filter), `reconnectKnownPort()` (via `getPorts()`), `disconnect()`, `sendCommand()`, `deviceState` (status snapshot + event-driven updates), 30s status poll, cleanup on unmount
+- **`web/src/lib/serial/web-serial.d.ts`** — Type declarations for Web Serial API (`SerialPort`, `Serial`, `Navigator.serial`) since `@types/w3c-web-serial` is not in the project
+
+### Phase 2 — Frontend USB Provisioning UI
+- **`web/src/features/device/usb-provision-dialog.tsx`** — Multi-step provisioning dialog: USB connect → identify → form (store selector, assigned name, WiFi, MQTT) → test WiFi → issue enrollment token → serial provision → poll for PENDING hub → auto-approve if unambiguous → progress stepper with 7 steps
+- **`web/src/app/[locale]/dashboard/devices/page.tsx`** — Added "Provision via USB" button (gated by `canUseSerial`) next to existing "Issue Token" button
+- **i18n** — Added bilingual `devices.usb.*` keys to both `en.json` and `vi.json` (provisioning, control panel, console, stepper labels, local lifecycle/MQTT/reset controls, RF dispatch labels)
+
+### Phase 3 — Backend USB Dispatch Payload Helper
+- **`backend/.../request/UsbDispatchPayloadRequest.kt`** — Request DTO: `{storeId, deviceId, action: call|stop}`
+- **`backend/.../response/UsbDispatchPayloadResponse.kt`** — Response DTO: `{receiverPublicId, band, rfCodeHex, rfCodeBits, protoAny}`
+- **`backend/.../service/UsbDispatchPayloadService.kt`** — Reuses `DeviceRfCodeRepository.findDecryptedPayload()` and PT2272 call/stop channel logic from `TransmitterDispatchService.patchRfCode()`. Does not elect transmitter, create tickets, sign commands, or publish MQTT
+- **`backend/.../controller/DeviceAdminController.kt`** — Added `POST /api/devices/usb-dispatch-payload` route with store access checks
+- **`web/src/lib/constants.ts`** — Added `DEVICES.USB_DISPATCH_PAYLOAD` constant
+- **`web/src/types/device.ts`** — Added `UsbDispatchPayloadRequest` and `UsbDispatchPayloadResponse` interfaces
+- **`web/src/features/device/api.ts`** — Added `getUsbDispatchPayload()` function
+
+### Phase 4 — Frontend USB Control Panel
+- **`web/src/styles/usb-console.css`** — Terminal styling: monospace font (Courier New/Consolas), dark background (#1E293B light / #0F172A dark), log-level color coding (W=warning, E=destructive, I=muted, D=dim)
+- **`web/src/features/device/usb-control-panel.tsx`** — Collapsible glass-card panel: connection badge (success/muted outline variant), live metrics grid (plain Card tiles — no glass-on-glass), event log (timestamped, color-coded), console log viewer (collapsible, pause/resume), warning banner when MQTT also connected
+- **`web/src/features/device/usb-dispatch-dialog.tsx`** — USB-specific dispatch dialog (not adapted from queue dialog): receiver mode (Select + backend payload helper) and manual mode (band/hex/bits/protoAny), USB badge in title
+- **`web/src/app/[locale]/dashboard/devices/[id]/page.tsx`** — Integrated USB connect button, control panel, and dispatch dialog on hub detail page (gated by `canUseSerial` + hub kind)
+
+### Post-Audit Amendments
+- Fixed provisioning dialog state reset on port open by splitting dialog initialization from close-time serial disconnect cleanup.
+- Fixed pending-device correlation so USB provisioning snapshots existing `PENDING` transmitter hubs and auto-approves only exactly one newly observed pending hub.
+- Added reconnect/status refresh support after serial restarts and hardened serial stream teardown so pending requests reject and reader/writer locks are released.
+- Gated backend-specific USB dispatch on `public_id` matching the hub detail record; mismatched or unprovisioned USB devices keep those controls disabled.
+- Added local lifecycle, MQTT credential update, and factory reset controls to the USB control panel.
+- Tightened manual RF payload validation to the firmware rules: 433M allows 1-32 bits with exact hex byte width; 2.4G requires 40 bits and 10 hex characters.
+- Converted visible English-only USB labels to bilingual `en.json`/`vi.json` keys and replaced the manual `proto_any` checkbox with the existing shadcn `Switch`.
+- Hardened the backend USB payload helper so RF decrypt/config failures return a conflict-style API error instead of leaking as an internal failure, and normalized the request action enum to uppercase Kotlin entries with lower-case JSON wire values.
+
+### UI Pattern Adherence
+- All buttons follow `bg-primary text-primary-foreground hover:bg-primary-hover` for CTAs, `variant="outline"` for secondary
+- All badges use `variant="outline"` with semantic `border-*/40 bg-*/10 text-*` pattern
+- Warning banners use `border-warning/40 bg-warning/10 p-3 text-sm text-warning-foreground rounded-lg`
+- Glass-on-glass avoided: metric tiles use plain Card inside glass-card parent, dialog content doesn't add glass
+- Error handling: `InlineError` + `aria-invalid` for field validation, `toast.error()` with `translateCommonApiError`/`translateNetworkError` for API errors
+- Select styling: `h-10 w-full gap-2 px-3` trigger, `align="start" alignItemWithTrigger={false} p-1.5` content, `py-2` items
+- useTranslations: multi-namespace (`tCommon`, `tDevices`, `tUsb`, `tErrors`, `tQueue`)
+- Store selector: conditional on isSuperAdmin (Select vs disabled Input)
+
+### Verification
+- `yarn lint` — 0 errors, 0 warnings (174 files checked)
+- `npx tsc --noEmit` — 0 errors
+
+---
+
+## 2026-05-17 — Web Serial Plan Implementation-Readiness Audit
+
+### Summary
+Re-audited `docs/planned/Web Serial Plan.md` against the current transmitter serial source, backend device registration/approval/dispatch flow, frontend device UI, `docs/walkthrough/Web Styles.md`, AGENTS.md UI/i18n rules, and Context7 Web Serial/Next.js documentation.
+
+### Findings & Fixes Applied
+- Corrected the provisioning flow: USB provisioning now uses the existing enrollment token API, then the current MQTT bootstrap creates a `PENDING` hub, and activation still requires the existing approval/challenge flow.
+- Removed deterministic backend-device matching claims: current device DTOs do not expose MAC, public key, token hash, or registration nonce, so auto-approval is allowed only when exactly one new pending hub is unambiguous.
+- Corrected USB dispatch planning: current `DeviceDto.rfCode` is masked and cannot provide `rf_code_hex`, so selected-receiver USB dispatch now includes a narrow backend payload-preparation helper instead of pretending the frontend can build the serial payload alone.
+- Replaced direct reuse of `device-dispatch-dialog.tsx` with a USB-specific dispatch dialog; the existing queue dialog remains a style/reference source only.
+- Tightened Web Serial behavior: secure context, user activation, `getPorts()` limits, reconnect-after-restart handling, defensive stream cleanup, and client-only Next.js access are now explicit.
+- Removed overstated live-status claims: push events update connectivity/lifecycle/dispatch state, while uptime/free heap/RSSI/IP still require `status` refreshes.
+- Cleaned UI guidance to stay within shadcn/ui, existing glass-card rules, no glass-on-glass, existing warning/badge patterns, and bilingual `devices.usb.*` key structure.
+
+### Files updated
+- `docs/planned/Web Serial Plan.md`
+- `docs/CHANGELOGS.md`
+
+### Skipped
+- No build/test commands run, per repository instruction.
+
+---
+
+## 2026-05-17 — Web Serial Plan UI Consistency Audit
+
+### Summary
+Audited the UI portions of `docs/planned/Web Serial Plan.md` against `docs/walkthrough/Web Styles.md`, existing device components (`enrollment-token-dialog.tsx`, `lifecycle-panel.tsx`, `approve-dialog.tsx`, `passive-device-form-dialog.tsx`, `device-dispatch-dialog.tsx`, `hub-heartbeat-panel.tsx`), `web/src/styles/glass.css`, and `web/src/app/globals.css`.
+
+### Findings & Fixes Applied
+
+| # | Category | Severity | Finding | Fix applied |
+|---|----------|----------|---------|-------------|
+| 1 | Button CTA color | **HIGH** | Plan used `--action` (orange) for Provision button. Codebase reserves `--action` for "Call Next" queue button only. All dialog CTAs use `bg-primary text-primary-foreground hover:bg-primary-hover` | Changed to primary styling throughout |
+| 2 | Glass-on-glass | **HIGH** | Metric tiles inside control panel used `.glass-card` inside a `.glass-card` parent. `Web Styles.md` §Glassmorphism: "Avoid glass-on-glass" | Metric tiles changed to plain `Card`. Progress stepper `Card` inside Dialog also de-glassed |
+| 3 | Badge styling | **MEDIUM** | Plan used `--success` colored dot for connection badge. Codebase pattern is `variant="outline"` with `border-success/40 bg-success/10 text-success` (see `hub-heartbeat-panel.tsx`) | Fixed to match existing badge pattern with proper disconnected state |
+| 4 | Warning banner | **MEDIUM** | Plan used generic "styled div with warning tokens". Codebase has exact pattern: `border-warning/40 bg-warning/10 p-3 text-sm text-warning-foreground rounded-lg` (see `enrollment-token-dialog.tsx`) | Fixed all warning banner references to use exact codebase pattern |
+| 5 | Console font | **MEDIUM** | Plan used `font-mono` but `globals.css` maps `--font-mono` to Inter (dashboard legends), which is NOT monospace | Changed to explicit monospace font stack (`Courier New, Consolas, monospace`) in `usb-console.css` |
+| 6 | Missing patterns | **HIGH** | Plan had no specification for error handling, form structure, loading states, Select styling, useTranslations namespaces, or store selector conditional logic | Added "UI Patterns" section documenting: `InlineError` component, `toast.error()` with translateCommonApiError/NetworkError, controlled inputs with validate(), Loader2 spinner pattern, Select styling (`h-10 w-full gap-2 px-3`), multi-namespace useTranslations, isSuperAdmin store selector pattern, glass-on-glass prohibition |
+
+### Verified correct (no change needed)
+- `Dialog` has glass styling built-in (`bg-surface/85 backdrop-blur-xl`) — confirmed in `dialog.tsx`
+- Color tokens `--success`, `--warning`, `--destructive`, `--primary`, `--action` exist in both light and dark themes
+- `.glass-card` applied to standalone panels (`lifecycle-panel.tsx`, `hub-heartbeat-panel.tsx`) — matches plan's `usb-control-panel.tsx` usage
+- `AlertDialog` confirmation pattern for lifecycle actions matches `lifecycle-panel.tsx`
+- `Collapsible` component exists and is used correctly
+- Event log color-coding with CSS variable tokens is consistent with design system
+- Browser support gate pattern (`canUseSerial ? <Component /> : null`) is correct for Next.js client components
+- Separate CSS file for complex terminal styling follows CLAUDE.md rule: "CSS should be written to separate files if they are too complex and lengthy"
+
+### Files updated
+- `docs/planned/Web Serial Plan.md`
+
+---
+
+## 2026-05-17 — Web Serial Plan Audit
+
+### Summary
+Audited `docs/planned/Web Serial Plan.md` against actual codebase (firmware, frontend, i18n, shadcn components) and verified Web Serial API signatures via Context7 WICG/serial spec.
+
+### Findings & Fixes Applied
+
+| # | Category | Severity | Finding | Fix applied |
+|---|----------|----------|---------|-----|
+| 1 | i18n namespace | **HIGH** | Plan used `device.usb.*` but codebase uses `devices.*` (plural). All 21 i18n keys would fail at runtime | Changed all `device.usb.*` → `devices.usb.*` |
+| 2 | Phantom field | **MEDIUM** | `dispatch_id` listed as optional in `transmit` command table and `TransmitPayload` type, but firmware `handle_transmit()` does not parse it | Removed `dispatch_id` from command table, TypeScript type, and trust model reference |
+| 3 | Missing component | **MEDIUM** | Plan referenced shadcn `Alert` component (2 locations) but only `AlertDialog` exists in `web/src/components/ui/` | Changed to styled `div` with warning tokens, with note to crawl `Alert` from shadcn if needed |
+| 4 | Glass styling | **MEDIUM** | Plan described "glass-effect variant" as a component prop/variant, but glass styling is applied via `.glass-card` CSS class from `web/src/styles/glass.css`. Dialog has built-in glass; Card does not | Fixed all 8 references: Dialog → "has glass styling built-in", Card → "with `.glass-card` class" |
+| 5 | Sequence diagram | **MEDIUM** | Post-provision diagram showed events streaming directly after restart, ignoring USB port disconnect/reconnect cycle | Added reconnect steps: port disconnect → reappear → re-open + status → then events stream |
+| 6 | Identify response | **LOW** | Sequence diagram showed `{mac, firmware_version, op_state}` but actual response has 5 fields | Fixed to `{public_id, device_name, firmware_version, mac, op_state}` |
+| 7 | Event payloads | **LOW** | Dispatch event `reason` and `source` fields listed as always-present but are conditional in firmware (only emitted when non-empty) | Added `?` suffix to `reason` and `source` in event table |
+| 8 | JSON parse safety | **LOW** | `SerialProtocol.handleLine()` code snippet had no try/catch around `JSON.parse()` — malformed lines starting with `{` would throw | Added try/catch fallback to console.log event |
+| 9 | i18n count | **LOW** | Plan said "~190 `devices.*` keys" but actual count is 152 | Fixed to "~150" |
+| 10 | dispatch-dialog props | **LOW** | Plan said "add a `via` prop" without documenting existing props | Added current props `{open, onOpenChange, storeId, onSuccess}` and clarified `sendCommand` function prop needed for USB mode |
+| 11 | Redundant backend section | **LOW** | Separate "Backend Changes" section with endpoint table was redundant — `POST /api/devices/enrollment-tokens` already exists, no backend changes needed | Collapsed into a single-paragraph note above the sequence diagram. References existing `DEVICES.TOKENS` constant and `issueEnrollmentToken()` API function |
+| 12 | Provisioning-biased framing | **MEDIUM** | Motivation section was entirely about SoftAP provisioning friction. Dispatch, lifecycle control, MQTT credential rotation, and diagnostics were afterthoughts ("beyond provisioning", "useful during setup and testing") despite being equally important use cases | Restructured Motivation into three co-equal sections: USB Provisioning, Direct Dispatch & Control, Real-Time Monitoring & Diagnostics. Updated scope header. Rewrote Live USB Control section to give RF dispatch, lifecycle, update_mqtt, and factory_reset proper weight as first-class capabilities |
+
+### Verified correct (no change needed)
+- Web Serial API `requestPort` filter `{usbVendorId, usbProductId}` — both properties valid per WICG/serial spec (Context7)
+- `port.open({ baudRate: 115200 })` — correct API, baudRate is the only required parameter
+- `port.writable.getWriter()` → `writer.write(encoder.encode(msg))` — correct write pattern
+- `port.readable.getReader()` → `reader.read()` loop — correct read pattern
+- `"serial" in navigator` feature detection — confirmed correct for Next.js client components via `useEffect`
+- `"use client"` directive requirement — confirmed, browser-only APIs must be in client components
+- `EventTarget` + `CustomEvent` pattern — valid browser API, not used elsewhere in codebase but standard
+- ESP32-C3 VID `0x303A` / PID `0x1001` — correct Espressif USB Serial/JTAG identifiers
+- `StatusPayload` conditional fields (`wifi_ssid?`, `wifi_rssi?`, `ip?`) — matches firmware (only present when `wifi_connected`)
+- `EnrollmentTokenIssueResponse` type with `{token, tokenHash, expiresAt}` — exists in `web/src/types/device.ts`
+- `DEVICES.TOKENS` constant pointing to `/api/devices/enrollment-tokens` — exists in `web/src/lib/constants.ts`
+- `listStores()` API in `web/src/features/store/api.ts` — exists, used by `enrollment-token-dialog.tsx`
+- All 5 CSS variable tokens (`--success`, `--warning`, `--destructive`, `--primary`, `--action`) — exist in both light and dark themes
+- Firmware session timeout is exactly 30000ms (30 seconds) — matches plan
+- All firmware command payloads and responses — verified field-by-field against `serial_protocol.c`
+- Third public API function `serial_protocol_is_usb_host_connected()` exists in firmware but is display-internal; dashboard doesn't need it — omission from plan is intentional
+
+### Files updated
+- `docs/planned/Web Serial Plan.md`
+
+---
+
+## 2026-05-17 — Web Serial Plan Cleanup (Post-Firmware Implementation)
+
+### Summary
+Updated `docs/planned/Web Serial Plan.md` to reflect that the firmware serial protocol is fully implemented. Restructured the plan so it now targets only the remaining backend and frontend work.
+
+### Changes
+- **Collapsed firmware sections** — removed the full "Firmware Changes" section (driver init, console routing, read loop, command dispatch, response writing, event forwarding, sdkconfig, boot integration) and replaced with a concise "Firmware Protocol Reference" that documents the implemented protocol as a reference for dashboard development
+- **Removed firmware phases** — removed Phase 1 (Firmware Serial Protocol Foundation) and Phase 2 (Firmware Control Commands + Event Forwarding) from implementation phases since both are complete
+- **Renumbered phases** — remaining phases are now Phase 1 (Frontend Serial Library), Phase 2 (Frontend USB Provisioning UI), Phase 3 (Frontend USB Control Panel)
+- **Updated scope header** — changed prerequisite from OLED & Button plan to the implemented Serial Protocol Plan
+- **Added backend flow diagram** — new Mermaid sequence diagram showing the full USB provisioning backend flow (dashboard → backend → serial → MQTT bootstrap)
+- **Added existing infrastructure summary** — documented the 15+ device components, ~190 i18n keys, and typed DTOs already in the frontend, so the plan doesn't re-specify what exists
+- **Clarified backend scope** — confirmed no new backend endpoints needed (existing `/api/devices/enrollment-tokens` POST suffices)
+- **Updated event table** — added `source` field to dispatch events matching actual firmware implementation
+- **Added session management reference** — documented the 30-second RX inactivity timeout and the requirement to send `status` immediately after connecting
+- **Added hardware constants table** — VID/PID and baud rate in one place for frontend reference
+- **Cleaned up risk table** — removed firmware-specific risks (serial stack memory, cJSON allocation) that are no longer relevant. Added post-restart reconnect timing risk
+- **Updated status response schema** — `firmware_version` default is `"v1.0"` (matching Kconfig default), `public_id` format is `"HUB-7F3A"` (matching firmware output)
+
+### Files updated
+- `docs/planned/Web Serial Plan.md`
+
+---
+
+## 2026-05-16 — Transmitter Serial Plan Follow-Up Audit
+
+### Summary
+Follow-up audit of `docs/planned/Transmitter Serial Protocol Plan.md`, cross-referenced against actual transmitter firmware headers, the Web Serial Plan, and Context7 ESP-IDF v6.0 docs.
+
+### Findings (verified against firmware source + ESP-IDF v6.0 release branch headers)
+- All event IDs, struct fields, `radio_tx_send()`, `device_config_*`, and `time_utils_now_epoch_ms()` signatures match actual headers
+- Protocol design (JSON Lines, command table, status schema, trust model) consistent between both plans
+- ESP-IDF APIs (`esp_wifi_sta_get_rssi`, `esp_read_mac`, `esp_netif_get_handle_from_ifkey`, `usb_serial_jtag_vfs_use_driver`) confirmed via Context7
+- `CONFIG_TRANSMITTER_FIRMWARE_VERSION` correctly identified as needing creation (absent from current Kconfig)
+- `CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION` correctly identified as absent from current sdkconfig
+- **`usb_serial_jtag_driver_install(&cfg)` confirmed** — takes `usb_serial_jtag_driver_config_t *` parameter as the plan specified (default buffers are 256 bytes each)
+- **`usb_serial_jtag_wait_tx_done()` EXISTS** — plan incorrectly stated it did not exist in v6.0. Verified in `driver/usb_serial_jtag.h` on release/v6.0 branch
+- **`usb_serial_jtag_is_connected()` EXISTS** — plan treated it as "unverified." It is a public API in v6.0, using USB SOF detection
+- **`ticks_to_wait` parameter type** — actual headers use `uint32_t`, not `TickType_t`. Functionally equivalent on ESP32-C3 but plan showed incorrect type name
+
+### Fixes applied
+- Added 4 missing function declarations to Key Function Signatures: `device_config_requires_recovery()`, `wifi_stop()`, `heartbeat_start()`, `heartbeat_stop()` — all used in serial module implementation but were omitted
+- Fixed 3 bare calls to `esp_err_t`-returning functions to use `(void)` cast, matching existing codebase convention in `dispatch.c`: `wifi_stop()` in test_wifi handler, `heartbeat_stop()` and `heartbeat_start()` in lifecycle handler
+- Fixed misleading comment "restore to previous state" → "release test connection" in test_wifi cleanup
+- **Rewrote ESP-IDF API Reference section** — added complete `usb_serial_jtag.h` API listing with correct types: `wait_tx_done()`, `is_connected()`, `is_driver_installed()`, `driver_uninstall()`. Included struct definition and default macro with actual default buffer sizes (256 bytes)
+- **Rewrote Host Connection Detection section** — `usb_serial_jtag_is_connected()` is now the primary hardware check; session flag is complementary protocol-level awareness. Updated `serial_protocol_is_host_connected()` implementation and docstring accordingly
+- **Replaced `vTaskDelay` pre-restart pattern** with `usb_serial_jtag_wait_tx_done(pdMS_TO_TICKS(200))` in all 3 handlers that call `esp_restart()` (provision, factory_reset, update_mqtt)
+- **Downgraded "TX buffer not drained" risk** from Medium to Low (proper drain API now used)
+- **Replaced "host-connected helper unavailable" risk row** — no longer applicable; updated to describe the cable-without-session edge case
+
+### Files updated
+- `docs/planned/Transmitter Serial Protocol Plan.md`
+- `docs/CHANGELOGS.md`
+
+---
+
+## 2026-05-16 — Web Serial and Transmitter Serial Plan Audit Corrections
+
+### Summary
+Audited `docs/planned/Transmitter Serial Protocol Plan.md` and `docs/planned/Web Serial Plan.md` for factual drift, parent/child conflicts, and transmitter-only Dev Container readiness. Treated the transmitter serial plan as the reference only for verified firmware-domain details, then aligned the web plan where it conflicted with current transmitter firmware, current backend routes, and Context7-verified Web Serial / ESP-IDF API behavior.
+
+### Documentation changes
+- Made the transmitter serial plan explicitly standalone for a transmitter-only Dev Container and added the required dashboard/backend contract snapshot locally.
+- Replaced unverified USB host-detection fallback guidance with an application-level serial-session flag; removed parent-plan boot logic that depended on USB host detection.
+- Corrected the web plan's USB provisioning flow to use the existing `/api/devices/enrollment-tokens` endpoint and normal MQTT bootstrap registration, instead of inventing a `/api/device/usb-provision` auto-registration endpoint.
+- Aligned firmware references in the web plan: `device_config_save_provisioning()`, `device_config_save_mqtt()`, `esp_driver_usb_serial_jtag`, no `usb_serial_jtag_wait_tx_done()`, no `store_id` in `identify`, and no unsupported `dispatch_count_today` status field.
+- Tightened serial implementation snippets with the missing protocol header, standard C includes, task creation error handling, and event-handler registration error handling.
+
+### Files updated
+- `docs/planned/Transmitter Serial Protocol Plan.md`
+- `docs/planned/Web Serial Plan.md`
+- `docs/CHANGELOGS.md`
+
+---
+
+## 2026-05-15 — Transmitter Serial Protocol Implementation Plan
+
+### Summary
+Created `docs/planned/Transmitter Serial Protocol Plan.md` — a standalone firmware implementation plan for adding USB serial protocol support to the ESP32-C3 transmitter hub. Covers Phase 1 (driver init, JSON protocol, provisioning/diagnostic commands) and Phase 2 (transmit/lifecycle control commands, event forwarding). The plan is self-contained for Dev Container implementation with ESP-IDF v6.0.
+
+### Research & verification
+- Cross-referenced all ESP-IDF API signatures against `docs/walkthrough/ESP_IDF_SDK_REFERENCE.md` and Context7 ESP-IDF v6.0 docs
+- Verified all function signatures, struct fields, and enum values against actual transmitter firmware source code
+- Confirmed `usb_serial_jtag_driver_install()`, `usb_serial_jtag_read/write_bytes()`, `usb_serial_jtag_vfs_use_driver()` APIs
+- Confirmed `CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION` Kconfig option exists in v6.0
+- Flagged `usb_serial_jtag_is_connected()` as unverified and avoided treating it as a required boot-flow dependency
+- Confirmed `usb_serial_jtag_wait_tx_done()` does NOT exist in v6.0 (parent plan error); replaced with `vTaskDelay` drain pattern
+
+### Audit findings fixed (19 total from automated audit)
+- **dispatch_id dedup self-contradiction** — resolved: serial protocol intentionally skips dispatch ring dedup (USB is local, not replayed); aligned trust model section, dispatch path description, and implementation code
+- **`identify` response `store_id`** — removed: firmware has no store concept; browser should get store info from backend API
+- **Task stack size misstatement** — corrected: ESP32-C3 RISC-V port uses byte-sized stack units, so `4096` = 4 KB not 16 KB; memory budget updated from ~27 KB to ~15 KB
+- **Missing rejection events** — added `TX_EVENT_DISPATCH_REJECTED` posts to serial transmit failure paths (no_2_4g_radio, tx_failed), matching MQTT dispatch behavior for OLED/LED reactivity
+- **Inline extern declarations** — replaced with proper `#include "network/heartbeat.h"`
+- **Lifecycle no-op guard** — added idempotent transition guard to skip NVS writes when already in requested state
+- **Line buffer overflow** — added overflow flag to discard truncated lines instead of parsing partial JSON
+- **malloc failure logging** — added `ESP_LOGE` when response serialization malloc fails
+- **Boot sequence pseudo-code** — added `ESP_ERROR_CHECK()` wrappers matching actual `main.c`
+- **Kconfig ordering** — moved `CONFIG_TRANSMITTER_FIRMWARE_VERSION` creation to Step 1.1
+- **Host connection detection** — softened assertion to "may expose"; later audit replaced the LL fallback with an application-level serial-session flag
+- **Init position** — documented intentional difference from parent plan (after controls_init, not before)
+- **SoftAP recovery note** — documented that test_wifi leaves WiFi stopped if SoftAP was active
+
+### Parent plan divergences documented (informational, no firmware plan change needed)
+- Parent plan uses `device_config_save()` → actual function is `device_config_save_provisioning()`
+- Parent plan uses `driver` in PRIV_REQUIRES → correct v6 name is `esp_driver_usb_serial_jtag`
+- Parent plan calls non-existent `usb_serial_jtag_wait_tx_done()`
+- Parent plan status schema includes `dispatch_count_today` → omitted from firmware (no counter exists yet)
+
+### Files created
+- `docs/planned/Transmitter Serial Protocol Plan.md`
+
+### Files updated
+- `docs/CHANGELOGS.md`
+
+---
+
 ## 2026-05-13 — Transmitter OLED/Button/LED Plan Final Audit Corrections
 
 ### Summary

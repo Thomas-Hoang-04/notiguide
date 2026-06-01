@@ -1073,3 +1073,354 @@ display_dimmed = false;
 
 1. **Dispatch counter scope:** Show both — "today" (calendar-day, NVS-persisted with date key as defined in F.1) and "lifetime" (NVS-persisted, never resets). Screen 1 shows "Dispatches today" (daily NVS counter); Screen 4 shows "Dispatches: N total" (lifetime NVS counter). The hub syncs approximate date from `issued_at` in dispatch commands.
 2. **Screen auto-rotation vs static:** Static — manual button navigation only. The hub is a diagnostic tool, not a kiosk.
+
+---
+
+## J. USB Serial Status — Display & LED Integration
+
+> **Prerequisite:** The Serial Protocol plan has been implemented. The `serial/serial_protocol.h` module exposes `serial_protocol_is_host_connected()`, which reports an active protocol session by combining ESP-IDF USB host-link detection (`usb_serial_jtag_is_connected()`) with an application-level session flag that tracks valid JSON command activity within a 30-second window.
+
+The USB serial protocol operates alongside MQTT as a second command channel. This section adds visual awareness of USB connectivity to the OLED display so an admin using the Web Serial dashboard can confirm the hub recognizes an active wired management session, and field technicians can inspect Screen 3 to distinguish an active protocol session from a USB host link with no recent JSON protocol traffic.
+
+All changes below integrate into the existing module structure. The display module (`display/display.c`, `display/display_screens.h`, `display/display_screens.c`) uses fixed-position `lv_obj_set_pos()` labels on the status bar and flex-column layouts for content screens. The patterns described here follow the same conventions.
+
+### J.1 Status Bar — Wired Indicator
+
+Add a conditional `Wired` text indicator to the status bar, visible only when `serial_protocol_is_host_connected()` returns `true` — meaning the USB Serial/JTAG link is connected to a host and an active Web Serial protocol session exists (a browser has sent at least one valid JSON command within the last 30 seconds). ESP-IDF's `usb_serial_jtag_is_connected()` detects SOF traffic from a USB host; it does not detect a passive power-only cable.
+
+The label reads "Wired" rather than "USB" — it is friendlier for non-technical users and communicates the relevant fact (a wired management session is active) without requiring the reader to know what USB Serial/JTAG means.
+
+**Pixel budget:** The `proggy_clean_12` bitmap font has a fixed advance width of 84 (LVGL 1/16th-pixel units) = **5.25 px per character**. The current status bar labels and their pixel spans are:
+
+| Label   | x     | Text (worst case) | Chars | Ends at |
+|---------|-------|--------------------|-------|---------|
+| MQTT    | 0     | `● MQTT`           | 6     | ~32     |
+| WiFi    | 38    | `▲ WiFi`           | 6     | ~70     |
+| State   | 76    | `ACTIVE`           | 6     | ~108    |
+| Uptime  | 104   | `00:00`            | 5     | ~130    |
+
+The shared `format_uptime()` helper currently emits `HH:MM` before 24 hours and `Xd HH:MM` after that, which is too wide for the status bar even before adding the wired indicator. As part of this section, add a status-bar-specific helper that always returns at most 5 display characters: `HH:MM` before 24 hours, `1d03h` style after one day, and `9d+` once the exact day/hour string would exceed 5 characters. Keep the existing wider `format_uptime()` for dashboard rows.
+
+There is no unused gap between WiFi (ending ~70) and State (starting 76) wide enough for "Wired" (5 chars = ~26px). The indicator must therefore **shift the State and Uptime labels** when it is visible. The total content for the wired case is approximately: MQTT (32px) + WiFi (32px) + "Wired" (26px) + State (32px) + compact Uptime (26px) = 148px — 20px over budget if all labels use their full text. To fit, condense the MQTT and WiFi labels to symbol-only form when the Wired indicator is active:
+
+| Condition | MQTT label | WiFi label | Layout width |
+|-----------|-----------|-----------|--------------|
+| Wired hidden | `● MQTT` (6 chars) | `▲ WiFi` (6 chars) | Unchanged — current layout |
+| Wired visible | `●` (1 char) | `▲` (1 char) | ~5 + ~5 + 26 + 32 + 26 ≈ 94px — fits |
+
+When `serial_protocol_is_host_connected()` becomes true, the MQTT and WiFi labels are shortened to their symbol-only form and the positions of all downstream labels shift left. When the session ends, the full text is restored. This keeps the bar readable in both states: the condensed symbols are the same indicators the user already recognises, and the "Wired" label provides context for why the layout changed.
+
+```
+Wired session active (condensed connectivity labels):
+┌────────────────────────────────────┐
+│ ● ▲ Wired  ACTIVE          00:42  │
+└────────────────────────────────────┘
+
+No wired session (unchanged from B.1):
+┌────────────────────────────────────┐
+│ ● MQTT  ▲ WiFi   ACTIVE     00:42 │
+└────────────────────────────────────┘
+```
+
+**Struct change** — add `lbl_usb` to `status_bar_t` in `display/display_screens.h`:
+
+```c
+typedef struct {
+    lv_obj_t *lbl_mqtt;
+    lv_obj_t *lbl_wifi;
+    lv_obj_t *lbl_usb;      // ← NEW — displays "Wired", hidden when no session
+    lv_obj_t *lbl_state;
+    lv_obj_t *lbl_uptime;
+} status_bar_t;
+```
+
+**Creation** — in `screens_create_status_bar()`, create the label after WiFi and hide it by default:
+
+```c
+bar->lbl_usb = lv_label_create(container);
+lv_obj_set_style_text_color(bar->lbl_usb, DISPLAY_WHITE, 0);
+lv_obj_set_pos(bar->lbl_usb, 16, 0);
+lv_label_set_text(bar->lbl_usb, "Wired");
+lv_obj_add_flag(bar->lbl_usb, LV_OBJ_FLAG_HIDDEN);
+```
+
+**Refresh** — in `update_status_bar()`, poll the serial session state, toggle visibility, and reposition labels. This function already runs on every 1-second `refresh_timer_cb` tick and on every event that calls `update_active_screen()`:
+
+```c
+#include "serial/serial_protocol.h"
+
+// inside update_status_bar(), after deriving state_str and compact uptime text:
+bool wired = serial_protocol_is_host_connected();
+if (wired) {
+    // condense connectivity labels to symbol-only
+    lv_label_set_text(s_status_bar.lbl_mqtt, s_mqtt_connected ? LV_SYMBOL_BULLET : "o");
+    lv_label_set_text(s_status_bar.lbl_wifi, s_wifi_connected ? LV_SYMBOL_UP : LV_SYMBOL_CLOSE);
+    lv_obj_set_pos(s_status_bar.lbl_wifi, 8, 0);
+    lv_obj_set_pos(s_status_bar.lbl_usb, 16, 0);
+    lv_obj_clear_flag(s_status_bar.lbl_usb, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(s_status_bar.lbl_state, 48, 0);
+    lv_obj_set_pos(s_status_bar.lbl_uptime, 84, 0);
+} else {
+    // restore full labels and standard positions
+    lv_label_set_text(s_status_bar.lbl_mqtt, s_mqtt_connected ? LV_SYMBOL_BULLET " MQTT" : "o MQTT");
+    lv_label_set_text(s_status_bar.lbl_wifi, s_wifi_connected ? LV_SYMBOL_UP " WiFi" : LV_SYMBOL_CLOSE " WiFi");
+    lv_obj_set_pos(s_status_bar.lbl_wifi, 38, 0);
+    lv_obj_add_flag(s_status_bar.lbl_usb, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(s_status_bar.lbl_state, 76, 0);
+    lv_obj_set_pos(s_status_bar.lbl_uptime, 104, 0);
+}
+lv_label_set_text(s_status_bar.lbl_state, state_str);
+lv_label_set_text(s_status_bar.lbl_uptime, uptime_buf);
+```
+
+This replaces the existing `lv_label_set_text` calls for `lbl_mqtt` and `lbl_wifi` — the wired branch sets the condensed text, the else branch restores the current text, so the existing set-text lines at the top of `update_status_bar()` should be removed and unified into this block. `update_status_bar()` should call the new compact uptime helper for `lbl_uptime`; dashboard rows should continue to use the current wider uptime formatting.
+
+**Compact status uptime helper** — add alongside the existing `format_uptime()` helper in `display.c`:
+
+```c
+static void format_status_uptime(char *buf, size_t sz)
+{
+    int64_t us = esp_timer_get_time();
+    int64_t total_sec = us / 1000000LL;
+    int days = (int)(total_sec / 86400);
+    int hrs  = (int)((total_sec % 86400) / 3600);
+    int mins = (int)((total_sec % 3600) / 60);
+
+    if (days <= 0) {
+        (void)snprintf(buf, sz, "%02d:%02d", hrs, mins);
+    } else if (days < 10) {
+        (void)snprintf(buf, sz, "%dd%02dh", days, hrs);
+    } else {
+        (void)snprintf(buf, sz, "9d+");
+    }
+}
+```
+
+### J.2 Screen 3 — Wired Connection Info
+
+Extend Screen 3 (Network Info) to show wired connection status. Merge SSID and Channel into a single `lv_label` — they are logically related (both describe the connected AP) and Channel is a short value that fits alongside a truncated network name. This frees the `lbl_channel` slot for the wired status row while keeping the screen at 5 flex rows within the 52px content area.
+
+```
+┌────────────────────────────────────┐
+│ ● ▲ Wired  ACTIVE          00:42  │
+├────────────────────────────────────┤
+│  IP:    192.168.1.42               │
+│  RSSI:  -52 dBm (Good)            │
+│  AP:    HomeLab-5G   Ch:6         │
+│  Hub:   HUB-7F3A                   │
+│  Wired: Session active             │
+└────────────────────────────────────┘
+```
+
+**Struct change** — replace `lbl_channel` with `lbl_usb` in `screen_network_t` in `display/display_screens.h`. The field order matches the visual row order in the flex column (IP → RSSI → SSID+Ch → Hub → Wired):
+
+```c
+typedef struct {
+    lv_obj_t *lbl_ip;
+    lv_obj_t *lbl_rssi;
+    lv_obj_t *lbl_ssid;     // now renders "AP: … Ch:…" combined
+    lv_obj_t *lbl_hub_id;
+    lv_obj_t *lbl_usb;      // ← REPLACES lbl_channel — displays "Wired: …"
+} screen_network_t;
+```
+
+**Creation** — in `screens_create_network_info()`, replace the `lbl_channel` creation with `lbl_usb`. The creation order determines the flex-column visual order. With the merge, AP+Channel becomes the 3rd row, Hub moves to the 4th row, and Wired becomes the 5th row:
+
+```c
+// lbl_ssid now shows both AP/SSID and channel (merged)
+net->lbl_ssid = lv_label_create(cont);
+// ...
+lv_label_set_text(net->lbl_ssid, "AP:   N/A");
+
+// lbl_channel removed — Channel is merged into lbl_ssid text
+
+net->lbl_hub_id = lv_label_create(cont);
+// ...
+
+// Wired status row (replaces the old lbl_channel)
+net->lbl_usb = lv_label_create(cont);
+lv_obj_set_style_text_color(net->lbl_usb, DISPLAY_WHITE, 0);
+lv_label_set_text(net->lbl_usb, "Wired: ---");
+```
+
+**Refresh** — in `update_screen_network()`, merge SSID + Channel into one `snprintf` call and add the wired row logic:
+
+```c
+// merged AP/SSID + Channel row. Keep this below 24 display characters.
+if (s_cached_channel > 0) {
+    (void)snprintf(buf, sizeof(buf), "AP:   %-12.12s Ch:%u",
+                   s_cached_ssid[0] ? s_cached_ssid : "N/A", s_cached_channel);
+} else {
+    (void)snprintf(buf, sizeof(buf), "AP:   %.18s", s_cached_ssid[0] ? s_cached_ssid : "N/A");
+}
+lv_label_set_text(s_network_scr.lbl_ssid, buf);
+
+// Wired status row
+if (serial_protocol_is_host_connected()) {
+    (void)snprintf(buf, sizeof(buf), "Wired: Session active");
+} else if (serial_protocol_is_usb_host_connected()) {
+    (void)snprintf(buf, sizeof(buf), "Wired: No session");
+} else {
+    (void)snprintf(buf, sizeof(buf), "Wired: ---");
+}
+lv_label_set_text(s_network_scr.lbl_usb, buf);
+```
+
+**Wired row states:**
+
+| Condition | Display | How determined |
+|-----------|---------|----------------|
+| USB host link connected, session active | `Wired: Session active` | `serial_protocol_is_host_connected()` returns `true` |
+| USB host link connected, no recent protocol session | `Wired: No session` | `serial_protocol_is_usb_host_connected()` returns `true` but `serial_protocol_is_host_connected()` returns `false` |
+| No USB host link | `Wired: ---` | `serial_protocol_is_usb_host_connected()` returns `false` |
+
+The three-state display distinguishes: (a) a Web Serial dashboard is open and communicating, (b) the USB Serial/JTAG peripheral sees a host link but no valid JSON command has arrived within the session window, and (c) no USB host link is detected. ESP-IDF's host-link signal is based on SOF packets from a host; it should not be described as passive cable detection.
+
+**Dependency:** The display module must include `serial/serial_protocol.h`. For the three-state distinction on Screen 3, the display needs to know whether the USB Serial/JTAG peripheral sees a host link without an active protocol session. Rather than having `display.c` include `driver/usb_serial_jtag.h` directly — which would couple the display module to the hardware driver — add a lightweight wrapper to `serial/serial_protocol.h`:
+
+```c
+bool serial_protocol_is_usb_host_connected(void);
+```
+
+This wraps `usb_serial_jtag_is_connected()`, keeping the hardware dependency inside the serial module where it belongs. The display module calls only `serial_protocol.h` functions. Because `display_init()` runs before `serial_protocol_init()` in `app_main()`, this accessor must be safe to call before the USB serial driver task has started; `usb_serial_jtag_is_connected()` itself reads the connection monitor state and does not require the serial protocol task to be running.
+
+### J.3 Dispatch Source Indication
+
+With two command channels (MQTT and USB serial), it is useful to indicate which path delivered each dispatch. This helps admins distinguish locally-triggered test commands from backend-dispatched production commands.
+
+#### Struct Change
+
+Add a `source` field to `dispatch_summary_t` in `events/transmitter_events.h`:
+
+```c
+typedef struct {
+    char receiver_public_id[48];
+    char band[8];
+    int  rf_code_bits;
+    bool proto_any;
+    char status[16];
+    char reason[32];
+    int64_t applied_at_ms;
+    char source[8];              // "mqtt" or "usb"  ← NEW
+} dispatch_summary_t;
+```
+
+**Producers:**
+- `dispatch.c` — in `post_dispatch_event()`, set `strlcpy(summary.source, "mqtt", sizeof(summary.source))` alongside the existing field population
+- `serial_protocol.c` — in `handle_transmit()`, set `strlcpy(summary.source, "usb", sizeof(summary.source))` alongside the existing `dispatch_summary_t` population (the handler already posts these events; add the field)
+
+**Consumers:**
+- `display.c` — already copies the full `dispatch_summary_t` via `memcpy` in `display_event_handler()` (into `event_summary`, then into `s_last_dispatch`), so the `source` field propagates automatically once all in-tree event producers are updated in the same commit. This is not a mixed-version compatibility boundary: because `esp_event` does not pass the payload size to the handler, old producers that post a smaller struct cannot be safely supported by checking `source[0]`. The display layer maps the machine-readable value to a user-friendly label at render time: `"usb"` → `"Wired"`, `"mqtt"` → `"MQTT"`.
+- `serial_protocol.c` — the `serial_event_handler` forwards dispatch events to USB as JSON. It currently reads `receiver_public_id`, `band`, `status`, and `reason` from the `dispatch_summary_t` payload. Update it to also forward the `source` field:
+
+```c
+// in serial_event_handler(), TX_EVENT_DISPATCH_OK / TX_EVENT_DISPATCH_REJECTED case:
+if (s->source[0] != '\0') {
+    cJSON_AddStringToObject(p, "source", s->source);
+}
+```
+
+This ensures the Web Serial dashboard receives the dispatch source alongside other event fields.
+
+**Display-side source mapping helper** — add to `display.c`:
+
+```c
+static const char *source_display_name(const char *source)
+{
+    if (strcmp(source, "usb") == 0) return "Wired";
+    if (strcmp(source, "mqtt") == 0) return "MQTT";
+    return source;
+}
+
+static const char *source_short_name(const char *source)
+{
+    if (strcmp(source, "usb") == 0) return "W";
+    if (strcmp(source, "mqtt") == 0) return "M";
+    return "?";
+}
+```
+
+#### Screen 2 — Last Dispatch Detail
+
+Append the dispatch source to the existing result row text in `update_screen_dispatch()`. No new `lv_label` is needed — the source tag is formatted inline into the existing `lbl_result` label via `snprintf`. Use the shorter `Res:` prefix so the longest current status (`unchanged`) plus `[Wired]` still fits the 128px display width:
+
+```c
+// in update_screen_dispatch():
+if (s_last_dispatch.source[0] != '\0') {
+    (void)snprintf(buf, sizeof(buf), "Res: %s [%s]",
+                   s_last_dispatch.status,
+                   source_display_name(s_last_dispatch.source));
+} else {
+    (void)snprintf(buf, sizeof(buf), "Result: %s", s_last_dispatch.status);
+}
+lv_label_set_text(s_dispatch_scr.lbl_result, buf);
+```
+
+```
+┌────────────────────────────────────┐
+│ ● MQTT ▲WiFi     ACTIVE     00:42 │
+├────────────────────────────────────┤
+│  Last Dispatch                     │
+│  To:    RCV-A3F2                   │
+│  Band:  433M    Proto: any         │
+│  Bits:  24      At: 00:41:07      │
+│  Res: applied [Wired]              │
+└────────────────────────────────────┘
+```
+
+If `source[0] == '\0'` in a newly built producer that zero-initialized the expanded struct but did not set a source, the tag is omitted. This is a defensive fallback for future in-tree producers, not a safe compatibility mechanism for older object code posting the pre-change struct size.
+
+#### Dispatch Flash Overlay (B.3)
+
+Append a compact source tag to the existing TX line text in `show_dispatch_overlay()`. No new `lv_label` is needed — the tag is formatted inline into the existing `lbl_tx_line`. The overlay is centered and has less tolerance for overflow than the flex rows, so truncate the receiver ID and use `[W]` / `[M]` source tags:
+
+```c
+// in show_dispatch_overlay():
+char receiver_short[9];
+(void)snprintf(receiver_short, sizeof(receiver_short), "%.8s",
+               summary->receiver_public_id[0] ? summary->receiver_public_id : "--");
+if (summary->source[0] != '\0') {
+    (void)snprintf(tx_line, sizeof(tx_line), ">TX %s %s [%s]",
+                   receiver_short, summary->band,
+                   source_short_name(summary->source));
+} else {
+    (void)snprintf(tx_line, sizeof(tx_line), ">TX %s %s",
+                   receiver_short, summary->band);
+}
+lv_label_set_text(s_overlay.lbl_tx_line, tx_line);
+```
+
+```
+┌────────────────────────────────────┐
+│ ● ▲ Wired  ACTIVE          00:42  │
+├────────────────────────────────────┤
+│                                    │
+│       >TX RCV-A3F2 433M [W]        │
+│        applied                     │
+│                                    │
+└────────────────────────────────────┘
+```
+
+The brackets visually separate the compact source tag from the other fields. When both the status bar "Wired" indicator and the overlay `[W]` tag are visible simultaneously, they serve different purposes: the status bar confirms the session is live, the overlay tag identifies which channel delivered *this specific* command.
+
+### J.4 LED — No Pattern Changes
+
+No LED pattern changes are required for USB connectivity. USB is a diagnostic and provisioning channel, not a device operational state — the LED state machine (D.2) already covers all operational states. The existing dispatch flash (single 150 ms pulse on `TX_EVENT_DISPATCH_OK` / `TX_EVENT_DISPATCH_REJECTED` in `controls.c`) fires regardless of whether the dispatch originated from MQTT or USB, providing adequate visual feedback for USB-triggered transmissions.
+
+### J.5 Changes Summary
+
+| File | Change | Type |
+|------|--------|------|
+| `events/transmitter_events.h` | Add `char source[8]` to `dispatch_summary_t` | Additive |
+| `dispatch/dispatch.c` | Add `strlcpy(summary.source, "mqtt", ...)` in `post_dispatch_event()` | Additive |
+| `serial/serial_protocol.h` | Add `serial_protocol_is_usb_host_connected()` declaration | Additive |
+| `serial/serial_protocol.c` | Add `strlcpy(summary.source, "usb", ...)` in `handle_transmit()`; implement `serial_protocol_is_usb_host_connected()`; forward `source` field in `serial_event_handler()` dispatch events | Additive |
+| `display/display_screens.h` | Add `lbl_usb` to `status_bar_t`; replace `lbl_channel` with `lbl_usb` in `screen_network_t` | Modify |
+| `display/display_screens.c` | Create "Wired" indicator in status bar; create "Wired:" row in Screen 3 (replacing channel row); merge SSID+Ch formatting | Modify |
+| `display/display.c` | Add `#include "serial/serial_protocol.h"`; add compact status uptime helper plus `source_display_name()` / `source_short_name()` helpers; toggle "Wired" indicator and reposition labels in `update_status_bar()`; add wired row refresh in `update_screen_network()`; append source display name to result text in `update_screen_dispatch()` and compact source tag in `show_dispatch_overlay()` | Modify |
+
+`screen_network_t` is a **breaking struct change** (field rename: `lbl_channel` → `lbl_usb`), not additive. All references to `lbl_channel` in `display_screens.c` and `display.c` must be updated in the same change.
+
+**Display-label convention:** User-facing text uses "Wired" for the active management-session concept. Compact overlay tags use `[W]` / `[M]` because the centered overlay line has a tight width budget. Code-level identifiers (`lbl_usb`, `source = "usb"`, function names like `serial_protocol_is_host_connected()`) remain machine-oriented — the mapping from machine identifier to display label happens in `source_display_name()`, `source_short_name()`, and in the `lv_label_set_text()` string literals. The `serial_protocol_is_usb_host_connected()` wrapper keeps the hardware dependency (`usb_serial_jtag_is_connected()`) inside the serial module and avoids the inaccurate implication that the firmware can detect a passive cable without a USB host.
+
+**Memory cost:** Two additional `lv_label` objects (status bar "Wired" indicator + Screen 3 "Wired:" row), plus a small `source[8]` field in dispatch event payloads. The exact LVGL object overhead depends on the LVGL configuration, but this is small relative to the E.6 memory budget. The dispatch source text is formatted inline into existing labels.

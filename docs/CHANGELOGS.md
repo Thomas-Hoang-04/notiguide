@@ -1,5 +1,113 @@
 # Changelogs
 
+## 2026-06-09 — Test Coverage suite (backend + web + client-web), DB-free
+
+Implemented `docs/planned/Test Coverage Plan.md` in full: a professional, infra-free unit-test
+suite plus coverage tooling, across the Spring Boot backend and both Next.js apps. **No runtime
+code was modified.** Backend: 27 test classes / 66 tests pass with no Docker/Redis/Postgres running.
+`web`: 22 tests (8 files). `client-web`: 9 tests (3 files). All library APIs and source signatures
+were verified against Context7 (MockK, springmockk, Kover, Vitest, vite-tsconfig-paths) and the
+actual source before writing.
+
+**Backend build (Modified): `backend/build.gradle.kts`**
+- Added Kover plugin `org.jetbrains.kotlinx.kover` 0.9.8 + `kover { reports { filters { excludes … } } }`
+  (entities/dto/request/response + `@Configuration` excluded from coverage).
+- Added `io.mockk:mockk:1.13.13` and `com.ninja-squad:springmockk:4.0.2`.
+- **Deviation (plan said 5.0.1):** Context7's springmockk compatibility table shows **5.x targets
+  Spring Framework 7 (Boot 4)**, while **4.x targets Spring Boot 3.x**. The project is on Boot 3.5.11,
+  so 4.0.2 is the correct line; 5.0.1 would pull Spring Framework 7 APIs.
+
+**Backend tests created (`backend/src/test/kotlin/com/thomas/notiguide/`):**
+- `HarnessSmokeTest.kt` — MockK + coroutines harness smoke check.
+- Phase 1 (pure-logic, 11): `core/redis/{RedisKeyManager,RedisTTLPolicy}Test`, `core/jwt/{TokenHashUtil,JWTManager}Test`,
+  `core/security/Argon2PwdEncoderTest`, `core/tenant/JoinCodeGeneratorTest`,
+  `core/device/{DeviceCanonical,DevicePublicIdMinter,DeviceCommandSigner}Test`,
+  `domain/store/service/SlugValidatorTest`, `domain/queue/service/NoShowPolicyTest`.
+- Phase 2 (service, MockK, 7): `domain/admin/service/{AdminAuthService,SessionService,JoinRequestService}Test`,
+  `domain/queue/service/QueueServiceTest`, `domain/device/service/{HubDiagnosticsService,EnrollmentTokenService}Test`,
+  `domain/analytics/service/AnalyticsQueryServiceTest`.
+- Phase 3 (`@WebFluxTest` slices + `@MockkBean`, 7): `support/{TestSecurityConfig,TestPrincipals}` (shared helpers),
+  `domain/admin/controller/{AuthController,AdminController}Test`, `domain/queue/controller/{QueueAdminController,QueuePublicController}Test`,
+  `domain/analytics/controller/AnalyticsControllerTest`, `domain/store/controller/StoreSlugControllerTest`,
+  `domain/device/controller/DeviceAdminControllerTest`.
+- Phase 4 (integration): `security/JwtSecurityIntegrationTest` — real `JWTManager`+`JWTToPrincipal`+`JWTAuthFilter`
+  on a mirrored security chain (in-test RSA keypair, mocked `AdminRepository`/`SessionService`); includes the
+  audit-round-4 regression guard (authorities sourced from the DB role, not the JWT claim).
+- Fixtures: `src/test/resources/rsa/test-sign.pem` + `test-sign-pub.pem` (test-only EC P-256 keypair for the signer test).
+
+**Backend deviations from plan (verified against source; tests, not runtime, were adjusted):**
+- `QueueServiceTest`: `DeviceDispatchEventBroadcaster` is in `domain.device.service`, not `core.sse` (plan typo).
+- `AnalyticsQueryServiceTest`: used a **real `AppProperties()`** — the service runs `ZoneId.of(appProperties.timezone)`
+  at construction, so a relaxed mock (empty timezone) would throw on construction.
+- `JoinRequestServiceTest`: `usernameReserved` consults only `redis.hasKey(...)`, so the test stubs that — not
+  `adminRepository.existsByUsername` (plan's described collaborator was inaccurate).
+- `EnrollmentTokenServiceTest`: `consume` uses `getAndDelete` (one-shot), so the test stubs `getAndDelete`, not `get`.
+- `AdminAuthServiceTest`: imported `kotlinx.coroutines.reactor.awaitSingleOrNull` (the project ships
+  `kotlinx-coroutines-reactor`, not `-reactive`).
+- Controller-slice 400 tests use bodies that **decode but fail `@Valid`** (e.g. `{"username":"","password":""}`),
+  not empty `{}` — a fully empty body fails Kotlin non-null decoding and is mapped by the global advice's
+  catch-all to 500, whereas a `WebExchangeBindException` is mapped to 400.
+- `JwtSecurityIntegrationTest`: `JWTProperties`/`AppProperties` are built inline inside the `@Bean` factories
+  (not exposed as beans) so the config-props binder never tries to rebind the constructor-bound `JWTProperties`
+  required fields; the stub controller is registered as an explicit `@Bean` (a nested test `@RestController` is not
+  component-scanned → would 404); `@EnableWebFluxSecurity` added to the test config; the regression-guard test uses
+  `runBlocking<Unit>` so JUnit discovers it (an expression-body `= runBlocking { … }` returns non-Unit and is
+  silently skipped).
+
+**Frontend tooling (Modified `package.json`, New `vitest.config.ts` + `vitest.setup.ts`) — `web` and `client-web`:**
+- devDeps: `vitest@3.2.6`, `@vitest/coverage-v8@3.2.6`, `vite-tsconfig-paths@5.1.4`; scripts `test`/`test:watch`/`test:coverage`.
+- `vitest.config.ts`: `environment: "node"`, `tsconfigPaths()` plugin, V8 coverage over `src/lib|store|types`.
+- **Deviation:** added `setupFiles: ["./vitest.setup.ts"]` providing an in-memory `localStorage`/`sessionStorage`.
+  The plan's config omitted it, but `web`'s store actions call Web Storage directly outside try/catch
+  (`auth.login → localStorage.setItem`, `queue.addServingTicket → sessionStorage.setItem`), which would throw
+  in the DOM-free `node` environment.
+
+**`web` tests created:** `src/lib/{password-validation,user-agent,api-error}.test.ts`,
+`src/lib/serial/support.test.ts` (asserts `hasWebSerialSupport()` is false with no `window`),
+`src/store/{auth,queue,layout}.test.ts`, `src/messages/parity.test.ts` (key-set + `<p>` count + rich-text tags).
+**`client-web` tests created:** `src/store/ticket.test.ts`, `src/types/api.test.ts`,
+`src/messages/parity.test.ts` (key-set + ICU `{placeholder}`).
+- **Deviation:** test imports use the real type locations — `AdminDto` from `@/types/admin`, `TicketDto` from
+  `@/types/queue` (the plan referenced `@/types/store`, which only exports `StoreDto`).
+- Both parity tests were proven to fail on a temporary divergence (web: removed key; client-web: injected an ICU
+  placeholder) and pass again after revert (success criterion §9.3). EN/VI key sets: web 806=806, client-web 99=99.
+
+**Coverage (Phase 8):** `./gradlew koverHtmlReport` → `backend/build/reports/kover/html/index.html`;
+`yarn test:coverage` in each app prints a V8 summary over `src/lib|store|types`. Reporting only — no failing gate.
+
+**Deliberately skipped (per spec §3.4/§3.7, noted here):**
+- `RegistrationService.register` — 6-collaborator `@Transactional` orchestrator; exercised at the controller layer
+  (`AuthController` validation) and deferred for deeper unit coverage.
+- `HubDiagnosticsService.getHubHealthSummary` and `DeviceDispatchService` — R2DBC `DatabaseClient`-backed; not
+  DB-free unit-testable without mocking a full fluent SQL chain.
+- Redis Lua-script semantics (queue lifecycle, rate limiter), `@Scheduled` timing, FCM/MQTT network behavior —
+  out of scope; only the Kotlin wrappers/contracts are covered.
+- Frontend `serial/serial-protocol` (needs a mock `SerialPort`); only the pure capability check is tested.
+
+**Post-implementation audit amendments (3 findings, all fixed; still no runtime code touched):**
+1. **`client-web` ticket-store persistence was never actually exercised** and emitted a
+   `[zustand persist middleware] … storage is currently unavailable` warning. `persist` reads
+   `window.localStorage`, which the DOM-free `node` env lacks. Fixed in `client-web/vitest.setup.ts`:
+   the in-memory storages are now also exposed on a minimal `globalThis.window`, so persistence works
+   and the warning is gone. Added a 4th `ticket.test.ts` case asserting the active ticket round-trips
+   to the `notiguide-ticket` key (`JSON.parse(localStorage.getItem(...)).state.storeId === "store-1"`).
+   client-web: 8 → 9 tests.
+2. **`web/src/lib/api-error.test.ts` had a vacuous rate-limit case** — it used `{ code: 429 }` with no
+   `rateLimitSeconds`, so production's `if (code === 429 && rateLimitSeconds)` guard was false and the
+   call fell through to the `serverError` catch-all; the test only checked "non-empty string" and never
+   exercised the branch it named. Rewritten into per-branch cases: rate-limited 429 →
+   `tooManyRequests` (and asserts the translator is called with `{ seconds: 30 }`), 429-without-seconds /
+   5xx / unrecognized → `serverError`, plus 403/404/400 and the network → `connectionLost` path.
+   web: 16 → 22 tests.
+3. **`JoinRequestServiceTest` redis-only contract was undocumented.** Added `verify { adminRepository
+   wasNot Called }` to both `usernameReserved` cases, pinning the behavior that the username check
+   consults only the Redis index (the plan had incorrectly named `adminRepository.existsByUsername` as
+   the collaborator). No new test methods; backend stays 66 tests.
+
+Final verification: backend `./gradlew cleanTest test` → BUILD SUCCESSFUL (66/27); `web` `yarn lint`
+clean (214 files) + `yarn vitest run` 22/22; `client-web` `yarn lint` clean (69 files) + `yarn vitest run`
+9/9, no persist warning.
+
 ## 2026-06-08 — Queue: inline Receivers dispatch panel (replaces dialog)
 
 Replaced the header "Gửi qua thiết bị" dialog with an always-visible, paginated Receivers

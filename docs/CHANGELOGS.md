@@ -1,5 +1,32 @@
 # Changelogs
 
+## 2026-06-08 — Queue: inline Receivers dispatch panel (replaces dialog)
+
+Replaced the header "Gửi qua thiết bị" dialog with an always-visible, paginated Receivers
+panel in the queue screen's left column (below "Currently serving").
+
+**New:**
+- `features/queue/device-dispatch-panel.tsx` — fetches `getAvailableDevices`, client-side
+  name search, per-receiver one-click dispatch (`issueDeviceTicket`), no-hub warning +
+  disabled buttons, fixed-height list with dynamic fit + pagination.
+- `features/queue/device-dispatch-card.tsx` — one receiver row (icon, name, kind, Phát vé/Dispatch).
+- `hooks/use-fit-count.ts` — ResizeObserver visible-card count.
+- `hooks/use-media-query.ts` — SSR-safe media query (gates fit-measurement at ≥2xl).
+
+**Modified:**
+- `app/[locale]/dashboard/queue/page.tsx` — removed dispatch button + standalone header
+  refresh + dialog; added `deviceRefreshSignal` (bumped by SSE + dispatch); ≥2xl bounded
+  flex layout (no page scroll); right column scrolls internally at ≥2xl.
+- `features/queue/ticket-lookup.tsx` — added waiting-list reload button (right of search).
+- `styles/queue.css` — `.queue-device-card` fixed height; ≥2xl `.queue-page-shell` definite-height reset.
+- `messages/en.json` / `vi.json` — added 7 keys, retired 6 dialog keys (806 = 806).
+- `docs/walkthrough/Web Styles.md` — Status Alert Boxes icon rule now mandates `shrink-0`.
+
+**Deleted:** `features/queue/device-dispatch-dialog.tsx`.
+
+**Device-card button** labelled **Phát vé / Dispatch** (distinct from the serving card's
+`Phục vụ` / Serve, resolving the label collision).
+
 ## 2026-06-08 — Topbar org name font coherence
 
 `components/layout/topbar.tsx` — the organization name (`org.name`) rendered at `text-sm`, one step larger than the two labels to its right: the role Badge (`text-xs font-medium`) and the store name (`text-xs`). Changed the org-name span from `text-sm` to `text-xs` so it matches both neighbors (it already shared `text-muted-foreground`). The username ("MrTien") stays `text-sm font-medium` — it's the prominent primary identity, not one of the flagged labels.

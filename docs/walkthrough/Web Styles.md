@@ -214,7 +214,7 @@ Colored alert/warning boxes are used across the app for inline status messages, 
 - **Use `text-warning`** (amber/yellow), NOT `text-warning-foreground` (dark brown). The foreground token is for text on solid warning backgrounds (buttons), not for alert boxes with transparent backgrounds.
 - **Always include `dark:` border and background overrides** — light-mode-only boxes look broken in dark theme.
 - **Use `rounded-xl`** for alert boxes, matching the rest of the glass design language.
-- **Icons** inside alert boxes inherit color from the parent `text-{severity}` — do not re-apply `text-warning` on the icon.
+- **Icons** inside alert boxes must include `shrink-0` (e.g. `size-4 shrink-0`) so they don't collapse in the flex row. The severity color is normally inherited from the parent `text-{severity}` and need not be re-applied; applying it explicitly on the icon (as the queue paused banner does — `size-4 shrink-0 text-warning`) is harmless and equally acceptable. Either is fine; `shrink-0` is mandatory.
 - Padding: `p-3` (compact) or `px-3.5 py-3` (with icon). Use `gap-2.5` between icon and text.
 
 ---

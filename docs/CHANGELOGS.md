@@ -1,5 +1,445 @@
 # Changelogs
 
+## 2026-06-08 — Topbar org name font coherence
+
+`components/layout/topbar.tsx` — the organization name (`org.name`) rendered at `text-sm`, one step larger than the two labels to its right: the role Badge (`text-xs font-medium`) and the store name (`text-xs`). Changed the org-name span from `text-sm` to `text-xs` so it matches both neighbors (it already shared `text-muted-foreground`). The username ("MrTien") stays `text-sm font-medium` — it's the prominent primary identity, not one of the flagged labels.
+
+## 2026-06-08 — Organization Metadata Display (header + account) & Public Org Endpoint
+
+Re-introduced `getMyOrg` as a member-facing organization metadata read, and surfaced the org name in the topbar and account settings. Self-managed (independent-store) admins are badged "Self-managed" / "Độc lập" with no org shown. Join-code access for owners is unchanged.
+
+**Backend — `GET /api/orgs/me` broadened to any member, public projection only:**
+- `OrganizationPublicDto` (CREATED) — `id`, `name`, `createdAt`. No join code / ownership metadata (those stay on the owner-only join-code endpoints).
+- `Organization.toPublicDto()` (entity) + `OrganizationService.getOrganizationPublic(id)` (read-only) (ADDED).
+- `OrganizationController.getMyOrg` now resolves the caller's org for ANY authenticated admin via a new `resolveOrgId(principal)`: SUPER_ADMIN → `principal.orgId`; store manager → `storeRepository.findOrgIdByStoreId(principal.storeId)`; independent/no-store → null → **404** (the client renders "self-managed"). Returns `OrganizationPublicDto`. Injected `StoreRepository`.
+- The join-code endpoints (`GET /me/join-code`, `POST /me/join-code/rotate`) are **unchanged** — still `requireOrgOwner` (SUPER_ADMIN only). No cross-tenant exposure: a caller only ever resolves their *own* org, and the join code (a secret) is never returned by `getMyOrg`.
+
+**Access model (preserved as requested):**
+- Org owner (SUPER_ADMIN) → full org spectrum incl. join code on the Organization settings tab.
+- Self-hosted store owner (independent-store ADMIN) → their store's join code on the Store settings tab (Phase 10).
+- Every member → public org name via `getMyOrg` for header/account display.
+
+**Frontend:**
+- `types/organization.ts` — `OrganizationDto` slimmed to the public shape (`id`, `name`, `createdAt`); `getMyOrg` re-added to `features/organization/api.ts`.
+- `features/organization/use-my-org.ts` (CREATED) — `useMyOrg()` returns `{ org, selfManaged, loading }`; a 404 from `getMyOrg` maps to `selfManaged: true`.
+- `components/layout/topbar.tsx` — org name (or a "Self-managed" outline badge) rendered between the username and the role badge.
+- `app/[locale]/dashboard/settings/account/page.tsx` — new "Organization" info row (org name, or the Self-managed badge for independent admins), between Role and Store.
+- i18n: added `common.selfManaged` — EN "Self-managed", VI "Độc lập" (user-approved). EN/VI parity 805 = 805.
+
+**Verification:** `yarn format`/`yarn lint` clean (201 files); `yarn build` exit 0, "Compiled successfully", TypeScript passed. Backend: arity/imports consistent (`getMyOrg` is a leaf HTTP endpoint with no internal Kotlin callers; the GitNexus index is stale so impact was confirmed by grep). Per request, explanatory comments added to new files were removed.
+
+## 2026-06-08 — Register Forms DRY Refactor + Dead-Code Removal
+
+Post-audit cleanup of the registration feature, at user request.
+
+**Removed unused API:** `getMyOrg()` in `web/src/features/organization/api.ts` had zero callers — deleted, and dropped the now-unused `OrganizationDto` import from that file.
+
+**DRY refactor of the three register forms:** `register-create-org-form.tsx`, `register-create-store-form.tsx`, and `register-join-form.tsx` were ~90% identical (same `RegisterFormProps`, username/password state + validation, username/password field markup, Back/Submit action row, and API-error mapping). Extracted the shared pieces into a new `web/src/features/auth/register-form-shared.tsx`:
+- `useRegisterForm(submitting, onSubmit)` — owns username/password state, the shared username/password validation, and the common 409/ApiError/network error mapping; exposes `buildSubmitHandler({ buildRequest, validateExtra, mapApiError })` so each form supplies only its mode-specific request payload, extra-field validation, and (JOIN only) the join-code error branch.
+- `RegisterUsernameField`, `RegisterPasswordField` (owns its own show/hide state + checklist), `RegisterFormActions` — shared presentational components.
+- `RegisterFormProps` interface (moved here; all three forms import it).
+
+Each form dropped from ~160–175 lines to ~70, now holding only its unique field, payload, validation, and submit label. Behavior is unchanged (identical markup, ids, validation order, and error handling).
+
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/organization/api.ts` | MODIFIED | Removed dead `getMyOrg()` + unused `OrganizationDto` import |
+| `web/src/features/auth/register-form-shared.tsx` | CREATED | Shared `useRegisterForm` hook + `RegisterUsernameField`/`RegisterPasswordField`/`RegisterFormActions` + `RegisterFormProps` |
+| `web/src/features/auth/register-create-org-form.tsx` | MODIFIED | Reduced to org-specific field/payload; consumes shared module |
+| `web/src/features/auth/register-create-store-form.tsx` | MODIFIED | Reduced to store-specific fields/payload; consumes shared module |
+| `web/src/features/auth/register-join-form.tsx` | MODIFIED | Reduced to join-code field/payload + join-code error map; consumes shared module |
+
+**Now-orphaned by the `getMyOrg` removal (left in place, reported to user):** the `OrganizationDto` frontend type (`types/organization.ts`), `API_ROUTES.ORGS.ME` (`lib/constants.ts`), and the backend `GET /api/orgs/me` endpoint no longer have a frontend caller. Left untouched pending a decision (the backend endpoint is a valid API surface).
+
+**Verification:** `yarn format` (3 files reflowed) · `yarn lint` clean (200 files) · `yarn build` exit 0, "Compiled successfully", TypeScript passed.
+
+## 2026-06-08 — Organization Tenancy Phase 10: Approval UI, Join-Code Management & Audit
+
+Completed the final phase of Organization Tenancy & Self-Registration and ran a full cross-phase audit. Tasks 10.1–10.2 (panels/dialogs/settings) were present from a prior session but had never been logged; Task 10.3 and the audit were completed this session. Covers plan Tasks 10.1–10.3.
+
+**Task 10.1 — Join-requests panel + approve/reject dialogs (admins page):** `JoinRequestsPanel` fetches pending requests and hides itself when empty; SUPER_ADMIN approval opens `ApproveJoinRequestDialog` (store picker, `requireStore`); store-ADMIN approves directly; reject always confirms via `RejectJoinRequestDialog`. All three use the repo's `AlertDialog` convention (`preventDefault()`, loading-disabled actions, `onOpenChange` guarded). `features/admin/api.ts` gained `listJoinRequests`/`approveJoinRequest`/`rejectJoinRequest`. The panel renders as the first child of the admins page, above the toolbar.
+
+**Task 10.2 — Join-code panel + organization settings + store settings:** Generic `JoinCodePanel` (read-only code, Copy, warning-confirmed Rotate) backed by `features/organization/api.ts`. New SUPER_ADMIN-only `settings/organization` page; `settings/store` page shows the store join-code panel only for an **independent** store (detected via the store's own `orgId === null`, fetched through the new `getStore` export — not the always-null `admin.orgId`). `settings/layout.tsx` adds the SUPER_ADMIN-only Organization tab (`Building2`).
+
+**Task 10.3 — Create-admin dialog restricted to ADMIN-only (this session):** Backend `createAdmin` now rejects `ROLE_SUPER_ADMIN` (Phase 4), so the role picker was removed from `create-admin-dialog.tsx`. The dialog always creates an ADMIN (`role: ROLES.ADMIN`), always shows the optional store field, and shows the `noteAdmin`/`noteAdminPending` hint. Removed the `role`/`setRole` state, the role `Select` block, and the `isSuperAdminRole` constant (this also eliminated a latent unimported-`AdminRole` type reference).
+
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/admin/join-requests-panel.tsx` | (prior, logged now) | Pending-request list with approve/reject; hides when empty |
+| `web/src/features/admin/approve-join-request-dialog.tsx` | (prior, logged now) | `AlertDialog` approve flow with optional store `Select` |
+| `web/src/features/admin/reject-join-request-dialog.tsx` | (prior, logged now) | Destructive `AlertDialog` reject confirmation |
+| `web/src/features/admin/api.ts` | (prior, logged now) | `listJoinRequests`/`approveJoinRequest`/`rejectJoinRequest` |
+| `web/src/app/[locale]/dashboard/admins/page.tsx` | (prior, logged now) | Renders `JoinRequestsPanel` above the toolbar |
+| `web/src/features/organization/api.ts` | (prior, logged now) | Org + store join-code GET/rotate calls |
+| `web/src/features/organization/join-code-panel.tsx` | MODIFIED | Generic join-code panel; rotate dialog hardened to repo `AlertDialog` convention (loading-disabled cancel/action, `onOpenChange` guarded by `!rotating`) |
+| `web/src/app/[locale]/dashboard/settings/organization/page.tsx` | MODIFIED | SUPER_ADMIN org join-code page; aligned to sibling single-panel layout (`mx-auto max-w-2xl`, panel-owned header) |
+| `web/src/app/[locale]/dashboard/settings/store/page.tsx` | (prior, logged now) | Independent-store join-code panel via store `orgId` |
+| `web/src/app/[locale]/dashboard/settings/layout.tsx` | (prior, logged now) | SUPER_ADMIN-only Organization tab |
+| `web/src/features/store/api.ts` | (prior, logged now) | `getStore` export |
+| `web/src/features/admin/create-admin-dialog.tsx` | MODIFIED | Role picker removed; always creates ADMIN with optional store |
+
+### Cross-phase audit (Phases 1–10)
+
+Audited the full implementation for plan adherence, UI-rule compliance, logical errors, flow inconsistency, and codebase integration (signature/arity consistency). Backend (Phases 1–7) verified clean — all `AdminPrincipal`/`createStore`/`listDevices` call-site arities consistent, every SUPER_ADMIN store/admin/device/analytics/enrollment-token path correctly fenced to the caller's org, all former device-helper SUPER_ADMIN bypasses removed, no write `@Query`/`@Modifying`, Redis ops String-serialized, registration/login/approval flows correct. Three frontend issues found and fixed:
+
+| File | Issue | Fix |
+|---|---|---|
+| `web/src/features/auth/register-path-selector.tsx` | **Build-blocking (TS2345):** `titleKey`/`descKey` typed as `string`, incompatible with next-intl's strict key-union parameter on `t()` | Changed `PATHS` to `as const` (matches the repo's `... as const` dynamic-key idiom used in `settings/layout.tsx`) so keys infer as literal unions |
+| `web/src/features/organization/join-code-panel.tsx` | Rotate **warning dialog** did not disable cancel/action while rotating and left `onOpenChange` unguarded — deviated from the repo's `AlertDialog` convention | Added `disabled={rotating}` to cancel + action and guarded `onOpenChange` with `!rotating` |
+| `web/src/app/[locale]/dashboard/settings/organization/page.tsx` | Layout inconsistent with sibling single-panel settings pages (no width constraint, redundant page `<h1>` duplicating the panel header) | Switched to `mx-auto max-w-2xl` and rely on the panel's own header (matches `slugs`/`store`) |
+
+**Verification:** `cd web && yarn lint` → clean (199 files); `yarn format` → 1 file reflowed; `yarn build` → exit 0, "Compiled successfully", TypeScript checks passed with no errors. EN/VI i18n key sets confirmed at parity (804 keys each).
+
+**Not changed (reviewed, intentionally left):** `AdminService.listAllAdmins` is now dead code (harmless, out of plan scope); `organization.join_code` declared as `TEXT NOT NULL` + a separate unique index rather than inline `UNIQUE` (functionally equivalent, internally consistent across schema.sql and the migration); `register-join-form` 400-error string match is English-only (backend `HttpException` messages are English server-side, so it works today). The store-settings page passes inline join-code callbacks (memoized by the enabled React Compiler + identical-value `setCode` bail-out — no refetch loop).
+
+## 2026-06-05 — Organization Tenancy Phase 9: Register Page
+
+Implemented the register page and its supporting components. Covers plan Tasks 9.1–9.3.
+
+**Task 9.1 — Register route shell + path selector:** The register page mirrors the login page shell (glass card, orbs, language/theme toggles). It holds a `view` state that gates which form or terminal screen is shown. `RegisterPathSelector` renders three option rows (Create Org, Create Store, Join) as styled buttons leading to their respective form views.
+
+**Task 9.2 — Three registration forms:** `RegisterCreateOrgForm` (username + password + org name), `RegisterCreateStoreForm` (username + password + store name + optional address), `RegisterJoinForm` (username + password + join code). All three reuse the same local validation pattern from `create-admin-dialog.tsx`, surface username-taken (409) and join-code (400) API errors as field errors, and delegate success to the parent page via `onSubmit`.
+
+**Task 9.3 — Pending/active screen + login link/banner:** `RegisterPendingScreen` renders the terminal state after registration — a warning box (pending) or success box (active) plus a "Go to login" `Button` rendered as a `Link`. The login page gains a `pendingBanner` state triggered when login returns a 403 with `"awaiting approval"` (ordered before the existing `"not been verified"` branch), plus a "Create an account" link below the submit button.
+
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/auth/register-path-selector.tsx` | CREATED | Three-option path selector component |
+| `web/src/app/[locale]/(auth)/register/page.tsx` | CREATED | Register page shell with view state machine |
+| `web/src/features/auth/register-create-org-form.tsx` | CREATED | Create-org registration form |
+| `web/src/features/auth/register-create-store-form.tsx` | CREATED | Create-store registration form |
+| `web/src/features/auth/register-join-form.tsx` | CREATED | Join-org registration form |
+| `web/src/features/auth/register-pending-screen.tsx` | CREATED | Terminal pending/active result screen |
+| `web/src/app/[locale]/(auth)/login/page.tsx` | MODIFIED | Added `pendingBanner` state, awaiting-approval catch branch, pending banner UI, and "Create an account" link |
+
+## 2026-06-04 — Organization Tenancy Phase 8: Frontend Foundation (Types, Routes, Auth Store, i18n)
+
+Implemented the frontend foundation layer for Organization Tenancy. Covers plan Tasks 8.1–8.2.
+
+**Task 8.2 — i18n keys (EN + VI mirrored, parity verified):**
+- `auth` namespace: added `createAccountLink`, `haveAccountLink`, `awaitingApproval` keys.
+- `register` namespace: created as a new top-level namespace (29 keys) covering path selection, form labels/placeholders, submit actions, success/pending result screens, and validation messages.
+- `admins` namespace: appended join-request keys (`requestsTitle`, `requestsEmpty`, `requestApprove/Reject`, approve/reject dialog titles and confirm strings, toast keys) and join-code management keys (`joinCodeTitle/Desc/Copy/Copied/Rotate/RotateConfirm`).
+- `settings` namespace: appended `organizationTab` and `organizationTitle`.
+- `navigation`, `settings`, `admins` namespaces (all three): relabeled `roleSuperAdmin` → "Organization owner" / "Chủ tổ chức" and `roleAdmin` → "Store manager" / "Quản lý cửa hàng".
+
+| File | Action | Summary |
+|---|---|---|
+| `web/src/types/admin.ts` | MODIFIED | Added `orgId: string \| null` to `AdminDto` (after `role`). Appended `RegisterMode`, `RegisterOutcome`, `RegisterRequest`, `RegisterResponse`, `JoinRequestDto` types. |
+| `web/src/types/organization.ts` | CREATED | `OrganizationDto` and `JoinCodeResponse` types. |
+| `web/src/lib/constants.ts` | MODIFIED | Added `REGISTER` to `API_ROUTES.AUTH`. Added `REQUESTS`, `APPROVE_REQUEST`, `REJECT_REQUEST` to `API_ROUTES.ADMINS`. Added `JOIN_CODE`, `JOIN_CODE_ROTATE` to `API_ROUTES.STORES`. Added new `API_ROUTES.ORGS` group (`ME`, `JOIN_CODE`, `JOIN_CODE_ROTATE`). |
+| `web/src/store/auth.ts` | MODIFIED | Added `orgId: string \| null` to `AuthState` interface (Derived block), `deriveState()` return, and `create()` initial state. |
+| `web/src/features/auth/api.ts` | MODIFIED | Added `register(request: RegisterRequest)` export (POST to `API_ROUTES.AUTH.REGISTER`, `skipAuth: true`). Extended type import to include `RegisterRequest`, `RegisterResponse`. |
+
+## 2026-06-04 — Organization Tenancy Phase 7: Join-Request Approval
+
+Implemented the join-request list/approve/reject HTTP layer. A SUPER_ADMIN sees and acts on all ORG-target requests within their organization (must supply a store in that org to approve); a store ADMIN sees and acts on STORE-target requests for their own store (must be verified to approve). Reject is idempotent — a missing request returns 204 immediately. Covers plan Task 7.1.
+
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../domain/admin/controller/JoinRequestController.kt` | CREATED | `GET /api/admins/requests` (list by org or store scope); `POST /{requestId}/approve` (ORG: SUPER_ADMIN + store-in-org required; STORE: verified store ADMIN); `POST /{requestId}/reject` (same scope checks, idempotent on missing request). Top-level `data class ApproveJoinRequest(storeId: UUID?)` for the approve request body. |
+
+## 2026-06-04 — Organization Tenancy Phase 6: Registration, Join Requests & Login Feedback
+
+Implemented self-registration for new organizations and independent stores, Redis-backed pending join requests, and password-gated login feedback for users awaiting approval. Covers plan Tasks 6.1–6.3.
+
+### Task 6.1 — JoinRequestService + Redis keys/TTL + JoinRequestDto
+
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../domain/admin/service/JoinRequestService.kt` | CREATED | `create(username, passwordHash, targetType, targetId)` — reserves username in Redis via `setIfAbsent`, writes payload JSON, adds to org/store index sorted set; `usernameReserved(usernameLower)` — key-existence check; `findPendingByUsername(usernameLower)` — resolves payload for login hint; `get(requestId)` — deserialized payload lookup; `listByOrg`/`listByStore` — hydrate+prune index entries; `approve(requestId, assignStoreId, verifierId)` — lock-guarded materialise admin row + cleanup; `reject(requestId)` — cleanup all keys. Nested `enum class TargetType { ORG, STORE }` and `data class JoinRequestPayload`. |
+| `backend/.../core/redis/RedisKeyManager.kt` | MODIFIED | Added `joinRequest(id)`, `joinRequestUsername(lower)`, `joinRequestOrgIndex(orgId)`, `joinRequestStoreIndex(storeId)`, `joinRequestLock(id)` key helpers. |
+| `backend/.../core/redis/RedisTTLPolicy.kt` | MODIFIED | Added `JOIN_REQUEST = Duration.ofDays(7)`. |
+| `backend/.../domain/admin/dto/JoinRequestDto.kt` | CREATED | `data class JoinRequestDto(requestId, username, createdAt)` — public projection for list endpoints. |
+
+### Task 6.2 — RegisterRequest/Response, RegistrationService, `/api/auth/register` (201/202)
+
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../domain/admin/request/RegisterRequest.kt` | CREATED | `enum class RegisterMode { CREATE_ORG, CREATE_STORE, JOIN }` + `data class RegisterRequest` with full jakarta validation on `username`/`password` (mirrors `CreateAdminRequest`) and nullable `orgName`/`storeName`/`storeAddress`/`joinCode` with `@Size` bounds. |
+| `backend/.../domain/admin/response/RegisterResponse.kt` | CREATED | `enum class RegisterOutcome { ACTIVE, PENDING }` + `data class RegisterResponse(outcome, role: AdminRole?, targetType: String?)`. |
+| `backend/.../domain/admin/service/RegistrationService.kt` | CREATED | `@Transactional register(request)` — checks username availability (DB + Redis), hashes password, dispatches to `createOrg`/`createStore`/`join`. `createOrg`: saves `Organization` first (FK), saves `Admin(ROLE_SUPER_ADMIN)`, backfills `org.createdBy`; returns `ACTIVE`. `createStore`: delegates to `StoreService.createStore(CreateStoreRequest(name, address), orgId=null)`, saves `Admin(ROLE_ADMIN)`; returns `ACTIVE`. `join`: validates join code prefix via `JoinCodeGenerator.ORG_PREFIX`/`STORE_PREFIX`, validates target exists, rejects org-owned stores, calls `JoinRequestService.create`; returns `PENDING`. Private `generateUniqueOrgCode()` (5-attempt loop). |
+| `backend/.../domain/admin/controller/AuthController.kt` | MODIFIED | Injected `RegistrationService` + `JoinRequestService`; added `POST /register` endpoint — returns `201 CREATED` for ACTIVE outcomes, `202 ACCEPTED` for PENDING. Added all required imports (`RegisterRequest`, `RegisterResponse`, `RegisterOutcome`, `RegistrationService`, `JoinRequestService`, `HttpStatus`). |
+
+### Task 6.3 — PendingJoinRequestException + login "awaiting approval" feedback
+
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../core/exception/HttpException.kt` | MODIFIED | Added `class PendingJoinRequestException : HttpException(HttpStatus.FORBIDDEN, "Your join request is awaiting approval")` — mirrors `UnverifiedAdminException` style. |
+| `backend/.../domain/admin/controller/AuthController.kt` | MODIFIED | `login` — when `findByUsername` returns null, checks `joinRequestService.findPendingByUsername` and verifies password against stored hash before throwing `PendingJoinRequestException` (403). Wrong password or non-pending username still yields generic `BadCredentialsException` (401) — no enumeration. |
+
+### Amendment vs. plan
+- **`CreateStoreRequest` 2-arg call (Task 6.2):** all fields except `name` have defaults, so `CreateStoreRequest(name = storeName, address = ...)` compiles as-is. No deviation from plan.
+
+## 2026-06-04 — Organization Tenancy Phase 5: Join-Code Management
+
+Introduced the `OrganizationService` + `OrganizationController` (`/api/orgs`) to let a SUPER_ADMIN view their org and view/rotate its join code. Added symmetric join-code endpoints to `StoreController` (`/{id}/join-code`, `/{id}/join-code/rotate`) backed by two new `StoreService` methods, both of which reject org-owned stores with 409 (those stores are joined via the org code). `JoinCodeResponse` is a shared response DTO used by both controllers. Covers plan Tasks 5.1–5.2.
+
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../domain/organization/response/JoinCodeResponse.kt` | CREATED | Shared `data class JoinCodeResponse(val joinCode: String)` used by both org and store join-code endpoints. |
+| `backend/.../domain/organization/service/OrganizationService.kt` | CREATED | `getOrganization(id)` (read-only), `rotateJoinCode(id)` (saves `org.copy(joinCode = newCode)`), private `generateUniqueJoinCode()` (5-attempt loop using `existsByJoinCode`, `ORG_PREFIX`). |
+| `backend/.../domain/organization/controller/OrganizationController.kt` | CREATED | `GET /api/orgs/me`, `GET /api/orgs/me/join-code`, `POST /api/orgs/me/join-code/rotate` — all gated by `requireOrgOwner` which returns `principal.orgId` only for SUPER_ADMIN. |
+| `backend/.../domain/store/service/StoreService.kt` | MODIFIED | Added `rotateStoreJoinCode(storeId)` and `getStoreJoinCode(storeId)` (both `@Transactional`); both reject `store.orgId != null` with `ConflictException`; `getStoreJoinCode` backfills a missing code via the existing `generateUniqueStoreJoinCode()`. |
+| `backend/.../domain/store/controller/StoreController.kt` | MODIFIED | Added `GET /{id}/join-code` and `POST /{id}/join-code/rotate`, both gated by `storeAccess.requireStoreAccess(principal, id)`; imported `JoinCodeResponse` from `domain.organization.response`. |
+
+## 2026-06-04 — Organization Tenancy Phase 4: Org-Scoped Reads & Writes
+
+Fenced every SUPER_ADMIN listing and management action to the caller's organization. Previously a SUPER_ADMIN saw/acted on all stores, admins, devices, analytics, and enrollment tokens globally; now each is scoped to `store.org_id == principal.orgId` (and an independent-store ADMIN's path is unchanged). Covers plan Tasks 4.1–4.6.
+
+### Store creation & listing (Task 4.1)
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../domain/store/service/StoreService.kt` | MODIFIED | `createStore(request, orgId: UUID?)` — generates a unique store `join_code` only for independent stores (`orgId == null`); `listStores(orgId, page, size)` scopes via `countByOrgId`/`findByOrgIdPaged`; added private `generateUniqueStoreJoinCode()`. |
+| `backend/.../domain/store/controller/StoreController.kt` | MODIFIED | `createStore`/`listStores` resolve `principal.orgId` (403 if absent) and pass it; `deleteStore` now calls `storeAccess.requireStoreAccess(principal, id)` before delete (closes a cross-org delete hole). |
+
+### Admin listing (Task 4.2)
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../domain/admin/repository/AdminRepository.kt` | MODIFIED | `findByOrgPaged`/`countByOrg` — org membership = own `org_id` (SUPER_ADMIN) OR store's `org_id` (assigned ADMIN) OR unassigned `ROLE_ADMIN` attributed via creator's `org_id` (`created_by`). |
+| `backend/.../domain/admin/service/AdminService.kt` | MODIFIED | `listAdminsByOrg(orgId, page, size)` mirroring `listAllAdmins` with the org-scoped count/page + `resolveStoreNames`. |
+| `backend/.../domain/admin/controller/AdminController.kt` | MODIFIED | `listAdmins`: when `storeId` is null, `requireSuperAdmin` + scope to `principal.orgId` via `listAdminsByOrg` (was global `listAllAdmins`). |
+
+### Device listing & hub health (Task 4.3)
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../domain/device/service/DeviceQueryService.kt` | MODIFIED | `listDevices(kind, storeId, orgId)` — added `AND (:orgId IS NULL OR s.org_id = :orgId)` (query already LEFT JOINs `store s`) + `bindNullable`. |
+| `backend/.../domain/device/service/DeviceDispatchService.kt` | MODIFIED | Updated the internal `listDevices(...)` caller to pass `orgId = null` (dispatch is already store-scoped). |
+| `backend/.../domain/device/service/HubDiagnosticsService.kt` | MODIFIED | `getHubHealthSummary(storeId, orgId)` — when `storeId == null && orgId != null`, append `AND store_id IN (SELECT id FROM store WHERE org_id = :orgId)` and bind it (mirrors the conditional `storeId` bind pattern). |
+| `backend/.../domain/device/controller/DeviceAdminController.kt` | MODIFIED | `listDevices`/`getHubHealth` compute an org scope (`principal.orgId` only when no explicit `storeId` and SUPER_ADMIN) and pass it; ADMIN store-local path unchanged. |
+
+### Analytics overview (Task 4.4)
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../domain/analytics/repository/AnalyticsEventRepository.kt` | MODIFIED | `getOverview` adds `AND (:orgId IS NULL OR s.org_id = :orgId)` (existing store join); `getOverviewDailyThroughput` (no join) adds `AND (:orgId IS NULL OR store_id IN (SELECT id FROM store WHERE org_id = :orgId))`; both bound via `bindNullable`. |
+| `backend/.../domain/analytics/service/AnalyticsQueryService.kt` | MODIFIED | `orgId: UUID?` threaded as first param of `getOverviewRealtime`/`getOverview`/`getOverviewThroughput`; realtime uses `findActiveByOrgId(orgId)` when non-null. |
+| `backend/.../domain/analytics/controller/AnalyticsController.kt` | MODIFIED | The three overview endpoints pass `principal.orgId`; `requireSuperAdmin` retained; store-specific endpoints (already `requireStoreAccess`-fenced) unchanged. |
+
+### Admin management fenced to org (Task 4.5)
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../domain/admin/repository/AdminRepository.kt` | MODIFIED | Added `countByOrgIdAndRole(orgId, role)` (per-org SUPER_ADMIN count) using `CAST(:role AS admin_role)`. |
+| `backend/.../domain/admin/service/AdminService.kt` | MODIFIED | Added `belongsToOrg`/`requireSameOrg` (3-clause, matching the listing membership) + `requireSameIndependentStore` + nested `sealed interface VerifyScope { Org, IndependentStore }`. `createAdmin(request, createdById, actorOrgId)` rejects `ROLE_SUPER_ADMIN` (created only via registration) and requires a same-org `storeId`; `verifyAdmin(adminId, verifierId, scope)` — Org scope → `requireSameOrg`, IndependentStore scope → `requireSameIndependentStore` + reject super-admin target; `updateAdminStore(id, storeId, actorOrgId)` fences both the target and the destination store; `deleteAdmin(id, requesterId, actorOrgId)` fences the target and uses the **per-org** last-owner guard (`countByOrgIdAndRole`, not global). |
+| `backend/.../domain/admin/controller/AdminController.kt` | MODIFIED | Added `requireOrgId(principal)`; `createAdmin`/`updateAdminStore`/`deleteAdmin` pass `actorOrgId`; `verifyAdmin` widened — SUPER_ADMIN verifies via `VerifyScope.Org`, a verified independent-store ADMIN verifies same-store co-owners via `VerifyScope.IndependentStore`. |
+
+### Enrollment-token scope (Task 4.6)
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../domain/device/service/EnrollmentTokenService.kt` | MODIFIED | Injected `StoreAccessService`. `issue` requires a concrete accessible store (SUPER_ADMIN must specify a store in its org; no new storeless tokens). `list` filters records to the caller's accessible stores (`findIdsByOrgId` set for SUPER_ADMIN, own store for ADMIN; legacy storeless records dropped). `revoke` fences by the token's store (403 for legacy storeless). |
+
+### Amendment vs. plan
+- **`requireSameOrg` 3-clause membership (Task 4.5):** the plan's literal `requireSameOrg` was 2-clause, which would make an unassigned ADMIN that the org owner can *see/created* unmanageable (cannot assign a store), breaking the create-then-assign flow. Implemented as a 3-clause check mirroring `findByOrgPaged`/`countByOrg` so listing and management stay consistent.
+
+### Verification (by inspection + subagent review)
+- Arity confirmed across the repo for `listDevices`, `getHubHealthSummary`, `getOverview*`, `createAdmin`, `verifyAdmin`, `updateAdminStore`, `deleteAdmin` — every caller updated.
+- R2DBC: every new `:orgId` placeholder is bound in all code paths (no orphan placeholder / unbound param); all new `@Query` are SELECT-only (no `@Modifying`); writes remain entity `.save()`.
+- Adversarial cross-org trace (admin management): a target in org B never satisfies `belongsToOrg(orgA)`; every mutation guard runs before `save`/`delete`; last-owner deletion is per-org.
+- Not run: backend build/test (separate audit flow). Public controller signatures for enrollment tokens unchanged → `EnrollmentTokenController` unaffected.
+
+## 2026-06-04 — Organization Tenancy Phase 3: Org-Aware Authorization Core
+
+Replaced the static `StoreAccessUtil` object with an injectable, org-aware `StoreAccessService` bean. SUPER_ADMIN is no longer a blanket bypass: it may now act on a store only when `store.org_id == principal.orgId` (one indexed DB lookup via `StoreRepository.findOrgIdByStoreId`); ADMIN keeps the cheap in-memory `principal.storeId == storeId` check. Every SUPER_ADMIN bypass around store-owned devices was removed so the service is the single chokepoint.
+
+### Files Created
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/shared/principal/StoreAccessService.kt` | CREATED | `@Service` with `suspend fun requireStoreAccess(principal, storeId)`. SUPER_ADMIN: requires `principal.orgId != null` and `storeRepository.findOrgIdByStoreId(storeId) == orgId`, else `ForbiddenException("You do not have access to this store")`. ADMIN: `principal.storeId == storeId`, else same `ForbiddenException`. Private `isSuperAdmin` checks `authorities` for `ROLE_SUPER_ADMIN`. Exception type/message mirror the deleted util verbatim. |
+
+### Files Deleted
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/shared/principal/StoreAccessUtil.kt` | DELETED | Static `object` removed; superseded by `StoreAccessService`. |
+
+### Files Modified — call-site injection (replace import, add `private val storeAccess: StoreAccessService` ctor param, swap `StoreAccessUtil.requireStoreAccess` → `storeAccess.requireStoreAccess`)
+| File | Action | Calls swapped |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/controller/QueueAdminController.kt` | MODIFIED | 15 |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/analytics/controller/AnalyticsController.kt` | MODIFIED | 6 |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/store/controller/StoreController.kt` | MODIFIED | 4 |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/store/controller/ServiceTypeController.kt` | MODIFIED | 4 |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/store/controller/StoreSlugController.kt` | MODIFIED | 4 |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/controller/DeviceAdminController.kt` | MODIFIED | 3 |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/controller/AdminController.kt` | MODIFIED | 1 |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/UsbDispatchPayloadService.kt` | MODIFIED | 1 |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/PassiveDeviceRegistrationService.kt` | MODIFIED | 1 |
+
+### Files Modified — SUPER_ADMIN device-helper bypass removal (ctor injection + control-flow rewrite)
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceLifecycleService.kt` | MODIFIED | `loadAccessibleDevice`: removed `if (isSuperAdmin(principal)) return device` early return. New flow — storeless device: SUPER_ADMIN allowed, ADMIN gets "needs assigned store" `ForbiddenException`; store-assigned device: both roles go through `storeAccess.requireStoreAccess` (org fence). 1 `requireStoreAccess` call. `isSuperAdmin` helper retained (used by storeless branch). |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/RfCodeService.kt` | MODIFIED | `loadAccessibleDevice`: identical rewrite — SUPER_ADMIN no longer bypasses the store fence for an RF-code device already assigned to a store. 1 `requireStoreAccess` call. `isSuperAdmin` retained. |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceApprovalService.kt` | MODIFIED | `requireDeviceAccess` changed `private fun` → `private suspend fun` (now calls suspend `requireStoreAccess`); removed `if (isSuperAdmin(principal)) return`. New flow — storeless device: SUPER_ADMIN allowed, ADMIN error; store-assigned device: both roles fenced via `requireStoreAccess`. Callers `approve`/`reject` already suspend (verified). Also swapped the 1 direct `approve` call on `request.storeId`. 2 `requireStoreAccess` calls total. `isSuperAdmin` retained. |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceQueryService.kt` | MODIFIED | `renameDevice`: removed the `if (!isSuperAdmin(principal)) { … }` wrapper. New flow — storeless device: SUPER_ADMIN allowed, ADMIN gets "needs assigned store to rename devices" error; store-assigned device: both roles fenced via `requireStoreAccess`. 1 `requireStoreAccess` call. `isSuperAdmin` retained. |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged Phase 3 org-aware authorization. |
+
+### Adaptation note (escalation)
+- For `DeviceApprovalService.requireDeviceAccess`, the plan's literal "remove the `if (isSuperAdmin) return` branch" would have routed a **SUPER_ADMIN + storeless** device into the ADMIN "needs assigned store" error, contradicting the plan's own truth table ("SUPER_ADMIN + storeless device stays allowed"). To preserve the intended security outcome and keep all four device helpers uniform, the storeless branch was rewritten as: SUPER_ADMIN allowed, ADMIN error — matching `loadAccessibleDevice`/`renameDevice`. `reject` calls `requireDeviceAccess` unconditionally; `approve` only calls it when `device.storeId != null` (and separately fences `request.storeId` at the top), so both paths are consistent.
+
+### Verification (by inspection)
+- `grep -rn "StoreAccessUtil" src/main/kotlin` → ZERO results (object deleted, all imports/calls migrated).
+- `grep -rn "storeAccess.requireStoreAccess" src/main/kotlin` → 44 calls across 13 files: 37 in controllers (Queue 15, Analytics 6, Store 4, ServiceType 4, StoreSlug 4, DeviceAdmin 3, Admin 1) + 7 in services (UsbDispatch 1, DeviceApproval 2, DeviceQuery 1, DeviceLifecycle 1, RfCode 1, Passive 1).
+- All replaced call sites already sit in `suspend` functions — no enclosing-function signature changes needed except `DeviceApprovalService.requireDeviceAccess` (now `suspend`), whose callers `approve`/`reject` are already suspend.
+- **Audit finding (post-Phase 3 fix):** `QueueAdminController.streamQueueEvents` is a non-suspend `fun` returning `Flux<ServerSentEvent<QueueSseEvent>>` (required by WebFlux SSE wire). The Phase 3 migration placed a direct `storeAccess.requireStoreAccess(principal, storeId)` call at line 211, but suspend functions cannot be called from a non-suspend context → compile error. Fix: bridged via `mono { storeAccess.requireStoreAccess(principal, storeId) }.thenMany(Flux.merge(events, heartbeat))`. The `mono {}` builder from `kotlinx-coroutines-reactor` runs the suspend check inside a coroutine, propagates `ForbiddenException` as a reactor error before any stream element is emitted, and leaves the function signature (and SSE wire behaviour) unchanged. Import `kotlinx.coroutines.reactor.mono` added alphabetically.
+- Four audited device helpers re-read in final state; truth table confirmed uniform — SUPER_ADMIN + store-assigned → `requireStoreAccess` (org fence); SUPER_ADMIN + storeless → allowed; ADMIN + store-assigned → `requireStoreAccess`; ADMIN + storeless → unchanged error.
+- In each audited file, `isSuperAdmin` (still called from the storeless branch), `ForbiddenException`, and `AdminRole` imports remain used (count ≥ 2 each) — no orphaned imports introduced.
+- `StoreController` keeps its own local `isSuperAdmin`/`requireSuperAdmin` helpers (unrelated to store-access; used by create/list/delete/update flows) — left intact.
+- `ForbiddenException` confirmed to live in `core/exception/HttpException.kt` (package `com.thomas.notiguide.core.exception`); import path in the plan is correct.
+- All new constructor params injected as `private val`; Spring wires the singleton `StoreAccessService` bean.
+- Not run: backend build/test, per repository instruction not to build after implementation. GitNexus index is stale (still lists the deleted `StoreAccessUtil`) — expected until re-analyze.
+
+## 2026-06-04 — Organization Tenancy Phase 2: Domain Model
+
+### Files Created
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/organization/entity/Organization.kt` | CREATED | `@Table("organization")` data class with `id`, `name`, `joinCode`, `createdBy` (plain column — no `@CreatedBy` because public registration has no security context), `@CreatedDate createdAt`, `@LastModifiedDate updatedAt`; `toDto()` mapper |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/organization/dto/OrganizationDto.kt` | CREATED | DTO mirroring all Organization fields |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/organization/repository/OrganizationRepository.kt` | CREATED | `CoroutineCrudRepository<Organization, UUID>` with two SELECT-only `@Query` methods: `findByJoinCode` and `existsByJoinCode` |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/tenant/JoinCodeGenerator.kt` | CREATED | `object` with `ORG_PREFIX = "o_"`, `STORE_PREFIX = "s_"`, and `generate(prefix)` using `SecureRandom` + `Base64.getUrlEncoder().withoutPadding()` (9 bytes → 12 url-safe chars) |
+
+### Files Modified
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/entity/Admin.kt` | MODIFIED | Added `@Column("org_id") val orgId: UUID? = null` after `role`, before `storeId`; updated `toDto()` to pass `orgId = orgId`; updated `toPrincipal()` to pass `orgId = orgId` |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/dto/AdminDto.kt` | MODIFIED | Added `val orgId: UUID?` before `storeId` |
+| `backend/src/main/kotlin/com/thomas/notiguide/shared/principal/AdminPrincipal.kt` | MODIFIED | Added `val orgId: UUID?` to constructor before `storeId` |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/jwt/JWTToPrincipal.kt` | MODIFIED | Added `orgId = admin.orgId` in `AdminPrincipal(...)` construction |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/store/entity/Store.kt` | MODIFIED | Added `@Column("org_id") val orgId: UUID? = null` and `@Column("join_code") val joinCode: String? = null` after `publicId`; updated `toDto()` to pass `orgId = orgId` (joinCode intentionally excluded from DTO) |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/store/dto/StoreDto.kt` | MODIFIED | Added `val orgId: UUID?` after `publicId`; `joinCode` deliberately NOT added (served via dedicated join-code endpoints only) |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/store/repository/StoreRepository.kt` | MODIFIED | Added six SELECT-only `@Query` methods: `findOrgIdByStoreId`, `findByOrgIdPaged`, `countByOrgId`, `findActiveByOrgId`, `findIdsByOrgId`, `findByJoinCode` |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged Phase 2 domain model changes |
+
+### Verification (by inspection)
+- `AdminPrincipal(` grep: exactly two construction sites — `Admin.toPrincipal()` and `JWTToPrincipal.convert()` — both updated to pass `orgId`.
+- `StoreDto(` grep: exactly one construction site — `Store.toDto()` — updated to pass `orgId`. No other mapper code constructs `StoreDto` directly.
+- `AdminDto(` grep: exactly one construction site — `Admin.toDto()` — updated to pass `orgId`. No other mapper code constructs `AdminDto` directly.
+- `Admin(` direct entity construction at `AdminService:77` uses named parameters only; `orgId` defaults to `null` — safe with no update needed. All `.copy()` calls in `AdminService` name specific fields and leave `orgId` unchanged — correct.
+- All new `@Query` methods are SELECT-only; no `@Modifying` annotations introduced.
+- `Organization.createdBy` uses plain `@Column` (not `@CreatedBy`) — correct, since public registration provides no Spring Security authentication context.
+- No unused imports introduced; all imports named.
+- Not run: backend build/test, per repository instruction not to build after implementation.
+
+## 2026-06-04 — Organization Tenancy Phase 1: DB Tenancy Schema
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/resources/db/schema.sql` | MODIFIED | Added `organization` table (UUID PK, `name`, `join_code` UNIQUE, nullable `created_by`, timestamps) immediately after `CREATE TYPE admin_role`; added `org_id UUID REFERENCES organization` and `join_code TEXT` columns to `store`; added `uq_store_join_code` partial unique index and `idx_store_org` index on `store`; added `org_id UUID REFERENCES organization` column to `admin`; replaced `chk_superadmin_no_store` CHECK with `chk_admin_tenancy` (SUPER_ADMIN requires `org_id IS NOT NULL AND store_id IS NULL`; ADMIN requires `org_id IS NULL`); added `idx_admin_org` index on `admin`; added deferred `fk_organization_created_by` FK (`organization.created_by → admin.id ON DELETE SET NULL`) as the last statement to break the circular dependency |
+| `backend/src/main/resources/db/migration/002_organization_tenancy.sql` | CREATED | Standalone idempotent migration for existing environments: (1) DDL section with `CREATE TABLE IF NOT EXISTS organization`, `ALTER TABLE … ADD COLUMN IF NOT EXISTS` for `store.org_id`, `store.join_code`, `admin.org_id`, `CREATE … INDEX IF NOT EXISTS` for all three new indexes, and a `DO/IF NOT EXISTS pg_constraint` block for the deferred FK; (2) one-time guarded backfill inside a `DO/IF NOT EXISTS (SELECT 1 FROM organization)` block that inserts a Default Organization and back-fills all existing stores and SUPER_ADMINs into it; (3) CHECK swap: `DROP CONSTRAINT IF EXISTS chk_superadmin_no_store`, `DROP CONSTRAINT IF EXISTS chk_admin_tenancy`, then `ADD CONSTRAINT chk_admin_tenancy` — this order ensures all rows satisfy the new constraint before it is applied |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged Phase 1 DB tenancy schema changes |
+
+### Verification (by inspection)
+- `organization` table is created before `store` in schema.sql — `store.org_id REFERENCES organization(id)` is valid on first run.
+- `admin.org_id REFERENCES organization(id)` is valid because `organization` precedes `admin` in declaration order.
+- `fk_organization_created_by` (`organization.created_by → admin.id`) is the very last statement — `admin` table exists by that point, breaking the circular dependency correctly.
+- Migration section order is DDL → backfill → CHECK swap: backfill runs while the old constraint (or no constraint) is still in place, so existing SUPER_ADMINs with `org_id IS NULL` are filled before the stricter CHECK is added.
+- All migration DDL is `IF NOT EXISTS`/`IF EXISTS`-guarded; backfill is wrapped in `IF NOT EXISTS (SELECT 1 FROM organization)` — safe to re-run.
+- No backfill needed in schema.sql (fresh DB has no rows).
+- Not run: backend build/test, per repository instruction not to build after implementation.
+
+## 2026-06-04 — Organization Tenancy & Self-Registration Plan/Spec Audit
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/Organization Tenancy and Self-Registration Plan.md` | MODIFIED | Finalized implementation readiness: added concrete GitNexus impact notes, closed SUPER_ADMIN device-scope bypasses (`DeviceLifecycleService`, `RfCodeService`, `DeviceApprovalService`, `DeviceQueryService`), added org-scoped enrollment-token work, widened `verifyAdmin` for independent-store co-owner approval, made last-SUPER_ADMIN deletion org-scoped, made Redis join-request reservation/approval race-safe, returned `202 Accepted` for pending JOIN, corrected settings i18n keys, enforced role display relabeling, and aligned approve/reject/rotate UI with existing `AlertDialog` conventions |
+| `docs/spec/Organization Tenancy and Self-Registration Spec.md` | MODIFIED | Aligned the approved design with implementation-ready decisions: `/api/orgs/me` join-code endpoints, existing `auth` rate-limit tier, atomic pending username reservation, no-cache v1 `StoreAccessService`, enrollment-token org scoping, per-org last-owner guard, option-row register selector, and `AlertDialog` approval/reject confirmations |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this documentation-only audit, API verification, and skipped verification commands |
+
+### Verification
+- Audited the plan against the spec, `CLAUDE.md`, `docs/walkthrough/Web Styles.md`, and current backend/frontend source surfaces.
+- Verified API syntax/usage with Context7 for Spring Data R2DBC, Spring Security WebFlux, Next.js App Router, next-intl, Base UI composition, and Spring Data Redis value operations.
+- Verified exact Spring Data Redis 3.5.9 reactive ZSET signatures from the local Gradle source jar (`reverseRange` requires `Range<Long>`).
+- Ran GitNexus impact analysis for `StoreAccessUtil` (MEDIUM) and `AdminPrincipal` (HIGH); incorporated the blast radius into the plan.
+- Used a reviewer subagent for a second read-only pass and folded its findings into the plan/spec.
+- Not run: backend build/test and frontend lint/build commands, per repository instruction not to build after implementation; changes are documentation-only.
+
+## 2026-06-03 — Custom Store Slugs: Task 1 — Database Schema
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/src/main/resources/db/schema.sql` | MODIFIED | Replaced `generate_store_public_id()` with collision-aware version that checks `store_public_id` aliases (guarded by `to_regclass` for bootstrap order); added `slug_status` enum, `store_public_id` table, four indexes (`uq_store_public_id_slug` on `lower(slug)`, `uq_store_public_id_default` partial, `idx_store_public_id_store_status`, `idx_store_public_id_expiry`), `mirror_store_default_public_id()` function, and `trg_mirror_store_default_public_id` trigger — all inserted immediately after `CREATE INDEX idx_store_public_id ON store(public_id);` |
+| `backend/src/main/resources/db/migration/001_store_public_id.sql` | CREATED | Standalone idempotent migration for existing databases: duplicate-safe enum creation (`DO/EXCEPTION`), `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `CREATE OR REPLACE` for both functions, `DROP TRIGGER IF EXISTS` + recreate, and backfill INSERT with `ON CONFLICT (lower(slug)) DO NOTHING` |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged Task 1 schema changes |
+
+### Verification (by inspection)
+- `slug` is `VARCHAR(128)` in both fresh schema and migration
+- Unique index on `lower(slug)` — `ON CONFLICT (lower(slug))` in the backfill matches this functional index
+- Trigger inserts default with `is_default = TRUE` and `status = 'ACTIVE'`
+- Migration `slug_status` creation wrapped in duplicate-safe `DO/EXCEPTION` block
+- Both schema and migration replace `generate_store_public_id()` so generated defaults avoid `store_public_id` aliases case-insensitively
+- Fresh schema uses `to_regclass('store_public_id')` guard so the generator remains functional during the first `CREATE TABLE store` bootstrap (before `store_public_id` exists)
+- Not run: backend build/test, per repository instruction not to build after implementation
+
+## 2026-06-03 — Custom Store Slugs: Tasks 2–16 — Full Implementation
+
+### Backend (Tasks 2–9)
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../store/types/SlugStatus.kt` | CREATED | `ACTIVE`/`GRACE` enum for slug lifecycle |
+| `backend/.../store/entity/StorePublicId.kt` | CREATED | R2DBC entity mapped to `store_public_id` table with `toDto()` |
+| `backend/.../core/database/R2DBCConfig.kt` | MODIFIED | Registered `slug_status` enum codec, write converter, and converter object |
+| `backend/.../store/repository/StorePublicIdRepository.kt` | CREATED | 7 query methods: `findResolvableBySlug`, `findAnyBySlug`, `findByStoreIdAndSlug`, `findByStoreId`, `findOldestActiveAlias`, `countByStoreIdAndStatus` (with `CAST`), `deleteExpiredGrace` (`@Modifying`) |
+| `backend/.../store/service/SlugValidator.kt` | CREATED | Format validation (3–128 chars, `[A-Za-z0-9-]`), reserved word blocklist |
+| `backend/.../store/dto/StoreSlugDto.kt` | CREATED | `StoreSlugDto` + `StoreSlugListResponse` DTOs |
+| `backend/.../store/request/CreateSlugRequest.kt` | CREATED | Request with Jakarta validation + `confirmAutoRetire` flag |
+| `backend/.../queue/response/StorePublicInfoResponse.kt` | MODIFIED | Added `canonicalId` and `matchedSlug` fields with defaults |
+| `backend/.../store/service/StoreSlugService.kt` | CREATED | Lifecycle: `listSlugs`, `createAlias` (auto-retire at cap), `retireAlias`, `hardDeleteAlias`; caps: 5 active / 5 grace |
+| `backend/.../store/controller/StoreSlugController.kt` | CREATED | REST at `/api/stores/{storeId}/slugs` with `StoreAccessUtil` auth |
+| `backend/.../store/service/SlugGracePurgeScheduler.kt` | CREATED | `@Scheduled` purge of expired grace slugs (5-min default) |
+| `backend/.../store/service/StoreService.kt` | MODIFIED | Added `StoreResolution` data class, `resolvePublicId()` (slug table → UUID fallback), `getStoreByPublicId` delegates to it; injected `StorePublicIdRepository` |
+| `backend/.../queue/controller/QueuePublicController.kt` | MODIFIED | `getStoreInfo` now uses `resolvePublicId` to populate `canonicalId`/`matchedSlug`; other 6 handlers unchanged |
+
+### Admin web — Tasks 10–14
+| File | Action | Summary |
+|---|---|---|
+| `web/src/types/store.ts` | MODIFIED | Added `StoreSlugDto`, `StoreSlugListResponse`, `CreateSlugRequest` |
+| `web/src/lib/constants.ts` | MODIFIED | Added `SLUGS`, `SLUG_RETIRE`, `SLUG` route constants |
+| `web/src/features/store/api.ts` | MODIFIED | Added `listSlugs`, `createSlug`, `retireSlug`, `removeSlug` functions |
+| `web/src/messages/en.json` | MODIFIED | Added `slugsTab` in settings, 32 slug keys in stores |
+| `web/src/messages/vi.json` | MODIFIED | Added matching VI strings (user-approved) |
+| `web/src/features/store/slugs-list.tsx` | CREATED | Presentational slug list with badges, retire/remove buttons |
+| `web/src/features/store/slug-add-dialog.tsx` | CREATED | Dialog form with client-side validation, auto-retire warning |
+| `web/src/features/store/slug-retire-dialog.tsx` | CREATED | AlertDialog for 30-day retire confirmation |
+| `web/src/features/store/slug-remove-dialog.tsx` | CREATED | Destructive AlertDialog for immediate removal |
+| `web/src/features/store/store-slugs-panel.tsx` | CREATED | Orchestrator panel: fetch, cap logic, all three dialogs |
+| `web/src/app/[locale]/dashboard/settings/slugs/page.tsx` | CREATED | ADMIN settings page hosting `StoreSlugsPanel` |
+| `web/src/app/[locale]/dashboard/settings/layout.tsx` | MODIFIED | Added `slugsTab` nav tab with `Link2` icon (non-super-admin only) |
+| `web/src/features/store/store-settings-panel.tsx` | MODIFIED | Added `slugs` tab for SUPER_ADMIN with `StoreSlugsPanel` |
+
+### Client web — Task 15
+| File | Action | Summary |
+|---|---|---|
+| `client-web/src/types/store.ts` | MODIFIED | Added `canonicalId`, `matchedSlug` to `StorePublicInfoResponse` |
+| `client-web/src/lib/constants.ts` | MODIFIED | Added `SITE_URL` constant |
+| `client-web/src/app/[locale]/layout.tsx` | MODIFIED | Added `metadataBase: new URL(SITE_URL)` to `generateMetadata` |
+| `client-web/src/app/[locale]/store/[storeId]/page.tsx` | REWRITTEN | Server component with `generateMetadata` for canonical link + renders `StorePageContent` |
+| `client-web/src/app/[locale]/store/[storeId]/store-page-content.tsx` | CREATED | Client component (moved from page.tsx) with updated redirect logic: UUID→canonicalId, case-mismatch→matchedSlug, alias stays in URL |
+
+### GitNexus impact analysis
+- `getStoreByPublicId`: CRITICAL risk, 7 direct callers — all in QueuePublicController. Signature unchanged, only internals refactored. Only `getStoreInfo` modified to use `resolvePublicId` directly.
+
+### Vietnamese strings
+- All VI translations confirmed by user before writing.
+
+### Out of scope (per spec §14)
+- Redis resolution cache, slug-reuse quarantine, slug analytics — explicitly deferred.
+
+## 2026-06-03 — Custom Store Slugs Plan Audit
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/planned/Custom Store Slugs Plan.md` | MODIFIED | Finalized the implementation plan audit: made the standalone migration genuinely idempotent for `slug_status`, replaced `generate_store_public_id()` so generated defaults avoid aliases, replaced client-rendered canonical links with Next.js server metadata, added the required client-web page split and `metadataBase`, corrected warning/status UI classes and Add-dialog conflict handling, corrected the client-web GitNexus impact note, and updated the audit record |
+| `docs/spec/Custom Store Slugs Spec.md` | MODIFIED | Aligned the spec with the finalized plan: documented duplicate-safe enum creation and generator replacement in the hand-applied migration, clarified server metadata canonical links, corrected active-cap auto-retire edge-case wording, and aligned destructive dialog guidance with existing shadcn `AlertDialog` conventions |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged the custom store slugs plan/spec audit and skipped verification commands |
+
+### Verification
+- Inspected current code surfaces for backend R2DBC enum wiring, public store resolution, client-web store route structure, admin warning/dialog conventions, i18n/navigation setup, and GitNexus indexing for `StorePage`.
+- Verified API syntax against Context7 for Spring Data R2DBC `@Query`/`@Modifying`, PostgreSQL expression indexes and `ON CONFLICT` conflict targets, and Next.js 16 `generateMetadata`/`alternates.canonical`/`metadataBase`.
+- Not run: backend build/test and frontend lint/build commands, per repository instruction not to build after implementation in this audit flow.
+
 ## Device Rename & Queue Dispatch Refresh
 
 ### Web Frontend

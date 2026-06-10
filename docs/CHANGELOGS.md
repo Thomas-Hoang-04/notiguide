@@ -1,5 +1,180 @@
 # Changelogs
 
+## 2026-06-10 — Module READMEs: workspace + all six submodule READMEs written
+
+Added a portfolio-grade README set covering every repo in the NotiGuide workspace, per `docs/spec/Module READMEs Spec.md` and `docs/planned/Module READMEs Plan.md`.
+
+### Files Written / Replaced (7)
+
+| File | Action | Summary |
+|------|--------|---------|
+| `README.md` | NEW | Master workspace README — system pitch, full union techstack badge row (17 badges), full-system Mermaid flowchart, modules table, key capabilities, gallery placeholders, repo layout + clone command, sign-off |
+| `backend/README.md` | NEW | Backend module README — intro, techstack (12 badges), NotiGuide ecosystem table (self bold/unlinked), features, technical highlights, architecture Mermaid, API overview table, getting started, project structure, sign-off |
+| `web/README.md` | REPLACED | Replaced create-next-app scaffold — admin dashboard README with features, highlights, architecture Mermaid, screenshots placeholders, getting started, structure, sign-off |
+| `client-web/README.md` | REPLACED | Replaced create-next-app scaffold — client app README with features, highlights, architecture Mermaid, screenshots placeholders, getting started, structure, sign-off |
+| `transmitter/README.md` | REPLACED | Replaced ESP-IDF hello-world scaffold — transmitter hub README with full module tree, hardware table, architecture Mermaid, photo placeholder, sign-off |
+| `receiver-esp32/README.md` | REPLACED | Replaced scaffold (branch `esp32`) — ESP32-C3 pager README with Repository Branches section (linking `esp8266` sibling), hardware table, architecture Mermaid, photo placeholder, sign-off |
+| `receiver-esp8266/README.md` | REPLACED | Replaced scaffold (branch `esp8266`) — ESP8266 pager README with Repository Branches section (linking `esp32` sibling), hardware table, architecture Mermaid, photo placeholder, sign-off |
+
+### Notable Corrections Made During Review
+
+- **Both web READMEs:** `src/proxy.ts` correctly described as Next.js middleware running next-intl locale routing — NOT an API proxy (original plan draft phrasing was ambiguous). Admin dashboard uses SSE for live queue updates; client app polls the public API. Client env vars documented (`NEXT_PUBLIC_API_BASE_URL`).
+- **Transmitter:** Heartbeat correctly attributed to `network/` module (not `diagnostics/`, which holds NVS dispatch counters). Pairing described accurately as PSK challenge-response over ESP-NOW.
+- **Receiver esp32:** Receive path described accurately as nRF24 hardware address filter + trigger-code match (no per-frame signature). Kconfig dual-radio variant (nRF24 or 433 MHz) documented. NVS persistence named.
+- **Receiver esp8266:** UART provisioning feature claim removed — `main/provision/` is an empty stub (design doc only, not implemented); project tree annotates it accordingly.
+- **Backend:** `core/device/` and `core/store/` added to the structure tree.
+- **Master README:** ESP8266 RTOS SDK badge added to the union techstack row.
+
+### Cross-file Consistency Check (Task 8 Steps 1–3)
+
+- **Ecosystem links / sign-offs:** All 7 files pass — module READMEs carry ≥6 repo links and exactly 1 sign-off each; master has 7 links and 1 sign-off.
+- **Shared-badge consistency:** All multi-file badges (FreeRTOS, C, TypeScript, shadcn/ui, Tailwind, React, Next.js, MQTT, Firebase, ESP-IDF, Yarn, TimescaleDB, Docker, Vitest, Spring Boot, Redis, LVGL, Kotlin, ESP8266 RTOS SDK, CMake, Biome) use identical URLs across every file — no drift found, no fixes needed.
+- **Placeholder/tone sweep:** Zero matches for `TODO`, `TBD`, `lorem`, `FIXME`, `seamless`, `blazing`, `cutting-edge`, `robust`, `comprehensive`.
+
+### Skipped / Deferred
+
+- Photo/screenshot slots are `<!-- PHOTO: ... -->` placeholders pending real captures by the author.
+- No `README_VI.md` files — out of scope per spec.
+- No git commits made — author commits manually.
+
+### Plan / Spec Files Updated Alongside
+
+- `docs/planned/Module READMEs Plan.md` — kept in sync as canonical record (audit amendments + self-review notes section).
+- `docs/spec/Module READMEs Spec.md` — Mermaid convention amended to require detailed diagrams.
+
+### Final Post-Implementation Audit (4 parallel reviewers: master/cross-file, backend, web apps, firmware)
+
+All seven files were byte-identical to the plan drafts; every finding below is a case where a draft claim contradicted the code (plan global rule 3: fix the claim, not the code). Badge render check re-run: all 24 slugs render. Verdict after amendments: 0 critical, all major/minor findings fixed.
+
+**Amended:**
+
+- `README.md` — removed the false `API -.-> Client` SSE edge from the system diagram (the customer app polls; only the admin dashboard uses SSE — the backend's sole SSE endpoint is `QueueAdminController` `/events`); relabeled the client edge "REST · join & poll status"; Key Capabilities now says "SSE live updates to the staff dashboard".
+- `backend/README.md` — same SSE correction in Features (public endpoints are poll-based; SSE attribution moved to the queue-engine bullet). **Getting Started rewritten**: `compose.yaml` provides only Redis 8 (no TimescaleDB service, and `docker compose up -d` would also start the prod backend image — command now `docker compose up -d redis`); there is no `spring-boot-docker-compose` dependency — config comes from a `.env` file via spring-dotenv (`SPRING_R2DBC_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `REDIS_PASSWORD`); the schema does NOT auto-initialize — `db/schema.sql` + `db/analytics.sql` must be applied manually (no `spring.sql.init`/`ConnectionFactoryInitializer` anywhere). Structure tree: `tenant/` relabeled "org/store join codes" (it only holds `JoinCodeGenerator`, no multi-tenancy infra); `shared/` now mentions client-IP resolution; MQTT diagram edge relabeled "queue lifecycle events" (publishes on issue/call/serve/cancel, not just call/dispatch).
+- `web/README.md` — Getting Started documents `NEXT_PUBLIC_API_URL` (defaults to `http://localhost:8080`; note: the client app uses a *different* var, `NEXT_PUBLIC_API_BASE_URL`); Mermaid `features/*` node gained "· …" (actual subfolders are 7, incl. admin/auth/organization).
+- `receiver-esp32/README.md` — Technical Highlights: "hub address and **key** persist in NVS" → "hub address and **trigger code**" (the PSK is compile-time Kconfig, never written to NVS — persisted struct is `slot_id`/`hub_mac`/`rf_code` in `main/config/device_config.c`); structure tree: NVS persistence reattributed from `pair/` to `config/` (mirrors the esp8266 tree); "motor patterns" → "motor pulse control" (single 250 ms pulse).
+- `receiver-esp8266/README.md` — "motor pattern(s)" → "motor pulse" wording (Features, diagram node, tree), same single-pulse rationale.
+
+**Accepted as-is (with reasons):**
+
+- FS1000A (transmitter) and RXB-12 (esp8266) part names appear nowhere in code — they are spec-mandated; author should confirm the physical parts match.
+- `web/README.md` Mermaid `BE -.-> ZS` SSE edge is a simplification (events land in `useQueueEvents` hooks, which then mutate stores) — acceptable at diagram altitude.
+- `client-web/README.md` omits `NEXT_PUBLIC_SITE_URL` (has a localhost fallback; README lists required config only).
+- esp8266 tree's "provision/ — UART provisioning (designed, not yet implemented…)" annotation is plan-mandated and factual (`main/provision/` confirmed empty).
+- Backend API table keeps `{publicId}` (matches the real path variable); the Features bullet now glosses it as the store's public slug.
+- Plan's Task 8 expectation of "≥10 links" for the master README is internally inconsistent with its own Task 1 draft (which yields 7) — the README follows the draft; no change.
+- Note: the CLAUDE.md claim that the backend uses `spring-boot-docker-compose` auto-start is stale relative to the code (spring-dotenv replaced it); the README now reflects the code.
+
+**Verified clean (no findings):** ecosystem-table verbatim parity across all 6 module READMEs; badge URL uniformity across all 7 files; all Mermaid diagrams syntactically valid; photo-placeholder two-line pattern, sign-off placement, spine order, and tone rules pass everywhere; `client-web/README.md` fully accurate (adaptive polling, typed fetch wrapper, FCM-per-ticket, `NEXT_PUBLIC_API_BASE_URL` all verified in code); `transmitter/README.md` fully accurate (SSD1306, LVGL 8.3.11, MQTT v5/TLS, signature verification, SoftAP provisioning, heartbeat in `network/`, menu names) — no changes needed to either.
+
+### Post-Audit Amendment — receiver-esp32 dual-radio parity (author review feedback)
+
+The author flagged that the esp32 receiver's equal support for both radios was downplayed: the firmware treats 433 MHz and 2.4 GHz as compile-time peers (`choice RECEIVER_RADIO_VARIANT` in `Kconfig.projbuild`; the checked-in `sdkconfig` merely selects `RECEIVER_RADIO_2_4G=y`; `main/rf/` is a full 547-line software OOK decoder, not a stub, with lifecycle parity in `rf_supervisor.c` and a trigger matcher shared by both paths). The transmitter likewise dispatches per *device band*, not per MCU: roster entries carry `radio_band_t`, `radio_tx_send(band, …)` arbitrates both paths, and the pairing handshake carries the receiver-requested band (`espnow_pair.c` sends `rx_band = compiled_band()`). All claims verified in code before rewording.
+
+**Amended:**
+
+- **Canonical ecosystem table row (all 6 module READMEs):** esp32 receiver role is now "ESP32-C3 pager — dual-radio (2.4 GHz nRF24 or 433 MHz OOK)" — byte-identical everywhere; esp8266 row unchanged.
+- `README.md` — Modules row now "Dual-radio pager (2.4 GHz nRF24 or 433 MHz OOK) with vibration alert"; system diagram RX1 node relabeled "dual-radio pager" and gained a dashed `TX -.-> RX1` edge labeled "433 MHz OOK · 433 MHz build".
+- `transmitter/README.md` — intro and Dual-radio dispatch bullet reframed from "nRF24 for ESP32 receivers / 433 MHz for ESP8266 receivers" to per-band dispatch ("each receiver registers its band at pairing time, and every call goes out on that device's link"); diagram pager nodes renamed by band ("2.4 GHz pagers — ESP32-C3", "433 MHz pagers — ESP8266 · ESP32-C3"); Hardware radio rows now say "receivers paired on that band".
+- `receiver-esp32/README.md` — intro presents both links as a build-time choice ("this tree ships with 2.4 GHz selected") and drops the nRF24-specific "address filter" from the receive-loop sentence; Branches section now "share a purpose but not an MCU or an SDK" with the radio choice spelled out; Features lead bullet is "Dual-radio receive loop" (hardware addressing vs software OOK, both first-class); Technical Highlights covers both builds; diagram gained `TX -.-> R433` ("433 MHz OOK · 433 MHz build") and build annotations on both radio nodes; Hardware table gained a generic "433 MHz OOK receiver" row (code names no part) + "fit the radio matching the selected build"; structure tree annotates `nrf24/`/`rf/` with their builds.
+- `receiver-esp8266/README.md` — sibling references updated to mirror (intro, Branches bullet, "the ESP32 sibling's 2.4 GHz build gets address filtering from silicon").
+
+**Review loop:** changes reviewed by a dedicated reviewer subagent — 0 critical, 1 important (R433 node had no incoming radio edge in the esp32 diagram — fixed), 3 minor terminology nits (fixed: "OOK" in master Modules row, "433 MHz build" edge vocabulary, "channel" → "radio parameters" in the Kconfig bullet). Reviewer confirmed the generic 433 MHz hardware row is correct since the firmware mandates no specific part. Post-fix verification: no leftover old framing in any of the 7 files, ecosystem-row parity intact, sign-offs intact, Mermaid quote balance even in all edited diagrams.
+
+### Post-Audit Amendment — receiver-esp32 architecture diagram refinement (author review feedback)
+
+The author flagged remaining inconsistencies in the esp32 Architecture diagram: the 433 MHz path's pairing involvement wasn't visible, the 433 link's 4-byte ID code wasn't shown, and edges into the trigger node mixed dashed/solid arbitrarily. Firmware verified before redrawing: the 433 OOK frame carries a 4-byte value (31-bit code + action bit) matched in `rf_trigger_on_frame` against the paired code; in the 2.4 GHz build the paired 5-byte code becomes the nRF24 RX *address* (`rf_sup_start` → `nrf24_recv_start_task(&s_nrf, cfg->rf_code)`) and the payload carries only magic + action bytes; ESP-NOW pairing is build-agnostic.
+
+- `receiver-esp32/README.md` — diagram redrawn with a uniform edge semantic: **solid = RF receive/alert data path, dashed = pairing/configuration**. Both TX→radio edges now solid (build tags live on the nodes); `RAD → TR` labeled "dispatch payload", `R433 → TR` labeled "4-byte ID code"; pair edges relabeled "trigger code as RX address" (→ nrf24) and "match code for rf frames (433 MHz build)" (→ trigger); ESP-NOW pairing edge marked "both builds".
+- `receiver-esp8266/README.md` — `RF → TR` edge gained the matching "4-byte ID code" label (`rf_trigger_on_frame(uint32_t decoded, …)` confirmed identical scheme); its solid/dashed usage already conformed.
+- Reviewer subagent verified every edge against the firmware: 0 critical/important; approved. Residual minor nit accepted as-is: the trigger node label "code match → alert" is loose for the 2.4 GHz build (where matching happens in radio silicon and trigger checks magic+action) — kept, since an identity match does occur.
+- **Pushed back (not implemented):** a `pair → rf` edge requested in review. The firmware has no such flow — `main/rf/` never reads pairing data (`rf_sup_start` passes `(void)cfg`; `espnow_pair.c` makes no `rf_sup_*`/rf calls; the paired code is installed into the trigger matcher by `main.c:44 rf_trigger_set`). Instead, the rf node is annotated "decodes every frame" and the pair→trigger edge says "match code **for rf frames**", so the absence of a direct edge reads as the deliberate design it is.
+
+### Post-Audit Amendment — ESP-01 module named in esp8266 Hardware table (author confirmation)
+
+The author confirmed the esp8266 variant physically uses an ESP-01 module (ESP8266EX SoC underneath). This is corroborated in-repo: `receiver-esp8266/main/Kconfig.projbuild` GPIO help text says "Default GPIO2 on ESP-01" / "Default GPIO0 on ESP-01", and `rf_supervisor.c` describes itself as "the ESP-01 specific RF lifecycle wrapper".
+
+- `receiver-esp8266/README.md` — Hardware table MCU row changed from "ESP8266 | Wi-Fi MCU…" to "ESP-01 | ESP8266EX-based Wi-Fi module doing the software radio decoding". Chip-level "ESP8266" wording elsewhere (intro, Branches bullets, ecosystem table, badges, repo/branch naming) intentionally unchanged — it remains accurate since the ESP-01 is an ESP8266EX carrier module, and the SDK targets the chip.
+
+---
+
+## 2026-06-10 — Transmitter dispatch: device name, Case B ack-timeout reconciliation, dashboard toast
+
+Backend dispatch work plus one admin-dashboard string. The firmware side of the device-name feature
+had already landed and been reviewed; this entry covers the backend and web changes
+(`docs/planned/Transmitter Dispatch Device Name Plan.md`).
+
+**Part A — Dispatch device name (full-payload path).** `TransmitEnvelope` now carries the target
+receiver's `assigned_name` so the firmware OLED can show it (display-only, **unsigned**: the
+`transmit-v1` canonical and signature verification are unchanged, `schema_version` stays `1`, fully
+backward/forward compatible). Jackson `@JsonInclude(NON_NULL)` usage verified current via Context7.
+- Modified `domain/device/service/TransmitterDispatchService.kt`: `TransmitEnvelope` promoted
+  `private`→`internal`; added optional `@field:JsonProperty("device_name") @field:JsonInclude(NON_NULL)
+  deviceName: String?`; `buildPayload(...)` sets `deviceName = receiver.assignedName`. Canonical/signer
+  untouched.
+- Created `domain/device/service/TransmitEnvelopeSerializationTest.kt` (3 tests).
+- **Skipped by design:** the slot dispatch wire format (`SlotDispatchEnvelope`) — the firmware already
+  holds receiver names locally in its roster (synced via the `cmd/label` topic).
+
+**Part B — Case B ack-timeout reconciliation.** Closed the deadlock where a CALL dispatch whose hub
+dies after publish was never acknowledged: the `device:busy` lock lingered for 12h and no failure
+reached the dashboard. On each successful **CALL** publish the service now arms a short-TTL
+`dispatch:pending-ack:{id}` timer alongside the existing tracking record; its Redis keyspace expiry
+drives a reconciler that atomically claims the tracking record (GET → DEL-with-count-check), releases
+the busy lock **only if it still belongs to that ticket**, and emits
+`DEVICE_DISPATCH_FAILED(reason=ack_timeout)`. Spring Data Redis `getAndDelete`/GETDEL does exist in
+the current version per Context7, but the claim deliberately uses only `get`/`delete`/`set(Duration)`
+(already used in this codebase); the `delete` return-count is the race arbiter.
+- Added `core/redis/RedisKeyManager.kt`: `dispatchPendingAck`, `isPendingAckKey`, `parsePendingAckKey`
+  (+ 5 tests in `RedisKeyManagerTest.kt`).
+- Added `core/device/DeviceTransmitterProperties.kt`: `dispatchAckTimeoutSeconds: Long = 45` (+`require`);
+  `application.yaml`: `dispatch-ack-timeout-seconds: 45` (prod inherits via profile merge — verified
+  `application-prod.yaml` has no `device.transmitter` block).
+- Created `domain/device/service/DispatchReconciliationService.kt` (`failDispatch` / `completeDispatch`,
+  atomic claim, ticket-scoped busy release, idempotent) + `DispatchReconciliationServiceTest.kt` (7 tests).
+- Modified `domain/device/service/TransmitterDispatchService.kt`: inject `DeviceTransmitterProperties`;
+  extracted a `trackDispatch(...)` helper that always writes tracking and arms the timer for CALL
+  dispatches only; called from both dispatch paths.
+- Modified `domain/device/listener/TransmitterOperationalListener.kt`: route applied/unchanged→
+  `completeDispatch`, rejected→`failDispatch`; deleted the now-redundant `handleTransmitRejection`;
+  swapped the `queueEventBroadcaster` dependency for `DispatchReconciliationService`. The rejection path's
+  busy release is now ticket-scoped (was unconditional) — a strict correctness improvement.
+- Modified `core/redis/RedisKeyExpirationListener.kt`: on `pending-ack` key expiry, delegate to
+  `DispatchReconciliationService.failDispatch(..., "ack_timeout")` via `ObjectProvider`.
+
+**Review amendments (applied during per-task two-stage review):**
+- `completeDispatch` deletes the tracking record **first**, in its own `runCatching`, then the
+  pending-ack timer in a second independent one (was: both in one block, pending-ack first). A partial
+  failure can now only orphan the timer (expires into a no-op) instead of orphaning the tracking record
+  (which would have emitted a spurious `DEVICE_DISPATCH_FAILED` for a successful dispatch).
+- `trackDispatch` split into two `runCatching` blocks with distinct log messages
+  (`dispatch_tracking_write_failed` vs `dispatch_ack_timer_arm_failed`) so a timer-arm failure is
+  observable and not misreported as a tracking failure; timer arming is skipped if tracking failed.
+- `releaseBusyIfOwned` logs `dispatch_busy_parse_failed` (warn) on a malformed busy record instead of
+  silently skipping with a misleading `ticket_mismatch` info log.
+- `handleAck`'s liveness `touchHub` call is wrapped in `runCatching` — a transient DB error no longer
+  aborts ack reconciliation (which would have surfaced a spurious `ack_timeout` for an applied dispatch).
+- `RedisKeyExpirationListener` logs warn on the two anomalous skip paths (unparseable pending-ack key;
+  pending-ack expiry while the transmitter feature is disabled) instead of silently dropping.
+- Two extra reconciler tests (malformed tracking record after claim; busy key already gone) and one
+  extra key-parser test (foreign key prefix → null).
+
+**Part C — Dashboard timeout toast (web).** The admin queue page now shows a purpose-built bilingual
+toast for the new `ack_timeout` dispatch-failure reason instead of the generic system-issue toast.
+- Modified `web/src/app/[locale]/dashboard/queue/page.tsx`: added an `ack_timeout` branch to the
+  `DEVICE_DISPATCH_FAILED` reason switch.
+- Modified `web/src/messages/en.json` and `web/src/messages/vi.json`: added the mirrored
+  `queue.dispatch.errorAckTimeout` key (Vietnamese copy as approved in the plan). `yarn lint` clean.
+
+## 2026-06-10 — Backend Remaining Plan marked Resolved (docs only)
+
+Closed out `docs/planned/Backend Remaining Plan.md`. Its last open backlog item — **P2 — Test Coverage** — is complete, delivered via the approved `docs/spec/Test Coverage Spec.md` + `docs/done/Test Coverage Plan.md` (66 backend tests, 31 frontend tests, all passing DB-free; see the 2026-06-09 entry below). Docs-only edits:
+
+- Header now carries **Status: ✅ Resolved**; "Last updated" → 2026-06-10.
+- Priority Backlog section marked **Cleared**; P2 added to the Completed table.
+- "Suggested Execution Order" updated to reflect nothing remaining.
+- Integration/TestContainers, Redis Lua execution, and R2DBC `DatabaseClient` query tests stay explicitly out of scope per Test Coverage Spec §3.7 — not reopened as a backlog item (per decision).
+- File left in `docs/planned/` (not moved to `docs/done/`) to preserve inbound references from `docs/spec/Test Coverage Spec.md`, `docs/done/Analytics Implementation Plan.md`, and `docs/done/Device Integration Implementation Plan.md`.
+
 ## 2026-06-09 — Test Coverage suite (backend + web + client-web), DB-free
 
 Implemented `docs/planned/Test Coverage Plan.md` in full: a professional, infra-free unit-test

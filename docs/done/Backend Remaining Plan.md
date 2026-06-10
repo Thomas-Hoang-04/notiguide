@@ -6,27 +6,14 @@ Merged implementation backlog from:
 - `docs/planned/Backend Audit.md` ("Open / Deferred Findings")
 - Current backend source TODO scan (`backend/src`)
 
-**Last updated**: 2026-05-17
+**Last updated**: 2026-06-10
+**Status**: ✅ **Resolved** — all tracked items complete. No remaining backlog.
 
 ---
 
 ## Priority Backlog
 
-### P2 — Test Coverage
-
-**Why now**
-
-- Backend has **zero tests** — the `src/test/` directory is empty.
-- All domain implementations are complete; this is now the primary remaining gap.
-- Queue (Lua scripts, race conditions), analytics (continuous aggregates), auth (JWT, sessions), and device (MQTT listeners, dispatch) are the highest-risk areas.
-
-**Implementation targets**
-
-- Integration tests for queue lifecycle (issue → call → serve/cancel/skip/requeue).
-- Integration tests for analytics event writes and query endpoints.
-- Unit tests for JWT issuance/verification, rate limiting, and auth flows.
-- Integration tests for device registration, activation, RF code distribution, and dispatch.
-- Test infrastructure: TestContainers for PostgreSQL/TimescaleDB + Redis, or equivalent.
+✅ **Cleared.** The last open item — **P2 — Test Coverage** — is complete. It was scoped and delivered through the approved `docs/spec/Test Coverage Spec.md` (whose source is this plan's "P2 — Test Coverage") and `docs/done/Test Coverage Plan.md`: a DB-free unit-test suite (66 backend tests across 27 classes, 31 frontend tests) with Kover/Vitest V8 coverage reporting, all passing with no infrastructure running. See the Completed table below and `docs/CHANGELOGS.md` (2026-06-09).
 
 ---
 
@@ -48,6 +35,7 @@ Merged implementation backlog from:
 | Jump-Call Feature                              | **Done** (2026-03-25) | `allowJumpCall` store field + `callSpecificTicket` endpoint + Lua script + stacked serving display.                                                                                |
 | Features Implementation Plan                   | **Done** (2026-03-25) | All 7 features fully implemented (see breakdown below). Verified in full-repo audit (2026-03-25).                                                                                  |
 | P2 — Remote Device Diagnostics                 | **Done** (2026-05-17) | Firmware heartbeat enrichment (heap, RSSI, uptime, dispatch counters, IP) + backend `HubDiagnosticsService` (MQTT ingest, USB relay, health summary) + frontend diagnostics panel and hub health card. See companion plans and joined audit in `CHANGELOGS.md`. |
+| P2 — Test Coverage                             | **Done** (2026-06-09) | DB-free unit-test suite per approved `docs/spec/Test Coverage Spec.md` + `docs/done/Test Coverage Plan.md`: backend 27 classes / 66 tests (3 layers + JWT integration slice), `web` 22 tests, `client-web` 9 tests, Kover + Vitest V8 coverage reporting. All pass with no infra running. Integration/TestContainers, Redis Lua execution, and R2DBC `DatabaseClient` query tests are explicitly out of scope per spec §3.7. See `CHANGELOGS.md` 2026-06-09. |
 
 
 ### Features Implementation Plan — Breakdown
@@ -98,5 +86,5 @@ store, admin, device, device_rf_code, analytics_event, login_history, store_sett
 
 ## Suggested Execution Order
 
-1. Add test coverage (P2) around queue, analytics, auth, and device flows (including the new diagnostics service).
+✅ **Nothing remaining.** All items above are complete. Test coverage (P2) was delivered per the approved Test Coverage Spec — see the Completed table.
 

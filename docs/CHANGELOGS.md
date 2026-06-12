@@ -1,5 +1,364 @@
 # Changelogs
 
+## 2026-06-12 — Link-Only Invitations (Join-Code Purge): implementation (Tasks 1–9) + documentation (Task 10)
+
+Completed the full purge of the join-code (`o_`/`s_`) invitation system from both backend and web, making expiring invite links the sole invitation mechanism. The join-request approval system is untouched. Four API routes removed: `GET /api/orgs/me/join-code`, `POST /api/orgs/me/join-code/rotate`, `GET /api/stores/{id}/join-code`, `POST /api/stores/{id}/join-code/rotate`.
+
+### Manual migration for existing deployments
+
+`schema.sql` is init-only; apply the following against a running database. PostgreSQL drops the dependent unique indexes automatically with the column:
+
+```sql
+ALTER TABLE organization DROP COLUMN join_code;
+ALTER TABLE store DROP COLUMN join_code;
+```
+
+A ready-to-run, idempotent version (wrapped in a transaction, `IF EXISTS` guards) is provided at `backend/src/main/resources/db/migration-2026-06-12-drop-join-code.sql`:
+
+```bash
+psql "$DATABASE_URL" -f backend/src/main/resources/db/migration-2026-06-12-drop-join-code.sql
+```
+
+### Files Changed
+
+#### Backend (`backend/`)
+
+| File | Action | Summary |
+|------|--------|---------|
+| `src/main/kotlin/com/thomas/notiguide/domain/admin/request/RegisterRequest.kt` | MODIFIED | `joinCode` field removed; JOIN mode now takes only `inviteToken` |
+| `src/main/kotlin/com/thomas/notiguide/domain/admin/service/RegistrationService.kt` | MODIFIED | `join()` rewritten link-only (400 "An invite link is required" without a token); org-code minting in `createOrg` and `generateUniqueOrgCode()` removed |
+| `src/main/kotlin/com/thomas/notiguide/domain/organization/controller/OrganizationController.kt` | MODIFIED | `GET/POST /api/orgs/me/join-code` endpoints removed; `requireOrgOwner` 403 reworded to "Only organization owners can manage organization invites" |
+| `src/main/kotlin/com/thomas/notiguide/domain/organization/service/OrganizationService.kt` | MODIFIED | Reduced to `getOrganizationPublic` only (`getOrganization`, `rotateJoinCode`, `generateUniqueJoinCode` removed) |
+| `src/main/kotlin/com/thomas/notiguide/domain/organization/response/JoinCodeResponse.kt` | DELETED | No longer produced post-purge |
+| `src/main/kotlin/com/thomas/notiguide/domain/store/controller/StoreController.kt` | MODIFIED | `GET/POST /api/stores/{id}/join-code` endpoints removed; `requireIndependentStore` 409 reworded to "Org-owned stores are joined via the organization" |
+| `src/main/kotlin/com/thomas/notiguide/domain/store/service/StoreService.kt` | MODIFIED | `rotateStoreJoinCode`, `getStoreJoinCode`, `generateUniqueStoreJoinCode` removed; create-time code minting removed |
+| `src/main/kotlin/com/thomas/notiguide/domain/store/repository/StoreRepository.kt` | MODIFIED | `findByJoinCode` removed |
+| `src/main/resources/db/schema.sql` | MODIFIED | `organization.join_code` + `uq_organization_join_code` and `store.join_code` + `uq_store_join_code` dropped |
+| `src/main/resources/db/migration-2026-06-12-drop-join-code.sql` | CREATED | Idempotent migration script for already-deployed databases (transactional, `IF EXISTS`) |
+| `src/main/kotlin/com/thomas/notiguide/domain/organization/entity/Organization.kt` | MODIFIED | `joinCode` property and `toDto()` removed |
+| `src/main/kotlin/com/thomas/notiguide/domain/organization/dto/OrganizationDto.kt` | DELETED | Nothing produces this DTO post-purge |
+| `src/main/kotlin/com/thomas/notiguide/domain/organization/repository/OrganizationRepository.kt` | MODIFIED | `findByJoinCode`/`existsByJoinCode` removed (bare `CoroutineCrudRepository` now) |
+| `src/main/kotlin/com/thomas/notiguide/domain/store/entity/Store.kt` | MODIFIED | `joinCode` property removed |
+| `src/main/kotlin/com/thomas/notiguide/core/tenant/JoinCodeGenerator.kt` → `InviteTokenGenerator.kt` | RENAMED | Single-purpose API: `PREFIX = "i_"`, `generate(byteCount)`; org/store prefixes and legacy overload removed |
+| `src/main/kotlin/com/thomas/notiguide/domain/admin/service/InviteLinkService.kt` | MODIFIED | Call sites updated to `InviteTokenGenerator` |
+| `src/test/kotlin/com/thomas/notiguide/domain/admin/service/RegistrationServiceTest.kt` | MODIFIED | Join-code tests removed/replaced (`join without an invite token is rejected with 400`); fixtures drop `joinCode` |
+| `src/test/kotlin/com/thomas/notiguide/domain/admin/service/InviteLinkServiceTest.kt` | MODIFIED | Org fixture drops `joinCode` |
+| `src/test/kotlin/com/thomas/notiguide/core/tenant/JoinCodeGeneratorTest.kt` → `InviteTokenGeneratorTest.kt` | RENAMED | 4 retargeted tests (prefix, 24-char length, uniqueness, url-safety); org/store-prefix and legacy-9-byte tests deleted |
+| `README.md` | MODIFIED | `core/tenant/` description reworded to "invite tokens" |
+
+#### Web (`web/`)
+
+| File | Action | Summary |
+|------|--------|---------|
+| `src/types/organization.ts` | MODIFIED | `JoinCodeResponse` interface removed |
+| `src/types/admin.ts` | MODIFIED | `RegisterRequest.joinCode` removed |
+| `src/lib/constants.ts` | MODIFIED | `JOIN_CODE`/`JOIN_CODE_ROTATE` route constants removed from `API_ROUTES.STORES` and `API_ROUTES.ORGS` |
+| `src/features/organization/api.ts` | MODIFIED | `getOrgJoinCode`, `rotateOrgJoinCode`, `getStoreJoinCode`, `rotateStoreJoinCode` removed |
+| `src/features/organization/join-code-panel.tsx` | DELETED | Replaced entirely by `InviteLinkPanel` |
+| `src/app/[locale]/dashboard/settings/organization/page.tsx` | MODIFIED | Renders only `InviteLinkPanel` |
+| `src/app/[locale]/dashboard/settings/store/page.tsx` | MODIFIED | `JoinCodePanel` dropped; gate collapsed to single `InviteLinkPanel` |
+| `src/features/auth/register-join-guidance.tsx` | CREATED | "Joining needs an invite link" neutral info state with Back button |
+| `src/features/auth/register-wizard.tsx` | MODIFIED | JOIN view renders by `invite.kind`: resolved → form, none → guidance, invalid → warning + guidance |
+| `src/features/auth/register-join-form.tsx` | MODIFIED | `invite` prop required; join-code field/state/`mapApiError` override removed |
+| `src/features/auth/register-path-selector.tsx` | MODIFIED | JOIN icon `KeyRound` → `Link2` |
+| `src/messages/en.json` | MODIFIED | Reworked `register.pathJoinTitle`, `register.pathJoinDesc`, `register.inviteInvalid`; added `register.inviteRequiredTitle`, `register.inviteRequiredDesc`; removed 10 dead keys (`register.joinCodeLabel`, `register.joinCodePlaceholder`, `register.joinCodeRequired`, `register.invalidJoinCode`, `admins.joinCodeTitle`, `admins.joinCodeDesc`, `admins.joinCodeCopy`, `admins.joinCodeCopied`, `admins.joinCodeRotate`, `admins.joinCodeRotateConfirm`) |
+| `src/messages/vi.json` | MODIFIED | Mirrored all EN changes with approved VI copy |
+
+### Skipped / No-change notes
+
+| Item | Status | Reason |
+|------|--------|--------|
+| `OrganizationControllerTest.kt` / `StoreControllerTest.kt` | NO CHANGE | No join-code endpoint tests; compilation remains green without edits |
+| `SecurityConfig` | NO CHANGE | No route matchers referenced the removed endpoints |
+| `client-web/` | NO CHANGE | No invitation surface; fully unaffected |
+| In-flight join codes post-deploy | ACCEPTED LIMITATION | Per spec § 1 decision — stale clients submitting `joinCode` get 400 "An invite link is required" (Jackson ignores unknown JSON fields) |
+| `register.pathJoinTitle` rework + `KeyRound` → `Link2` swap | PURGE-COMPLETENESS | Found at plan audit as beyond the spec's § 5.4 list; included for completeness |
+
+## 2026-06-12 — Link-Only Invitations (join-code purge): design spec written & audited
+
+Brainstormed and spec'd the removal of the join-code (`o_`/`s_`) invitation system from backend and web, making expiring invite links the only invitation mechanism. Decisions locked: single-pass purge; register Join view is link-only with a guidance state (no token-paste field, Join card stays visible on the selector); `join_code` DB columns dropped fully with manual `ALTER` statements documented; 7-day link TTL unchanged. The join-request approval system is untouched. Supersedes the "codes stay" decision in the Expiring Invite Links spec.
+
+### Files Changed
+
+| File | Action | Summary |
+|------|--------|---------|
+| `docs/spec/Link-Only Invitations Spec.md` | NEW | Full removal spec — registration link-only flow, 4 endpoints + DTOs deleted, entity/schema/repository column purge with migration `ALTER`s, `JoinCodeGenerator` → `InviteTokenGenerator` rename, web panel/form/i18n removals, wizard guidance states (Mermaid state diagram), test rework, file map |
+| `docs/CHANGELOGS.md` | MODIFIED | This entry |
+
+### Spec audit (fresh-context reviewer, pre-plan)
+
+Audited for missed references, phantom references, logical errors, flow inconsistency, and codebase integration. No CRITICAL/HIGH. 8 findings, all amended into the spec: orphaned dead-code chain extended into the removal (`OrganizationService.getOrganization` → `Organization.toDto()` → `OrganizationDto.kt` now deleted — nothing produces the DTO post-purge); supersession scope of the old spec broadened; stale KDoc in `StoreController` and two stale comments in `register-wizard.tsx` flagged for rewrite; `backend/README.md` `core/tenant/` description added to the file map; all five affected generator tests enumerated; unreachable `mapApiError` invite branch dropped instead of remapped; "every JOIN 400 contains invite" claim scoped to credential errors. Verified clean: exhaustive greps across backend/web/client-web found no reference outside the spec's file map; all quoted strings/line anchors byte-exact; migration `ALTER`s sound (no FKs/hypertables); web matcher compatibility holds post-purge.
+
+## 2026-06-12 — Backend test files: replace inline FQNs with top-level named imports
+
+Mechanical cleanup only — no logic changed. All 10 affected test files had inline fully-qualified class names (e.g. `mockk<com.thomas.notiguide.X>()`, `@MockkBean ... : com.thomas...Y`) replaced by simple class names backed by `import` statements at the top of each file.
+
+| File | Action | Summary |
+|------|--------|---------|
+| `backend/src/test/.../domain/admin/controller/AdminControllerTest.kt` | MODIFIED | Added imports: `AdminService`, `SessionService`, `RefreshTokenService`, `AppProperties`, `StoreAccessService` |
+| `backend/src/test/.../domain/admin/controller/AuthControllerTest.kt` | MODIFIED | Added imports: `AdminRepository`, `PasswordEncoder`, `JWTManager`, `RefreshTokenService`, `StoreRepository`, `JWTProperties`, `AppProperties`, `AdminService`, `SessionService`, `LoginAbortService`, `RegistrationService`, `JoinRequestService`, `InviteLinkService` |
+| `backend/src/test/.../domain/analytics/controller/AnalyticsControllerTest.kt` | MODIFIED | Added imports: `AnalyticsQueryService`, `StoreAccessService` |
+| `backend/src/test/.../domain/device/controller/DeviceAdminControllerTest.kt` | MODIFIED | Added imports: `DeviceQueryService`, `PassiveDeviceRegistrationService`, `DeviceApprovalService`, `RfCodeService`, `DeviceLifecycleService`, `UsbDispatchPayloadService`, `HubDiagnosticsService`, `StoreAccessService` |
+| `backend/src/test/.../domain/device/service/EnrollmentTokenServiceTest.kt` | MODIFIED | Added imports: `StoreRepository`, `StoreAccessService`, `DeviceCommandSigningProperties` |
+| `backend/src/test/.../domain/device/service/HubDiagnosticsServiceTest.kt` | MODIFIED | Added import: `DeviceTransmitterProperties` |
+| `backend/src/test/.../domain/queue/controller/QueueAdminControllerTest.kt` | MODIFIED | Added imports: `QueueService`, `QueueEventBroadcaster`, `DeviceDispatchService`, `StoreAccessService`, `ForbiddenException` |
+| `backend/src/test/.../domain/queue/controller/QueuePublicControllerTest.kt` | MODIFIED | Added imports: `QueueService`, `StoreService`, `ServiceTypeService`, `FcmNotificationService` |
+| `backend/src/test/.../domain/queue/service/QueueServiceTest.kt` | MODIFIED | Added imports: `StoreRepository`, `QueueEventBroadcaster`, `DeviceDispatchEventBroadcaster`, `DeviceQueryService`, `StoreSettingsRepository`, `ServiceTypeRepository` |
+| `backend/src/test/.../domain/store/controller/StoreSlugControllerTest.kt` | MODIFIED | Added imports: `StoreSlugService`, `StoreAccessService`, `ForbiddenException` |
+
+**Skipped:** SpEL expression strings in `@ConditionalOnExpression` annotations (e.g. `T(org.springframework.util.StringUtils)`) are not Kotlin code and cannot be replaced with imports. KDoc `[com.thomas...]` links in comments also left as-is.
+
+## 2026-06-12 — Expiring Invite Links: completion (Tasks 1–3, 9, 13–14), final verification & post-implementation audit
+
+Closes out `docs/planned/Expiring Invite Links Plan.md`. This entry back-fills the per-task logs that were not yet written (Tasks 1–3, 9, 13, 14 — implemented in the same execution run as Tasks 4–12 but unlogged), records the Task 15 final verification, and documents the two-agent post-implementation audit (backend + frontend) with its amendments.
+
+### Files Changed — back-filled task logs
+
+| File | Action | Summary |
+|------|--------|---------|
+| `backend/src/main/kotlin/com/thomas/notiguide/core/tenant/JoinCodeGenerator.kt` | MODIFIED | Task 1 — added `INVITE_PREFIX = "i_"` and `generate(prefix, byteCount)` overload (16 bytes → 22 base64url chars); single-arg overload keeps the legacy 9-byte length |
+| `backend/src/test/kotlin/com/thomas/notiguide/core/tenant/JoinCodeGeneratorTest.kt` | MODIFIED | Task 1 — 4 new tests (prefix, 24-char length, legacy length, url-safe alphabet) |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/redis/RedisKeyManager.kt` | MODIFIED | Task 2 — added `inviteToken`/`inviteActive`/`inviteLock`/`inviteAudit` key functions (`targetType: String` so `core/` gains no `domain/` dependency) |
+| `backend/src/main/kotlin/com/thomas/notiguide/core/redis/RedisTTLPolicy.kt` | MODIFIED | Task 2 — added `INVITE_LINK` (7 days) and `INVITE_AUDIT` (30 days) |
+| `backend/src/test/kotlin/com/thomas/notiguide/core/redis/RedisKeyManagerTest.kt` | MODIFIED | Task 2 — 1 new test (invite key formats) |
+| `backend/src/test/kotlin/com/thomas/notiguide/core/redis/RedisTTLPolicyTest.kt` | MODIFIED | Task 2 — 1 new test (invite TTLs) |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/organization/response/InviteLinkResponse.kt` | NEW | Task 3 — `InviteLinkResponse` (nullable `token`/`expiresAt` = no-active-link state, `recentUses`) + `InviteLinkUse` trail-entry DTO with Jackson-friendly defaults |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/response/InviteResolveResponse.kt` | NEW | Task 3 — public-resolve display DTO (`targetType`, `name`) |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/controller/AuthController.kt` | MODIFIED | Task 9 — `InviteLinkService` constructor injection; new public `GET /api/auth/invite/{token}` → 200 with display info or 404 (unknown/expired indistinguishable, token never echoed). Public + auth rate-limit tier automatic via existing `/api/auth/**` matchers |
+| `backend/src/test/kotlin/com/thomas/notiguide/domain/admin/controller/AuthControllerTest.kt` | MODIFIED | Task 9 — 13th `@MockkBean` (matching that file's existing FQN declaration style per plan Ground Rule 5), 2 new tests (resolve 200, resolve 404) |
+| `web/src/features/organization/invite-link-panel.tsx` | NEW | Task 13 — `InviteLinkPanel`: loading/active/empty states, copy-to-clipboard, AlertDialog regenerate confirm, valid-until line, canonical warning caution box, usage-trail block (renders in both link states, gated only on non-empty `recentUses`, "current link" chip via `Badge` default vs outline, fixed-locale timestamps) |
+| `web/src/app/[locale]/dashboard/settings/organization/page.tsx` | MODIFIED | Task 14 — `InviteLinkPanel` (org variant) below `JoinCodePanel` |
+| `web/src/app/[locale]/dashboard/settings/store/page.tsx` | MODIFIED | Task 14 — `InviteLinkPanel` (store variant) inside the existing `storeId && storeOrgId === null` gate |
+| `web/src/app/[locale]/dashboard/admins/page.tsx` | MODIFIED | Task 14 — panel above `JoinRequestsPanel`; SUPER_ADMIN → org panel; role-ADMIN → store panel gated on the **store's** `orgId === null` fetched via `getStore(adminStoreId)` (never `admin.orgId`) |
+
+### Task 15 — Final verification
+
+- Backend: `./gradlew test` — BUILD SUCCESSFUL, full suite green (re-run after audit amendments).
+- Web: `yarn lint` clean (216 files) → `yarn test` 22/22 (8 suites, incl. `parity.test.ts`) → `yarn build` compiled successfully, 41/41 static pages; `/register` prerenders statically, confirming the `<Suspense>` boundary around `RegisterWizard` satisfies Next.js 16's `useSearchParams` requirement. (`yarn build` was run on explicit user instruction for this audit pass, overriding the plan's no-build rule.)
+- GitNexus: `detect_changes` run, but the index predates this feature (stale — `regenerate`/`InviteLinkService` unknown to it); scope was verified via `git status` in both repos instead and matches the plan's File Map exactly. The post-commit hook will re-run `npx gitnexus analyze`.
+
+### Post-implementation audit (2 parallel reviewers: backend Tasks 1–9, frontend Tasks 10–14)
+
+Both audits returned **no CRITICAL or HIGH findings** and judged the implementation a faithful, near-verbatim execution of the plan. All non-verbatim test additions strengthen assertions only. Findings and dispositions:
+
+#### Amended
+
+| Finding | Severity | Fix |
+|---|---|---|
+| `InviteLinkService.regenerate` lock release not cancellation-safe — a cancelled request skips the `finally` DEL (suspend call in `finally` throws immediately on cancellation), locking the tenant out of regenerates for the 10 s lock TTL | LOW (backend) | `backend/.../InviteLinkService.kt` — lock release wrapped in `withContext(NonCancellable) { … }`; imports `NonCancellable`/`withContext` added |
+| Stale comment "AuthController's 12 collaborators" after the 13th `@MockkBean` | INFO (backend) | `backend/.../AuthControllerTest.kt` — comment updated to 13 |
+| Regenerate/rotate failure silently swallowed — a lock-mutex 409 (an error path spec § 6 explicitly names as "loser retries") or network failure closed the confirm dialog with zero feedback, leaving a possibly-revoked link on screen | LOW (web) | `web/src/features/organization/invite-link-panel.tsx` + sibling `join-code-panel.tsx` — `catch` added: `ApiError` → `toast.error(translateCommonApiError(...))`, else `toast.error(translateNetworkError(...))` (both panels fixed in one pass for sibling consistency) |
+| Clipboard copy failure unhandled (permission denied / non-secure context → unhandled rejection, no signal) | LOW (web) | Both panels — copy wrapped in try/catch → `toast.error(tAdmins("copyFailed"))`; new `admins.copyFailed` key added to `en.json`/`vi.json` (wording reused verbatim from the already-approved `devices.tokens.copyFailed`: "Could not copy to clipboard" / "Không thể sao chép") |
+
+#### Accepted — no change (documented rationale)
+
+| Finding | Severity | Rationale |
+|---|---|---|
+| The "Provide a join code or an invite link[, not both]" 400 messages contain both the "invite" and "join code" substrings, so the web's error matcher would map them to invite-link copy | LOW (backend) | Messages are exactly what the spec prescribes; the case is unreachable from the web UI (the form client-validates empty codes and never sends both fields) — only hand-rolled API clients can trigger it. Changing either side needs a user decision on spec wording |
+| `OffsetDateTime.now()` renders `expiresAt`/`usedAt` with the JVM default zone offset (e.g. `+07:00`) rather than `Z` | INFO (backend) | Instant is correct and ISO-8601 parseable everywhere (web `new Date()` handles offsets); plan-identical |
+| `requireOrgOwner`'s 403 message still says "join codes" while also guarding invite-link endpoints | INFO (backend) | Explicitly accepted in plan Task 7 — the web branches on status code only |
+| Mid-flow token death shows `inviteInvalid` twice (wizard warning box + form field error) | INFO (web) | By design — the plan's flow-check describes both renders (defense in depth) |
+| Panel fetch effect has no cancellation flag / loading reset | INFO (web) | Unreachable in practice (stable `fetchLink` per mount); identical to the established `JoinCodePanel` pattern |
+| "Current link" chip semantics conveyed only by Badge color + hover `title` | INFO (web) | Plan-verbatim; minor a11y nit noted for future polish |
+| Invite URL interpolates the token without `encodeURIComponent` | INFO (web) | Safe — tokens are base64url (`[A-Za-z0-9_-]`) by construction; the resolve route constant does encode |
+
+#### Scope note
+
+The `web` diff also carries an unrelated pre-existing change (`components/layout/topbar.tsx`, `app/[locale]/dashboard/settings/account/page.tsx`, and the `common.selfManaged` key removal from `en.json`/`vi.json`). That change is **not** part of the invite-links feature; no dangling usage of the removed key remains and i18n parity passes.
+
+### Skipped / Deferred (per plan Task 15)
+
+| Item | Status | Reason |
+|---|---|---|
+| Use-count caps, per-invitee invitations, recording link opens/lifecycle events | DEFERRED | Spec § 9 future work |
+| Web component tests for the new UI | SKIPPED | Vitest covers only `src/**/*.test.ts` (node env); spec § 8's seven manual scenarios were handed to the user as the live-stack checklist |
+| Backend `./gradlew build` | SKIPPED | Project rule — tests only; build belongs to the deploy flow |
+
+---
+
+## 2026-06-11 — Expiring Invite Links: Task 12 — RegisterWizard + invite-aware RegisterJoinForm
+
+Extracted the register page's state machine into a new `RegisterWizard` client component (wrapped in `<Suspense>`) so `useSearchParams` resolves without a static-render boundary error. Added invite-link resolution on mount and dead-token handling on submit.
+
+### Files Changed
+
+| File | Action | Summary |
+|------|--------|---------|
+| `web/src/features/auth/register-wizard.tsx` | CREATED | New `RegisterWizard` client component: reads `?invite=` via `useSearchParams`, resolves token with `resolveInvite()` on mount, drives view state machine (select / CREATE_ORG / CREATE_STORE / JOIN / active / pending), clears invite state on 400 "invite" backend error |
+| `web/src/app/[locale]/(auth)/register/page.tsx` | MODIFIED | Stripped to a static shell: removed all state, imports `RegisterWizard`, wraps it in `<Suspense fallback={null}>`. Shell markup and CSS classes kept verbatim from the original. |
+| `web/src/features/auth/register-join-form.tsx` | MODIFIED | Added optional `invite` prop: hides join-code field when present, submits `inviteToken` instead; `mapApiError` now checks `code === 400 && includes("invite")` first (shows `inviteInvalid` on joinCode field), then existing join-code path |
+
+### Adaptations vs plan
+
+- **Shell markup**: current page and plan shell were identical — no adaptation needed.
+- **Import order**: Biome required `next/navigation` before `next-intl` (plan had them reversed) — fixed on first lint pass.
+- **`useRegisterForm` / `buildSubmitHandler` API**: real shared hook matched the plan's signature exactly (`buildRequest`, `validateExtra`, `mapApiError`) — no adaptation needed.
+- **`ApiError` shape**: `err.code` (number) and `err.message` (string) confirmed from `src/types/api.ts` — matches plan's conditions.
+
+### Lint/Format
+`yarn lint` clean → `yarn format` no fixes → `yarn lint` clean.
+
+---
+
+## 2026-06-11 — Expiring Invite Links: Task 11 — i18n keys for EN + VI
+
+Added and reworked i18n strings in both `en.json` and `vi.json` for the Expiring Invite Links feature.
+
+### Files Changed
+
+| File | Action | Summary |
+|------|--------|---------|
+| `web/src/messages/en.json` | MODIFIED | `register` namespace: reworked 5 existing keys (invite code → join code terminology); added `joiningTarget` and `inviteInvalid`. `admins` namespace: reworked `joinCodeTitle`; added 13 new invite-link keys |
+| `web/src/messages/vi.json` | MODIFIED | Mirrored all EN changes with approved VI copy |
+
+### Reworked keys (EN → new value)
+
+**`register` namespace:**
+- `pathJoinDesc`: `"Join an existing store or organization using an invite code."` → `"Join an existing store or organization using a join code."`
+- `joinCodeLabel`: `"Invite code"` → `"Join code"`
+- `joinCodePlaceholder`: unchanged value (placeholder `o_… or s_…` is terminology-neutral — no rework needed)
+- `joinCodeRequired`: `"An invite code is required"` → `"A join code is required"`
+- `invalidJoinCode`: `"That invite code is invalid"` → `"That join code is invalid"`
+
+**`admins` namespace:**
+- `joinCodeTitle`: `"Invite code"` → `"Join code"`
+
+### New keys added
+
+**`register` namespace:** `joiningTarget`, `inviteInvalid`
+
+**`admins` namespace:** `inviteLinkTitle`, `inviteLinkDesc`, `inviteLinkEmpty`, `inviteLinkGenerate`, `inviteLinkRegenerate`, `inviteLinkRegenerateConfirm`, `inviteLinkCopy`, `inviteLinkCopied`, `inviteLinkValidUntil`, `inviteLinkCaution`, `inviteLinkUsageTitle`, `inviteLinkUsageDesc`, `inviteLinkUsageCurrent`
+
+### Extra "invite code" occurrence
+
+`joinCodePlaceholder` (`"o_… or s_…"`) contains no "invite code" text — it is a format hint and required no rework.
+
+**VI reworks for renamed keys:**
+- `pathJoinDesc`: `"…bằng mã mời."` → `"…bằng mã tham gia."`
+- `joinCodeLabel`: `"Mã mời"` → `"Mã tham gia"`
+- `joinCodeRequired`: `"Cần nhập mã mời"` → `"Cần nhập mã tham gia"`
+- `invalidJoinCode`: `"Mã mời không hợp lệ"` → `"Mã tham gia không hợp lệ"`
+- `joinCodeTitle` (admins): `"Mã mời"` → `"Mã tham gia"`
+
+### Verification
+
+- `yarn lint`: 214 files checked, no issues
+- `yarn test`: 22 tests passed (8 suites), including `parity.test.ts` (2 tests — key set + rich-tag parity)
+
+## 2026-06-11 — Expiring Invite Links: Task 10 — Web API layer for invite links
+
+Added the web-side API layer for invite-link endpoints and fixed the pre-existing `RegisterResponse.outcome` → `status` bug that prevented the PENDING branch from ever firing.
+
+### Files Changed
+
+| File | Action | Summary |
+|------|--------|---------|
+| `web/src/types/admin.ts` | MODIFIED | Added `inviteToken?: string` to `RegisterRequest`; renamed `outcome` → `status` in `RegisterResponse` (bug fix — backend has always serialized `status`); added `InviteResolveResponse` interface |
+| `web/src/types/organization.ts` | MODIFIED | Added `InviteLinkUse` and `InviteLinkState` interfaces |
+| `web/src/lib/constants.ts` | MODIFIED | Added `AUTH.INVITE`, `ORGS.INVITE_LINK`, `ORGS.INVITE_LINK_ROTATE`, `STORES.INVITE_LINK`, `STORES.INVITE_LINK_ROTATE` route constants |
+| `web/src/features/organization/api.ts` | MODIFIED | Added `getOrgInviteLink`, `rotateOrgInviteLink`, `getStoreInviteLink`, `rotateStoreInviteLink` functions; extended type import to include `InviteLinkState` |
+| `web/src/features/auth/api.ts` | MODIFIED | Added `resolveInvite` function (skipAuth: true); added `get` to api imports; added `InviteResolveResponse` to type imports |
+| `web/src/app/[locale]/(auth)/register/page.tsx` | MODIFIED | Fixed `res.outcome` → `res.status` (one-line bug fix) |
+
+### `.outcome` audit
+
+Searched `src/` for all `.outcome` usages. Only one referencing `RegisterResponse` was found: `register/page.tsx:31` (fixed above). The other hit (`features/analytics/outcome-chart.tsx:22`) is a translation key `useTranslations("analytics.outcome")` — unrelated to `RegisterResponse`, no change needed.
+
+### Adaptations
+
+- `get` helper in `src/lib/api.ts` accepts `opts?: RequestOptions` with `skipAuth?: boolean` — matches the `resolveInvite` call exactly, no adaptation needed.
+
+### Skipped
+
+- Nothing skipped.
+
+## 2026-06-11 — Expiring Invite Links: Tasks 7–8 — Invite-link endpoints on OrganizationController and StoreController
+
+Wired invite-link GET + rotate endpoints onto both controllers following TDD (red → green). OrganizationController: 4 tests pass. StoreController: 5 tests pass.
+
+### Files Changed
+
+| File | Action | Summary |
+|------|--------|---------|
+| `backend/src/test/kotlin/com/thomas/notiguide/domain/organization/controller/OrganizationControllerTest.kt` | NEW | 4 tests: no-active-link GET returns usage trail, GET forbidden for ROLE_ADMIN, POST rotate returns fresh link, POST rotate forbidden for ROLE_ADMIN — written first, confirmed red (404s on unmapped routes) |
+| `backend/src/test/kotlin/com/thomas/notiguide/domain/store/controller/StoreControllerTest.kt` | NEW | 5 tests: GET 200 for independent store, GET 409 for org-owned store, POST rotate 409 for org-owned, POST rotate 403 on access denied, POST rotate 200 for independent store — written first, confirmed red (404s) |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/organization/controller/OrganizationController.kt` | MODIFIED | Added `inviteLinkService: InviteLinkService` constructor param; added imports for `InviteLinkService`, `JoinRequestService`, `InviteLinkResponse`; added `GET /me/invite-link`, `POST /me/invite-link/rotate`, `composeLinkResponse` private helper |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/store/controller/StoreController.kt` | MODIFIED | Added `inviteLinkService: InviteLinkService` constructor param; added imports for `ConflictException`, `InviteLinkService`, `JoinRequestService`, `InviteLinkResponse`; added `GET /{id}/invite-link`, `POST /{id}/invite-link/rotate`, `requireIndependentStore` and `composeLinkResponse` private helpers |
+
+### Deviations
+
+- `StoreDto.createdAt`/`updatedAt` fields are `OffsetDateTime?` not `String?` — test helper passes `null` for both so the constructor call compiles without change.
+- `OrganizationController` had exactly 2 constructor deps (`organizationService`, `storeRepository`); no additional `@MockkBean` additions needed beyond plan.
+- `StoreController` had exactly 2 constructor deps (`storeService`, `storeAccess`); field name `storeAccess` matches plan exactly; no additional mocks needed.
+- `QueueAdminControllerTest` uses FQN-style `@MockkBean` for some deps; new test files use named imports only per project rules.
+
+### Skipped
+
+- Nothing skipped.
+
+## 2026-06-11 — Expiring Invite Links: Task 6 — Invite-token join path in RegistrationService
+
+Wired invite-token joins into `RegistrationService` following TDD (red → green). All 9 tests pass.
+
+### Files Changed
+
+| File | Action | Summary |
+|------|--------|---------|
+| `backend/src/test/kotlin/com/thomas/notiguide/domain/admin/service/RegistrationServiceTest.kt` | NEW | 9 tests: valid ORG/STORE invite-token joins, expired/unknown token rejected, both code+token rejected, neither rejected, org-owned store invite rejected, deleted-target invite rejected, `recordUse` failure swallowed — written first, confirmed red (compilation failure: missing constructor param + missing `inviteToken` field) |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/request/RegisterRequest.kt` | MODIFIED | Added `inviteToken: String? = null` field with `@field:Size(max = 64)` |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/service/RegistrationService.kt` | MODIFIED | Added `inviteLinkService: InviteLinkService` constructor param; added `CancellationException` and `UUID` imports; replaced `join()` with invite-token–aware version (mutual-exclusion guard for code+token, delegates to `joinViaInviteToken`); added `joinViaInviteToken` (resolves token, validates entity existence, org-owned-store guard, calls `recordUseSafely`); added `recordUseSafely` (swallows non-cancellation exceptions, re-throws `CancellationException`) |
+
+### Deviations
+
+- None. Constructor order matched the test exactly (adminRepository, organizationRepository, storeRepository, storeService, passwordEncoder, joinRequestService, +inviteLinkService). Existing join-code branch internals (`when` block, error messages) carried over unchanged.
+
+### Skipped
+
+- Nothing skipped.
+
+## 2026-06-11 — Expiring Invite Links: Tasks 4–5 — InviteLinkService + tests
+
+Implemented `InviteLinkService` (main) and `InviteLinkServiceTest` (test) following TDD (red → green). All 14 tests pass.
+
+### Files Changed
+
+| File | Action | Summary |
+|------|--------|---------|
+| `backend/src/test/kotlin/com/thomas/notiguide/domain/admin/service/InviteLinkServiceTest.kt` | NEW | 14 tests covering lifecycle (getActive, regenerate, resolve, resolveForDisplay) and usage-trail (recordUse, getRecentUses) — written first, confirmed red (compilation failure: unresolved reference `InviteLinkService`) |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/admin/service/InviteLinkService.kt` | NEW | `InviteLinkService`: `getActive`, `regenerate` (mutex + revoke-then-write), `resolve` (read-only, prefix-gated), `resolveForDisplay` (store visibility guard), `recordUse` (best-effort ZSet trail), `getRecentUses` (lazy prune + malformed-skip) |
+
+### Deviations
+
+- None. `Organization(id, name, joinCode)` and `Store(id, orgId, name)` matched the entity constructors exactly. `OrganizationRepository.findById` and `StoreRepository.findById` are inherited from `CoroutineCrudRepository<T, UUID>` as suspend funs — no custom override needed.
+
+### Skipped
+
+- Nothing skipped.
+
+## 2026-06-11 — Expiring Invite Links: usage audit trail amendment
+
+Amended the invite-links spec to move the link-usage audit trail from future work into scope, per a follow-up brainstorming session. Decisions locked: record **join submissions only** (no link opens, no lifecycle events), 30-day rolling window, entries carry username + timestamp + 4-char link suffix (`linkId`), storage is a per-tenant Redis ZSet (`invite:audit:{ORG|STORE}:{targetId}`) following `JoinRequestService`'s index pattern, write is best-effort (never fails registration), served via a new `recentUses` field on `InviteLinkResponse` (no new endpoints), displayed as a conditional block inside `InviteLinkPanel` with a "current link" chip accent. Spec's "use never mutates" invariant reworded to "resolve never mutates". No code written — spec only.
+
+### Files Changed
+
+| File | Action | Summary |
+|------|--------|---------|
+| `docs/spec/Expiring Invite Links Spec.md` | MODIFIED | Audit trail into scope: §1 summary bullet + decisions row, §2 goals/non-goals rebalanced, §3 invariant + sequence diagram arrow, §4.2 `invite:audit` key + `INVITE_AUDIT = 30 days`, §4.3 `recordUse`/`getRecentUses`, §4.4 `recentUses` on DTO + `InviteLinkUse`, §4.5 recordUse call, NEW §4.6 "Usage audit trail", §5.1/§5.2/§5.5 web types + panel block + 3 i18n keys, §6 two error rows, §7 owner-only/no-IP note, §8 test cases + manual scenario 7, §9 future work reworded, §10 file table updated |
+
+### Skipped
+
+- Nothing skipped from the approved design. Link opens (resolves) and generate/regenerate lifecycle events deliberately remain future work per scoping decision.
+
+## 2026-06-11 — Expiring Invite Links: design spec written
+
+Captured the approved brainstorming design for expiring, multi-use, revocable invite links layered on top of the persistent join-code system (Redis-only, 7-day hard TTL, on-demand generation, one active link per tenant, regenerate-to-revoke). Spec was adversarially audited against the backend and web codebases; all 11 findings amended (admins-page visibility gate corrected to use the store's `orgId`, pre-existing `RegisterResponse.status`/`outcome` mismatch pulled into scope, org-owned mint = 409, invite-state clearing on expired-token submit, regenerate mutex, resolve-for-display responsibilities, terminology cleanup "invite code" → "join code", plus DTO/type/constants placements).
+
+### Files Written (1)
+
+| File | Action | Summary |
+|------|--------|---------|
+| `docs/spec/Expiring Invite Links Spec.md` | NEW | Full design spec — lifecycle, Redis keys/TTLs, `InviteLinkService`, 5 endpoints, registration flow change, web panel + register deep link (Suspense-wrapped wizard), i18n plan, error handling, security, testing |
+
 ## 2026-06-10 — Module READMEs: workspace + all six submodule READMEs written
 
 Added a portfolio-grade README set covering every repo in the NotiGuide workspace, per `docs/spec/Module READMEs Spec.md` and `docs/planned/Module READMEs Plan.md`.

@@ -1,5 +1,71 @@
 # Changelogs
 
+## 2026-06-13 — Invite link timestamps follow the active web locale
+
+`InviteLinkPanel` now formats the active invite expiry and recent-use timestamps through `next-intl`'s `useFormatter().dateTime(...)` instead of module-level `Intl.DateTimeFormat("en-US", ...)` instances. The same visible date/time fields are shown, but rendered output now follows the active web locale (`vi` / `en`) from the app's intl context, including the locale's hour-cycle preference.
+
+### Files Changed
+
+#### Web (`web/`)
+
+| File | Action | Summary |
+|------|--------|---------|
+| `src/features/organization/invite-link-panel.tsx` | MODIFIED | Replaced fixed English date formatters with locale-aware `useFormatter().dateTime(...)` calls |
+
+### Skipped / No-change notes
+
+| Item | Status | Reason |
+|------|--------|--------|
+| `src/messages/en.json` / `src/messages/vi.json` | NO CHANGE | No user-facing copy or i18n key structure changed |
+| `yarn build` | SKIPPED | Repository instruction says not to build after implementation; syntax was checked with TypeScript/Biome instead |
+
+## 2026-06-13 — Clear TS71007 (Next.js TS-plugin false positive) across client components
+
+The Next.js TypeScript language-service plugin's `client-boundary` rule emits **TS71007** (`INVALID_CLIENT_ENTRY_PROP`, an editor-only Warning — not surfaced by `tsc` or `next build`) for any function-typed prop (not named `action`/`*Action`) when a `"use client"` component declares its props as a `type` alias to an object literal. The rule does **not** inspect props declared as an `interface`. This is a false positive for client→client composition — these are event-handler callbacks that are never serialized across the server/client boundary.
+
+Converted the props of all affected client components from `type X = { … }` to `interface X { … }` — the codebase's prevailing convention (85× `interface` vs. a handful of `type` prop bags). No behavior or type change; verified with `yarn lint`, `npx tsc --noEmit`, and `yarn build` (all clean). Data-only `type` prop bags with no function members (`inline-error`, `password-validation-checklist`) were left as-is since they never trigger the rule. (`admin-directory-toolbar.tsx` was converted as part of the invite-dialog work below.)
+
+### Files Changed
+
+#### Web (`web/`)
+
+| File | Action | Summary |
+|------|--------|---------|
+| `src/features/admin/admin-directory-table.tsx` | MODIFIED | props `type` → `interface` (5 function props) |
+| `src/features/store/service-types-table.tsx` | MODIFIED | props `type` → `interface` (4) |
+| `src/features/store/store-management-table.tsx` | MODIFIED | props `type` → `interface` (3) |
+| `src/features/admin/admin-directory-pagination.tsx` | MODIFIED | props `type` → `interface` (2) |
+| `src/features/store/store-management-pagination.tsx` | MODIFIED | props `type` → `interface` (2) |
+| `src/features/admin/delete-admin-dialog.tsx` | MODIFIED | props `type` → `interface` (2) |
+| `src/features/admin/admin-directory-error-banner.tsx` | MODIFIED | props `type` → `interface` (1) |
+| `src/features/store/store-management-error-banner.tsx` | MODIFIED | props `type` → `interface` (1) |
+| `src/features/store/store-management-header.tsx` | MODIFIED | props `type` → `interface` (1) |
+
+## 2026-06-13 — Admin management: invite link moves to a dialog, manual refresh, auto-update on approval
+
+On the admin-management page (`dashboard/admins`), the invite-link panel moves behind a `Link mời` button in the directory toolbar (opening a dialog), a manual refresh icon-button now reloads the whole page (admin directory + pending join requests) on demand, and approving a pending join request refetches the directory so the new verified admin appears without a page reload. The invite dialog refetches its state each time it opens, so recent-join activity is always current when viewed.
+
+`InviteLinkPanel` gains an optional `embedded` prop (drops the card chrome + its own heading) so the new `InviteLinkDialog` can reuse it; with the prop omitted, its rendering is unchanged. The role/store → invite selection is extracted into a pure, unit-tested `resolveInviteConfig` module. The join-requests refetch-on-signal uses the same two-effect pattern (mount fetch + guarded signal effect) as the queue dashboard — no lint suppression.
+
+**Deliberately unchanged (recorded per convention):** the in-table shield-verify already updates optimistically and is untouched; both Settings tabs that embed `InviteLinkPanel` (`settings/organization`, `settings/store`) pass no `embedded` prop and render exactly as before; no backend/API/schema change.
+
+Design docs: `docs/spec/Admin Management Invite Dialog & Auto-Refresh Spec.md`, `docs/planned/Admin Management Invite Dialog & Auto-Refresh Plan.md`.
+
+### Files Changed
+
+#### Web (`web/`)
+
+| File | Action | Summary |
+|------|--------|---------|
+| `src/messages/en.json` / `src/messages/vi.json` | MODIFIED | Added mirrored `admins.refresh` aria-label ("Refresh list" / "Tải lại danh sách") |
+| `src/features/organization/invite-config.ts` | CREATED | Pure `resolveInviteConfig(isSuperAdmin, adminStoreId, storeOrgId)` + `InviteConfig` type |
+| `src/features/organization/invite-config.test.ts` | CREATED | Unit tests for `resolveInviteConfig` (mocks `@/features/organization/api`) |
+| `src/features/organization/invite-link-panel.tsx` | MODIFIED | Added optional `embedded` prop — drops card chrome + own title/description; default rendering unchanged (Settings tabs unaffected) |
+| `src/features/organization/invite-link-dialog.tsx` | CREATED | Controlled dialog wrapping the embedded panel; refetches on open |
+| `src/features/admin/admin-directory-toolbar.tsx` | MODIFIED | Added refresh icon-button (`RefreshCcw`, spins while refreshing) + `Link mời` trigger (`Link2`); new props `refreshing`, `onRefresh`, `showInviteButton`, `onOpenInvite`. Props declared as an `interface` (the codebase's 85× convention) rather than a `type` literal, which avoids the Next.js TS-plugin false positive **TS71007** (`INVALID_CLIENT_ENTRY_PROP`) — the `client-boundary` rule only inspects `type`-literal props and flags any non-`Action` function member, even for client→client composition |
+| `src/features/admin/join-requests-panel.tsx` | MODIFIED | New `refreshSignal` prop (refetch on bump, two-effect pattern) + `onApproved` callback (parent refetches directory after approval) |
+| `src/app/[locale]/dashboard/admins/page.tsx` | MODIFIED | Moved invite panel into `InviteLinkDialog` (toolbar-triggered); added `inviteOpen`/`refreshing`/`refreshSignal` state, memoized `inviteConfig`, whole-page `handleRefresh`; removed inline `InviteLinkPanel` blocks |
+
 ## 2026-06-13 — Join Request Role Selection: organization owners choose the joiner's role on approval
 
 When a SUPER_ADMIN approves an **organization** join request, they now choose the new account's role: a store-scoped `ROLE_ADMIN` (assigned to a store, as before) or a peer org-wide `ROLE_SUPER_ADMIN` (no store, governs all stores). The choice is offered only for ORG-target requests; the server enforces the invariant that `ROLE_SUPER_ADMIN` is unreachable from an independent-store (STORE-target) approval (403). No schema change — the existing `chk_admin_tenancy` constraint is satisfied by construction via a typed `Approval` decision (SUPER_ADMIN ⇒ `org_id` set / `store_id` null; ADMIN ⇒ `store_id` set / `org_id` null). New SUPER_ADMINs created this way are auto-verified, matching the existing approval flow.

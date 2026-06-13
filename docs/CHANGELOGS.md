@@ -1,5 +1,39 @@
 # Changelogs
 
+## 2026-06-13 — Join Request Role Selection: organization owners choose the joiner's role on approval
+
+When a SUPER_ADMIN approves an **organization** join request, they now choose the new account's role: a store-scoped `ROLE_ADMIN` (assigned to a store, as before) or a peer org-wide `ROLE_SUPER_ADMIN` (no store, governs all stores). The choice is offered only for ORG-target requests; the server enforces the invariant that `ROLE_SUPER_ADMIN` is unreachable from an independent-store (STORE-target) approval (403). No schema change — the existing `chk_admin_tenancy` constraint is satisfied by construction via a typed `Approval` decision (SUPER_ADMIN ⇒ `org_id` set / `store_id` null; ADMIN ⇒ `store_id` set / `org_id` null). New SUPER_ADMINs created this way are auto-verified, matching the existing approval flow.
+
+Approach A from the spec: the controller resolves authorization + role/tenancy into a sealed `Approval` type; the service persists the matching columns. The dialog defaults to ADMIN and shows a warning only when SUPER_ADMIN is selected.
+
+**Deliberately unchanged (recorded per convention):** the manual "Add admin" path (`POST /api/admins` / `AdminService.createAdmin`) stays `ROLE_ADMIN`-only — its existing guard at `AdminService.kt:92` is untouched. There is no schema migration. The `requireStore` dialog prop was renamed to `allowRoleChoice` (store is now required only for the ADMIN branch).
+
+Design docs: `docs/spec/Join Request Role Selection Spec.md`, `docs/planned/Join Request Role Selection Plan.md`.
+
+### Files Changed
+
+#### Backend (`backend/`)
+
+| File | Action | Summary |
+|------|--------|---------|
+| `src/main/kotlin/com/thomas/notiguide/domain/admin/request/ApproveJoinRequest.kt` | MODIFIED | Added `role: AdminRole = ROLE_ADMIN` (default keeps existing/legacy callers backward compatible) |
+| `src/main/kotlin/com/thomas/notiguide/domain/admin/service/JoinRequestService.kt` | MODIFIED | Added nested sealed `Approval` (`AsAdmin(storeId)` / `AsSuperAdmin(orgId)`); `approve` now takes `Approval` and constructs the admin row with role+tenancy per branch (lock / `existsByUsername` re-check / `deleteKeys` / auto-verification unchanged) |
+| `src/main/kotlin/com/thomas/notiguide/domain/admin/controller/JoinRequestController.kt` | MODIFIED | `approve` maps the request to an `Approval`: ORG → `AsSuperAdmin(orgId)` or store-validated `AsAdmin(storeId)`; STORE → rejects `ROLE_SUPER_ADMIN` (403) then `AsAdmin(principal.storeId)`. Optional-body comment added |
+| `src/test/kotlin/com/thomas/notiguide/domain/admin/service/JoinRequestServiceTest.kt` | MODIFIED | Added `approve` tests: AsSuperAdmin column assertions, AsAdmin column assertions, lock-already-held conflict |
+| `src/test/kotlin/com/thomas/notiguide/domain/admin/controller/JoinRequestControllerTest.kt` | CREATED | WebFluxTest: role→Approval mapping, 409 missing store, STORE+SUPER_ADMIN invariant 403, non-super 403, backward-compat default role, STORE happy path |
+
+#### Web (`web/`)
+
+| File | Action | Summary |
+|------|--------|---------|
+| `src/messages/en.json` / `src/messages/vi.json` | MODIFIED | Added mirrored `admins.requestApproveSuperAdminNote` warning copy (EN + VI) |
+| `src/features/admin/approve-join-request-logic.ts` | CREATED | Pure gating helpers `isStoreRequired` / `isConfirmEnabled` |
+| `src/features/admin/approve-join-request-logic.test.ts` | CREATED | Unit tests for the gating helpers (incl. boundary case) |
+| `src/features/admin/api.ts` | MODIFIED | `approveJoinRequest(requestId, role, storeId?)` now posts `{ role, storeId }` |
+| `src/features/admin/api.test.ts` | CREATED | Unit test asserting the approve payload (mocks `@/lib/api`) |
+| `src/features/admin/approve-join-request-dialog.tsx` | MODIFIED | Role picker (default ADMIN), conditional store select, SUPER_ADMIN warning box (canonical alert pattern); `requireStore` prop → `allowRoleChoice`; `onConfirm(role, storeId?)` |
+| `src/features/admin/join-requests-panel.tsx` | MODIFIED | `doApprove(role, storeId?)` threads the role; passes `allowRoleChoice={isSuperAdmin}` |
+
 ## 2026-06-12 — Link-Only Invitations (Join-Code Purge): implementation (Tasks 1–9) + documentation (Task 10)
 
 Completed the full purge of the join-code (`o_`/`s_`) invitation system from both backend and web, making expiring invite links the sole invitation mechanism. The join-request approval system is untouched. Four API routes removed: `GET /api/orgs/me/join-code`, `POST /api/orgs/me/join-code/rotate`, `GET /api/stores/{id}/join-code`, `POST /api/stores/{id}/join-code/rotate`.

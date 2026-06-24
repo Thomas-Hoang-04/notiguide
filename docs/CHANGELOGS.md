@@ -1,5 +1,309 @@
 # Changelogs
 
+## 2026-06-24 — Enhance ESP-NOW pairing sequence diagram
+
+Updated the first subsection diagram in `docs/spec/Thiết kế giao thức.md` to better match the pairing flow shown in the reference image while reflecting the implemented ESP-NOW handshake.
+
+**Changes:**
+- Reworked Figure 4.13 into a richer Mermaid sequence diagram with two main lifelines: the reminder device and the central transmitter.
+- Added pairing details for channel scanning, `CHALLENGE`, HMAC verification, operator confirmation, `OFFER`, `ACK`, `CONFIRM`, receiver-side NVS save, `SAVED`, and hub-side roster/NVS persistence.
+- Adjusted the surrounding paragraph so the prose matches the final confirmation/save order shown in the diagram.
+
+**Verification:**
+- Checked Mermaid sequence syntax through Context7.
+- Cross-checked the message order against `transmitter/main/pair/espnow_pair_host.c` and `receiver-esp32/main/pair/espnow_pair.c`.
+- Documentation-only change; build and test commands were intentionally skipped per repository instruction.
+
+## 2026-06-24 — Polish Web Serial protocol design subsection
+
+Refined the Web Serial subsection in `docs/spec/Thiết kế giao thức.md` so the prose and Mermaid diagram describe the browser-mediated Web Serial lifecycle before the project-specific JSON-line command protocol.
+
+**Changes:**
+- Rewrote the subsection introduction to distinguish MQTT remote operation from local USB maintenance/configuration.
+- Updated Figure 4.15 to show user permission, `requestPort()`, `port.open(...)`, readable/writable stream setup, bidirectional read/write flow, connect/disconnect events, lock release, and serial-port closure.
+- Tightened the JSON-line protocol and command-group descriptions for a more concise thesis-style explanation.
+- Corrected the adjacent Figure 4.12 caption from three to four communication protocols.
+
+**Verification:**
+- Documentation-only change; build and test commands were intentionally skipped per repository instruction.
+
+## 2026-06-24 — Resilient USB Dispatch: Task 5 — `transmit_slot` serial command (firmware)
+
+Added `transmit_slot` USB serial command to `transmitter/main/serial/serial_protocol.c` so the admin web app can dispatch a page by hub slot number (RF codes never leave the hub). The command delegates to `dispatch_slot_execute` (Task 4), which gates on `OP_STATE_ACTIVE` and roster presence.
+
+**Changes:**
+- Added `#include "dispatch/dispatch.h"` inside `#if CONFIG_TRANSMITTER_PAIRING_ENABLED` guard (line ~29) — the only new include.
+- Added `static void handle_transmit_slot(const char *id, const cJSON *payload)` inside a `#if CONFIG_TRANSMITTER_PAIRING_ENABLED` / `#endif` guard, placed after `handle_roster_unpair`. Validates slot (1..`CONFIG_TRANSMITTER_PAIR_MAX_RECEIVERS`) and action (`"call"` | `"stop"`), calls `dispatch_slot_execute`, returns `{status:"applied", applied_at_ms}` or `{status:"rejected", reason}`.
+- Added `transmit_slot` branch in `serial_handle_line` dispatcher inside the existing `#if CONFIG_TRANSMITTER_PAIRING_ENABLED` block, after `roster.unpair`. In the `#else` (non-pairing build) fallback, added `transmit_slot` to the existing `pairing_disabled` error clause.
+
+**API/macros verified against real code:**
+- `json_get_string`, `serial_send_error`, `serial_send_response`, `serial_mark_session_active` — all confirmed present and used exactly as in the handler.
+- `cJSON_CreateObject`, `cJSON_AddStringToObject`, `cJSON_AddNumberToObject`, `cJSON_GetObjectItem`, `cJSON_IsNumber` — confirmed by `handle_transmit` / `handle_roster_unpair` sibling usage.
+- `CONFIG_TRANSMITTER_PAIR_MAX_RECEIVERS` — confirmed used in `pair/roster.h` and `pair/roster.c` slot bounds.
+- `slot_exec_result_t` and `dispatch_slot_execute` declared under `#if CONFIG_TRANSMITTER_PAIRING_ENABLED` in `dispatch/dispatch.h` (Task 4).
+
+**Non-pairing build:** non-pairing `#else` clause extended with `transmit_slot` → returns `pairing_disabled` error; no link-time reference to `dispatch_slot_execute` or `slot_exec_result_t`.
+
+## 2026-06-24 — Resilient USB Dispatch: Whole-branch audit + amendments
+
+Cross-layer audit (backend + firmware + web) of the completed feature. Verdict was FIX-THEN-SHIP with no Critical findings — the safety-critical double-page guard holds in code. Amendments applied:
+
+- **(Important, fixed) Tier-1 duplicate event no longer fires a spurious error toast** — `web/.../queue/page.tsx`. In `ONLINE_SERIAL_FALLBACK`, a duplicate `DEVICE_DISPATCH_FAILED` (dedupe miss) previously fell through to the generic reason-toast block, surfacing an error for a dispatch already retried. The retry branch now returns silently on a dedupe miss (`if (!dedupe.seen(key)) return;`) instead of falling through. Aligns with the spec's at-least-once SSE expectation.
+- **(Important, fixed) Double-page suppression now has an automated assertion** — `backend/.../QueueServiceTest.kt`. Added two tests: one asserts `reconcileTerminalTransition(SERVE)` returns `applied`, broadcasts `TICKET_SERVED`, and calls `deviceDispatchEventBroadcaster.broadcast` **zero** times (the guard); the other asserts the `gone` path emits nothing. Earlier CHANGELOGS overstated that `OfflineReconciliationServiceTest` covered this — corrected above.
+- **(Minor, fixed) Stale "queue empty" line in offline call-next** — `web/.../queue/page.tsx`. The `OFFLINE_SERIAL` call-next branch now calls `setEmptyMessage(false)` on the success path before `addServingTicket`, so a prior empty hit clears once a ticket is advanced.
+- **(Important, FIXED — user opted for full coverage) Ack-timeout `DEVICE_DISPATCH_FAILED` now enriched for Tier-1.** Previously `DispatchReconciliationService` broadcast the ack-timeout failure without `deviceId`/`dispatchAction`, so a USB-hub-equipped store in `ONLINE_SERIAL_FALLBACK` would NOT auto-retry an ack-timeout over serial. Fix (additive, backward-compatible): added an optional `action: String?` (`@JsonProperty("action")`) to `DispatchTrackingRecord`; `TransmitterDispatchService.trackDispatch` now records `action = dispatchActionOf(event.type)`; and `DispatchReconciliationService` broadcasts `deviceId = tracking.deviceId`, `dispatchAction = tracking.action`. In-flight tracking records written before this change deserialize `action = null` and degrade to the prior toast-only behavior (5-min TTL ages them out). `DispatchReconciliationServiceTest` strengthened to assert the enriched `deviceId`/`dispatchAction` reach the SSE event. Blast radius (verified by grep): one construction site, one read site — both updated.
+- **(Minor, accepted) reconcileTerminalTransition skips MQTT publish + analytics** that `serveTicket`/`cancelTicket` perform — plan-mandated minimal reconcile; reconciled terminals are not counted in throughput/analytics and not pushed to MQTT displays. Consistent with the accepted long-outage undercount limitation (now also applies to short outages).
+- **(Minor, accepted) Offline non-device terminal toast reuses `dispatch.offlineIssueDisabled`** ("Can't add new pagers…") — plan-mandated copy (Task 17 Step 2); semantically about issuance rather than the non-device ticket being un-serveable offline. A dedicated key would read better; left as-is to avoid a copy/VI-review cycle for a rare edge.
+- **(Minor, accepted) Firmware `dispatch_slot_execute` reports `device_decommissioned` for an unprovisioned (`OP_STATE_INVALID`) hub** — inherited verbatim from the pre-refactor MQTT path; behavior is safe (rejects, no transmit). NOT changed, because the plan requires MQTT slot behavior to remain byte-for-byte identical after the extraction.
+
+**Verification after amendments:** web `yarn lint` clean (236 files) + `yarn vitest run` 51/51 (16 files); backend `QueueServiceTest`, `TransmitterDispatchFailedEventTest`, `DeviceDispatchIssueFallbackTest`, `OfflineReconciliationServiceTest` all green.
+
+## 2026-06-24 — Resilient USB Dispatch: Task 18 — Integration drills, deferred items, VI review note
+
+Finalization for the Resilient USB Dispatch feature. All code tasks (1–17) are implemented; this entry records the manual verification to run in the audit/build flow and the accepted gaps.
+
+**Manual integration drills (to execute in the audit/build flow — not runnable here per the no-build constraint):**
+- **Tier-1 drill (Task 16):** Stop the MQTT hub, connect the USB transmitter hub. With the queue in `ONLINE_SERIAL_FALLBACK`, calling a device ticket must emit RF over serial (`transmit_slot`) with no error toast. Verify the SSE `DEVICE_DISPATCH_FAILED` retry fires exactly once per `(ticketId, action, deviceId)` (dedupe), and the banner reads `dispatch.banner.serialFallback`.
+- **Tier-2 + reconcile drill (Task 17):** Kill the backend entirely (`OFFLINE_SERIAL`). Serve/cancel/no-show current device tickets → `transmit_slot` STOP over serial, outbox grows, local serving store mutates; call-next advances from the persisted waiting snapshot. Restore the backend → on the reachable rising edge the `reconcile-offline` POST fires once, `dispatch.syncedToast` shows the synced count, the queue re-fetches, and there is **no double-page**.
+- **Firmware on-device checks (Tasks 4–5):** Over MQTT, confirm slot dispatch ack + RF are unchanged for `call`/`stop` on both bands (433 MHz + 2.4 GHz); a suspended hub rejects with `device_suspended`, an empty slot with `slot_not_found`. Over Web Serial, `{type:"transmit_slot", payload:{slot:1, action:"call"}}` → `{status:"applied"}` + RF; `slot:99` → `invalid_slot`; unpaired slot → `slot_not_found`; suspended hub → `device_suspended`.
+- **Double-page guard assertion (Task 3):** `OfflineReconciliationService` / `QueueService.reconcileTerminalTransition` must apply the terminal state WITHOUT emitting any `DEVICE_*_REQUESTED` event — reconcile of an offline SERVE/CANCEL/NO_SHOW must never re-page a receiver. Asserted directly by `QueueServiceTest.reconcileTerminalTransition applies SERVED without emitting a device dispatch (double-page guard)` (`verify(exactly = 0) { deviceDispatchEventBroadcaster.broadcast(any()) }`) plus the `gone` case; `OfflineReconciliationServiceTest` covers per-item result propagation. Re-confirm during the integration drill.
+
+**Accepted / deferred gaps (logged, by design):**
+- **Standalone-receiver offline gap:** offline STOP RF is only deliverable to hub-paired (slot) receivers; a standalone receiver with no cached slot still records the terminal transition (replayed on reconnect) but cannot be paged while offline.
+- **Non-device offline boundary:** non-device tickets cannot be progressed in `OFFLINE_SERIAL` (the public display is backend-driven); the UI surfaces `dispatch.offlineIssueDisabled` and aborts.
+- **Long-outage TTL fidelity (spec §11):** a very long offline window can let the backend's ticket TTLs lapse before reconnect; reconcile then returns `gone` for those tickets (terminal, nothing to retry) — accepted.
+- **Firmware no-host-test gap:** the transmitter has no host test harness and builds are forbidden in this flow, so Tasks 4–5 ship with documented on-device verification only (no automated red-green).
+- **Offline call-next loading state (Task 17):** the `OFFLINE_SERIAL` call-next branch sets no `callLoading`; rapid `N`/clicks advance multiple distinct snapshot tickets (no duplicate dispatch) — benign, accepted.
+
+**Vietnamese copy review:** the six `queue.dispatch` VI strings added in Task 14 were reviewed and approved by the user in-session before writing `vi.json`. Per the standing `CLAUDE.md` rule they remain open to further native refinement, but no blocking review is outstanding.
+
+## 2026-06-24 — Resilient USB Dispatch: Task 17 — Offline serving + call-next + re-page (web)
+
+Tier-2 offline operation for the serving area and call-next.
+
+- `web/src/features/queue/serving-display.tsx`: `ServingDisplay` and `ServingTicketCard` take `mode: DispatchMode` and `dispatchSerial` (the `(target:{id,hubSlot}, action) => Promise<TransmitResult>` from Task 16's `useSerialDispatch`). When `mode === "OFFLINE_SERIAL"`, `handleServe`/`handleNoShow`/`handleCancel` branch BEFORE the backend call: non-device tickets toast `offlineIssueDisabled` and abort; device tickets best-effort dispatch a `stop` over serial (only hub-paired slots are reachable; `slot_not_found` → `errorReceiverNotOnHub`), append `SERVE`/`NO_SHOW`/`CANCEL` to the outbox with an ISO `at`, and remove the local serving ticket. The existing `finally` still clears loading. A new "Re-page over USB" `Button` (`outline`/`sm`, `Radio` icon, `dispatch.rePageUsb`) renders on device tickets whenever `mode` is a serial mode and re-issues a `call`.
+- `web/src/app/[locale]/dashboard/queue/page.tsx`: `handleCallNext` gains an `OFFLINE_SERIAL` branch (after the existing guard) that advances via `shiftWaitingDeviceTicket()` (null → `queueEmpty`), pages over serial when a slot is cached, and `addServingTicket` with a reconstructed `CALLED` `TicketDto` — no backend call, no outbox append (a still-serving offline call has no terminal entry yet). `<ServingDisplay>` now receives `mode` + `dispatchSerial`.
+- **Known minor (logged for audit):** the offline call-next branch does not set `callLoading`, so rapid `N`/clicks advance multiple snapshot tickets; each shift returns a distinct ticket so there is no duplicate dispatch — benign, accepted.
+
+## 2026-06-24 — Resilient USB Dispatch: Task 16 — Wire the queue page (mode, banner, Tier-1 retry, reconcile) (web)
+
+Wired the Phase-3 pure logic and Phase-4 hooks into `web/src/app/[locale]/dashboard/queue/page.tsx`.
+
+- **Hooks/state:** `useSerial()`, `useBackendReachability()` (→ `reachable`, `onConnectionChange`), a page-owned `dispatchReady` state, `useDispatchMode({reachable, dispatchReady, serial})` → `mode`, `useSerialDispatch(storeId ?? "", serial)` → `serialDispatch`, and a stable `createDispatchDedupe()` via `useRef`.
+- **Hydrate:** once-on-mount effect calls `useOfflineDispatchStore.getState().hydrate()`.
+- **Slot capture:** page-owned `getAvailableDevices` effect (keyed `[storeId, deviceRefreshSignal]`) sets `dispatchReady` and persists every available device's `hubSlot` via `setSlot` (never removed → resolvable after the device goes busy). Separate from `DeviceDispatchPanel`'s own fetch by design.
+- **Waiting snapshot:** effect keyed `[storeId, statsRefreshSignal, reachable]`, only while `reachable`, fetches `listWaitingTickets`, keeps device-bound tickets, maps to `SnapshotTicket` (resolving `hubSlot` from the store), and calls `setWaitingSnapshot` — the sole offline call-next source (Task 17).
+- **Tier-1 retry:** SSE handler is now `async` and receives `onConnectionChange` as the 3rd arg. On `DEVICE_DISPATCH_FAILED`, when `mode === "ONLINE_SERIAL_FALLBACK"` with `deviceId`+`dispatchAction` and the dedupe admits `${ticketId}:${dispatchAction}:${deviceId}`, it re-dispatches over serial (`serialDispatch`) and toasts `errorNoActiveTransmitter` only if the serial result is not `applied`; otherwise it falls through to the existing reason-based toasts.
+- **Reconcile on reconnect:** `prevReachableRef` rising-edge effect (keyed `[reachable, storeId, tQueue]`) replays the outbox via `reconcileOffline`, clears ALL sent items on a resolved response (applied/superseded/gone are all terminal), toasts `syncedToast {count}`, and bumps `deviceRefreshSignal`; items are retained only if the call throws.
+- **UI:** renders `<DispatchModeBanner mode={mode} />` under the paused banner and passes `mode` to `<DeviceDispatchPanel>`. `handleCallNext` and `<ServingDisplay>` left untouched (Task 17).
+
+## 2026-06-24 — Resilient USB Dispatch: Task 12 — SSE connection state + `useBackendReachability` (web)
+
+- `web/src/hooks/use-queue-events.ts`: Added optional `onConnectionChange?: (state: "open" | "closed") => void` third parameter; wired `eventSource.onopen` / `eventSource.onerror` to call it via a stable `onConnRef` ref. The existing `eventTypes` `addEventListener` loop, cleanup, and `[storeId]` dep array are unchanged.
+- `web/src/hooks/use-backend-reachability.ts` (new): `useBackendReachability()` drives `reachabilityReducer` (Task 9) from SSE connection state + API errors. Exposes `{ reachable, onConnectionChange, onApiError }` consumed by the page wiring (Task 16).
+
+## 2026-06-24 — Resilient USB Dispatch: Task 13 — `useDispatchMode` + `useSerialDispatch` (web)
+
+- `web/src/hooks/use-dispatch-mode.ts` (new): `useDispatchMode({ reachable, dispatchReady, serial })` derives `DispatchMode` via `deriveDispatchMode`, computing `hubConnectedForStore` from `serial.portState === "open"` && `identifyPayload?.device_kind === "TRANSMITTER_HUB"` && `deviceState?.op_state === "ACTIVE"` (memoized).
+- `web/src/hooks/use-serial-dispatch.ts` (new): `useSerialDispatch(storeId, serial)` returns a `useCallback` `(target: { id, hubSlot }, action) => Promise<TransmitResult>` that resolves a `SerialDispatchPlan` via `buildSerialDispatch` and routes to `sendCommand("transmit_slot", …)` (hub-slot path) or `getUsbDispatchPayload` + `sendCommand("transmit", …)` (standalone payload path, keys matching `usb-dispatch-dialog.tsx`). Minimal `{ id, hubSlot }` target shape is deliberate (device is absent from `getAvailableDevices` at call time).
+
+## 2026-06-24 — Resilient USB Dispatch: Task 14 — `DispatchModeBanner` + i18n keys (web)
+
+- `web/src/features/queue/dispatch-mode-banner.tsx` (new): Warning banner rendered only for `ONLINE_SERIAL_FALLBACK` / `OFFLINE_SERIAL` (returns `null` otherwise). Uses the canonical Warning alert-box pattern verbatim (`text-warning`, `rounded-xl`, dark overrides, `gap-2.5`, `px-3.5 py-3`), `Usb` icon (`size-4 shrink-0`, `aria-hidden`).
+- `web/src/messages/en.json`, `web/src/messages/vi.json`: Added under `queue.dispatch` (after `nextPage`) a nested `banner.{serialFallback,offline}` object plus siblings `offlineIssueDisabled`, `rePageUsb`, `errorReceiverNotOnHub`, `syncedToast` (`{count}` placeholder). Both locales structurally mirrored. **Vietnamese copy was reviewed and approved by the user in-session before writing** (per `CLAUDE.md` VI sign-off rule); it remains subject to the standing provisional-review note in Task 18.
+
+## 2026-06-24 — Resilient USB Dispatch: Task 15 — Mode-aware `DeviceDispatchPanel` (web)
+
+- `web/src/features/queue/device-dispatch-panel.tsx`: Added `mode: DispatchMode` prop; derived `canDispatch = mode !== "DISABLED" && mode !== "OFFLINE_SERIAL"` and passed it as `dispatchReady` to each `DeviceDispatchCard`. Removed the panel's internal `dispatchReady`/`setDispatchReady` state and its no-hub warning block (now superseded by the page-level `DispatchModeBanner`), plus the now-unused `AlertTriangle` import. Threaded `allowSerialFallback: mode === "ONLINE_SERIAL_FALLBACK"` into the `issueDeviceTicket` call (with `mode` added to the `handleDispatch` deps). In `OFFLINE_SERIAL` the card list is replaced by the `dispatch.offlineIssueDisabled` empty-state note (issuance is online-only per spec §2).
+
+## 2026-06-24 — Resilient USB Dispatch: Task 10 — `createDispatchDedupe` TTL de-dup helper (web)
+
+Implemented a lightweight TTL-based de-duplication helper for Tier-1 SSE retries. The `createDispatchDedupe(ttlMs?)` factory returns a `{ seen(key, now?) }` function that admits keys on first sight within the TTL window, rejects repeats, and re-admits after expiry. Self-contained, node-tested, no external dependencies.
+
+**Changes:**
+- `web/src/lib/dispatch/dedupe.ts`: New pure function `createDispatchDedupe(ttlMs = 5000)` returning an object with `seen(key: string, now?: number): boolean`. Uses a `Map<string, number>` to track last-seen timestamps. Re-admits keys when `now - last >= ttlMs`.
+- `web/src/lib/dispatch/dedupe.test.ts`: Complete vitest test suite with 2 test cases: (1) admits first call, rejects within TTL, (2) re-admits after TTL elapses. Uses explicit timestamps (0, 500, 1500) for deterministic testing.
+- **TDD evidence**: RED — Error: Cannot find package '@/lib/dispatch/dedupe'; GREEN — 2/2 tests pass, 0 lint issues.
+
+## 2026-06-24 — Resilient USB Dispatch: Task 9 — `reachabilityReducer` debounce logic (web)
+
+Implemented a pure debounce reducer for backend reachability state machine. Declares offline only after `FAILURE_THRESHOLD` (2) consecutive failures; any `sse_open` event resets to reachable immediately. Self-contained reducer with explicit state interface and event discriminated union.
+
+**TDD evidence:** RED — module not found; GREEN — all 4 tests pass (starts reachable, debounces single failure, goes offline at 2 failures, recovers on sse_open). Lint clean.
+
+**Changes:**
+- `web/src/lib/dispatch/reachability.ts`: New — exports `FAILURE_THRESHOLD`, `ReachabilityState`, `INITIAL_REACHABILITY`, `ReachabilityEvent`, `reachabilityReducer`, `isReachable`.
+- `web/src/lib/dispatch/reachability.test.ts`: New — 4 test cases covering initial state, debounce behavior, offline transition, and recovery path.
+
+## 2026-06-24 — Resilient USB Dispatch: Task 11 — offline dispatch store (snapshot + outbox) (web)
+
+Implemented the `useOfflineDispatchStore` zustand store that holds the Tier-2 offline state: the device→hub-slot mapping, the waiting-ticket snapshot (the only offline data source for "call next"), and the terminal-outcome outbox replayed on reconnect. Manual `localStorage` persistence under key `offlineDispatch`, mirroring `store/queue.ts` (no zustand `persist` middleware).
+
+**Changes:**
+- `web/src/store/offline-dispatch.ts`: New — exports `OutboxEntry`, `SnapshotTicket`, and `useOfflineDispatchStore` with state `{ slotByDevice, waitingDeviceTickets, outbox }` and actions `setSlot`, `slotFor`, `setWaitingSnapshot`, `shiftWaitingDeviceTicket`, `appendOutbox`, `clearOutbox`, `hydrate`. Every mutating action persists the three persisted slices to `localStorage`; `slotFor` returns `null` for unknown devices; `setSlot` never removes entries so a slot captured while a device is available stays resolvable after it goes busy.
+- `web/src/store/offline-dispatch.test.ts`: New — 2 vitest cases: slot mapping resolution (hit + miss → `null`), and outbox append→persist→clear-by-ticketId.
+
+**TDD evidence:** RED — module not found; GREEN — 2/2 tests pass.
+
+**Verification fix (post-implementation review):** the implementer skipped `yarn lint`; both files failed Biome formatting. Reformatted via `biome check --write`; full `yarn lint` now clean (232 files), tests still green.
+
+## 2026-06-24 — Resilient USB Dispatch: Task 3 — `OfflineReconciliationService` + reconcile endpoint (backend)
+
+Implemented the idempotent offline-reconcile endpoint (`POST /api/queue/admin/{storeId}/reconcile-offline`) that the web app calls on reconnect to replay terminal outcomes (SERVE/CANCEL/NO_SHOW) recorded while offline. Core safety property ("double-page guard") confirmed: `QueueService.reconcileTerminalTransition` applies terminal state WITHOUT emitting any `DEVICE_*_REQUESTED` dispatch event (no RF re-page), clears `device:busy`, broadcasts normal `TICKET_SERVED`/`TICKET_CANCELLED` SSE, returns `applied | superseded | gone`.
+
+**Real symbols verified:**
+- Store-access type: `StoreAccessService.requireStoreAccess(principal, storeId)` (exact match to brief)
+- Redis key accessors: `RedisKeyManager.serving(storeId)`, `RedisKeyManager.ticket(storeId, ticketId)`, `RedisKeyManager.deviceBusy(deviceId)` — all confirmed from `RedisKeyManager.kt`
+- Repository methods used: `redisTicketRepository.markServed/markCancelled` (handles TTL), `redisQueueRepository.removeFromServing/removeFromQueue` — mirrored from `serveTicket`/`cancelTicket`
+- Helpers confirmed: `parseUuid(...)`, `RedisTTLPolicy.TICKET_TERMINAL`, `TicketStatus`, `QueueSseEvent`, `queueEventBroadcaster` field name
+
+**GitNexus impact:** `handleTerminalDeviceDispatch` has d=1 callers only: `serveTicket` and `cancelTicket` (risk: LOW). `reconcileTerminalTransition` deliberately does NOT call it — confirmed safe.
+
+**TDD evidence:** RED — compile failure (`Unresolved reference 'reconcileTerminalTransition'`); GREEN — all 3 new tests pass; full suite 134 tests, 0 failures.
+
+**Changes:**
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/request/ReconcileOfflineRequest.kt`: New — `ReconcileOfflineRequest`, `OfflineTransition`, `OfflineAction` DTOs.
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/response/ReconcileOfflineResponse.kt`: New — `ReconcileOfflineResponse`, `ReconcileItemResult` DTOs.
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/service/OfflineReconciliationService.kt`: New — service that checks store access and fans out to `QueueService.reconcileTerminalTransition` per transition.
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/service/QueueService.kt`: Added `reconcileTerminalTransition` method + import for `OfflineAction`. No device dispatch path invoked.
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/controller/QueueAdminController.kt`: Added `offlineReconciliationService` constructor parameter and `POST /reconcile-offline` endpoint.
+- `backend/src/test/kotlin/com/thomas/notiguide/domain/queue/service/OfflineReconciliationServiceTest.kt`: New — 3 test cases covering per-item result propagation, superseded, and empty-list cases.
+- `backend/src/test/kotlin/com/thomas/notiguide/domain/queue/controller/QueueAdminControllerTest.kt`: Added `@MockkBean` for `OfflineReconciliationService` (required by `@WebFluxTest` wiring).
+
+## 2026-06-24 — Resilient USB Dispatch: Task 8 — `buildSerialDispatch` pure function (web)
+
+Implemented dispatch plan builder as a pure function in the web frontend. Maps device hub pairing state and action to a discriminated union of slot-based vs full-payload dispatch plans. Followed TDD: wrote test suite first, confirmed RED (module not found), implemented function per spec, passed lint + both test cases.
+
+**Changes:**
+- `web/src/lib/dispatch/serial-command.ts`: New pure function `buildSerialDispatch(device: { hubSlot: number | null }, action: SerialDispatchAction): SerialDispatchPlan` with type exports. Returns `{ kind: "slot"; slot: number; action }` if hub-paired, else `{ kind: "payload"; action }`.
+- `web/src/lib/dispatch/serial-command.test.ts`: Complete vitest test suite covering hub-paired and standalone receiver cases. All tests pass after formatting correction.
+- **TDD evidence**: RED phase confirmed (Error: Cannot find package '@/lib/dispatch/serial-command'), GREEN phase (2 passed, lint clean).
+
+## 2026-06-24 — Resilient USB Dispatch: Task 2 — `allowSerialFallback` on device-ticket issuance (backend)
+
+Added opt-in serial fallback flag to device ticket issuance. When `allowSerialFallback=true` and no MQTT transmitter is elected, issuance proceeds (USB path takes over); when `false` (default), the existing `no_active_transmitter` exception is still thrown unchanged.
+
+**Changes:**
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/request/IssueDeviceTicketRequest.kt`: Added `allowSerialFallback: Boolean = false` field.
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/device/service/DeviceDispatchService.kt`: Added `allowSerialFallback: Boolean = false` parameter to `issueDeviceTicket`; replaced Elvis-throw guard with explicit `if (elected == null && !allowSerialFallback)` check.
+- `backend/src/main/kotlin/com/thomas/notiguide/domain/queue/controller/QueueAdminController.kt`: Threaded `request.allowSerialFallback` through to `deviceDispatchService.issueDeviceTicket(...)`.
+- `backend/src/test/kotlin/com/thomas/notiguide/domain/device/service/DeviceDispatchIssueFallbackTest.kt`: New test. TDD — RED on compile (no `allowSerialFallback` param), GREEN after impl. Two cases: `false`+no transmitter → throws `DeviceConflictEnvelopeException`; `true`+no transmitter → bypasses guard, reaches `device_not_dispatchable` (not `no_active_transmitter`).
+- **Impact analysis**: `DeviceDispatchService` has one direct caller — `QueueAdminController.kt` (already updated). Risk: LOW.
+
+## 2026-06-24 — Resilient USB Dispatch: Task 7 — `deriveDispatchMode` pure function (web)
+
+Implemented the dispatch mode derivation logic as a pure function in the web frontend. Maps three boolean signals (`backendReachable`, `dispatchReady`, `hubConnectedForStore`) to a dispatch mode union type (`"ONLINE_MQTT" | "ONLINE_SERIAL_FALLBACK" | "OFFLINE_SERIAL" | "DISABLED"`). Followed TDD: wrote full test suite first, confirmed RED (module not found), implemented function per spec, passed lint + all 5 test cases.
+
+**Changes:**
+- `src/lib/dispatch/mode.ts`: New pure function `deriveDispatchMode(signals: DispatchSignals): DispatchMode` with type exports. Decision tree: offline+hub → OFFLINE_SERIAL; offline+no-hub → DISABLED; online+ready → ONLINE_MQTT (hub irrelevant); online+not-ready+hub → ONLINE_SERIAL_FALLBACK; online+not-ready+no-hub → DISABLED.
+- `src/lib/dispatch/mode.test.ts`: Complete vitest test suite covering all 5 logical states (6 physical test cases total; 2 ONLINE_MQTT cases verify hub irrelevance). All tests pass.
+
+### Verification (TDD flow)
+- Test RED: Module not found (yarn vitest run before implementation)
+- Implementation: 18-line function following spec exactly
+- Test GREEN: All 5 test suites (6 cases) pass
+- Lint: Biome check passes (2-space indent, formatted multiline expects)
+
+## 2026-06-24 — Resilient USB Dispatch: Task 4 — Extract `dispatch_slot_execute` shared core
+
+Refactored `dispatch_handle_slot` (transmitter firmware, `main/dispatch/dispatch.c`) to extract the op-state gate, roster lookup, and RF build/transmit block into a new reusable `dispatch_slot_execute(slot, action, out)`. The MQTT slot-dispatch path behavior is byte-for-byte identical after this change. No signature check, no ack channel, and no dedup ring logic was moved — `dispatch_handle_slot` retains all of those. Task 5 (serial command handler) will call `dispatch_slot_execute` directly.
+
+**Changes:**
+- `dispatch_slot_execute`: New non-static function (guarded by `CONFIG_TRANSMITTER_PAIRING_ENABLED`) encapsulating op-state gate → roster lookup → RF code preparation → `radio_tx_send` → result population in `slot_exec_result_t`
+- `slot_exec_result_t`: New result struct (`status[16]`, `reason[32]`, `applied_at_ms`) declared in `dispatch.h` under pairing guard
+- `dispatch_handle_slot`: Now delegates the core transmit block to `dispatch_slot_execute`; maps `exec_result.status/reason/applied_at_ms` back into `dispatch_ring_remember`, `publish_transmit_ack`, `reject_transmit`, `post_dispatch_event`. Does a second `roster_find_slot` after `dispatch_slot_execute` returns to build the ack envelope via `slot_to_transmit_cmd` (required so ack carries correct band/device_name on success path)
+- MQTT slot behavior unchanged
+
+### Files Changed
+
+#### Transmitter firmware (`transmitter/`)
+
+| File | Action | Summary |
+|------|--------|---------|
+| `main/dispatch/dispatch.h` | MODIFIED | Added `#include <stdint.h>`, `#include "sdkconfig.h"`; declared `slot_exec_result_t` and `dispatch_slot_execute` under `#if CONFIG_TRANSMITTER_PAIRING_ENABLED` guard |
+| `main/dispatch/dispatch.c` | MODIFIED | Added `dispatch_slot_execute` implementation (non-static, inside pairing guard); refactored `dispatch_handle_slot` to delegate to it |
+
+### Verification (on-device — audit flow)
+
+- Publish MQTT slot dispatch (`call` action, 433M band) → confirm transmit ack `status=applied` and correct RF emission
+- Publish MQTT slot dispatch (`stop` action, 433M band) → confirm transmit ack `status=applied`, stop-bit set in tx_code
+- Publish MQTT slot dispatch (`call` action, 2.4G band) → confirm transmit ack `status=applied` and correct 2.4G RF emission
+- Suspend hub (`op_state=SUSPENDED`) → publish slot dispatch → confirm ack `status=rejected, reason=device_suspended`
+- Publish slot dispatch for an empty slot → confirm ack `status=rejected, reason=slot_not_found`
+
+## 2026-06-24 — Resilient USB Dispatch: Task 1 — Enrich `DEVICE_DISPATCH_FAILED` SSE event
+
+Added two nullable fields (`deviceId`, `dispatchAction`) to `QueueSseEvent` and wired them into `emitDispatchFailed` in `TransmitterDispatchService`. Extracted a top-level `dispatchActionOf` mapping helper so the logic is unit-testable without spinning up the service.
+
+**Changes:**
+- `QueueSseEvent`: New optional fields `deviceId: UUID?` and `dispatchAction: String?` (inserted before `timestamp`; all existing callers unaffected — fields have defaults)
+- `TransmitterDispatchService.emitDispatchFailed`: Now populates `deviceId = event.deviceId` and `dispatchAction = dispatchActionOf(event.type)` on the broadcast event
+- `dispatchActionOf(DeviceDispatchEventType): String`: New `internal` top-level function mapping `DEVICE_CALL_REQUESTED → "call"`, `DEVICE_STOP_REQUESTED → "stop"`
+- New test `TransmitterDispatchFailedEventTest`: Pure-function test for `dispatchActionOf`; RED→GREEN confirmed
+
+### Files Changed
+
+#### Backend (`backend/`)
+
+| File | Action | Summary |
+|------|--------|---------|
+| `src/main/kotlin/com/thomas/notiguide/core/sse/QueueEventBroadcaster.kt` | MODIFIED | Added `deviceId: UUID?` and `dispatchAction: String?` to `QueueSseEvent` |
+| `src/main/kotlin/com/thomas/notiguide/domain/device/service/TransmitterDispatchService.kt` | MODIFIED | Added `dispatchActionOf` top-level function; wired `deviceId` + `dispatchAction` into `emitDispatchFailed` broadcast |
+| `src/test/kotlin/com/thomas/notiguide/domain/device/service/TransmitterDispatchFailedEventTest.kt` | ADDED | Unit test for `dispatchActionOf` mapping (JUnit5 + AssertJ) |
+
+### Verification
+
+- ✓ TDD: RED (`dispatchActionOf` unresolved) → GREEN (BUILD SUCCESSFUL)
+- ✓ No `./gradlew build` (repository policy)
+- ✓ Impact analysis: HIGH risk (31 symbols, 13 d=1); all d=1 callers unaffected — additive nullable fields with defaults only
+
+## 2026-06-24 — Resilient USB Dispatch: Task 6 — Types, constants, API functions
+
+Added TypeScript type definitions and API infrastructure for the Resilient USB Dispatch feature (web). Pure type additions with no runtime logic — provides the contracts consumed by Tasks 7–9 (dispatch UI, offline reconciliation).
+
+**Additions:**
+- **Queue types** (`QueueSseEvent`, `IssueDeviceTicketRequest`): Added optional `deviceId`, `dispatchAction`, `allowSerialFallback` fields
+- **Offline reconciliation types** (`OfflineAction`, `OfflineTransition`, `ReconcileItemResult`, `ReconcileOfflineRequest`, `ReconcileOfflineResponse`): Full offline state reconciliation workflow
+- **Serial command** (`transmit_slot`): New USB transmitter command with `TransmitSlotPayload` (slot + action)
+- **API route** (`QUEUE.RECONCILE_OFFLINE`): REST endpoint builder
+- **API function** (`reconcileOffline`): HTTP POST wrapper returning `ReconcileOfflineResponse`
+
+### Files Changed
+
+#### Web (`web/`)
+
+| File | Action | Summary |
+|------|--------|---------|
+| `src/types/queue.ts` | MODIFIED | Extended `QueueSseEvent` (+`deviceId`, `dispatchAction`); extended `IssueDeviceTicketRequest` (+`allowSerialFallback`); added offline reconciliation types (7 new exports) |
+| `src/lib/serial/types.ts` | MODIFIED | Added `TransmitSlotPayload`; added `transmit_slot` to `SerialCommandMap` |
+| `src/lib/constants.ts` | MODIFIED | Added `RECONCILE_OFFLINE` route under `API_ROUTES.QUEUE` |
+| `src/features/queue/api.ts` | MODIFIED | Extended type imports; added `reconcileOffline()` function |
+
+### Verification
+
+- ✓ Lint: `yarn lint` — 222 files checked, no errors
+- ✓ No `yarn build` (repository policy)
+- ✓ All changes are types-only; covered by downstream tests
+
+## 2026-06-14 — Rewrite Vietnamese use case specification
+
+Rewrote the use case specification from scratch based on thorough codebase exploration (all controllers, services, and both frontends). Consolidated into **3 actors** and **12 use cases** with full description tables in Vietnamese.
+
+- **Người dùng** (2 UCs): Xếp hàng, Theo dõi & quản lý phiếu
+- **Quản trị viên** (6 UCs): Đăng ký & xác thực, Vận hành hàng đợi, Cấu hình cửa hàng, Quản lý thiết bị, Xem thống kê, Quản lý tài khoản & bảo mật
+- **QTV cấp cao** (inherits Admin + 4 UCs): Quản lý tổ chức, Quản lý cửa hàng, Quản lý quản trị viên (incl. join requests), Xem thống kê toàn tổ chức
+
+USB/Web Serial device provisioning modeled as alternate flow of UC06 (Quản lý thiết bị). Previous version (`Use Case Specification.md`) superseded.
+
+### Files Changed
+
+#### Docs (`docs/`)
+
+| File | Action | Summary |
+|------|--------|---------|
+| `docs/spec/Use Case Descriptions.md` | ADDED | Vietnamese use case spec: 3 actors, Mermaid use case diagram, 12 description tables with main/alt/exception flows |
+| `docs/spec/Use Case Specification.md` | SUPERSEDED | Previous version with different structure (8 business + 2 auth UCs); kept for reference |
+
 ## 2026-06-13 — Invite link timestamps follow the active web locale
 
 `InviteLinkPanel` now formats the active invite expiry and recent-use timestamps through `next-intl`'s `useFormatter().dateTime(...)` instead of module-level `Intl.DateTimeFormat("en-US", ...)` instances. The same visible date/time fields are shown, but rendered output now follows the active web locale (`vi` / `en`) from the app's intl context, including the locale's hour-cycle preference.

@@ -1,5 +1,24 @@
 # Changelogs
 
+## 2026-07-08 — Fix hub reboot on "Disconnect USB" (Windows-only)
+
+**Why:** Pressing "Disconnect USB" on the dashboard rebooted the hub — but only when the browser ran on Windows, not Linux. Root cause is hardware-level, not application code: the transmitter enumerates via the ESP32-C3's native USB-Serial-JTAG peripheral (VID `0x303A`), which implements the classic esptool auto-reset circuit in silicon — it pulls chip reset (EN) whenever the host asserts RTS while DTR is deasserted. Chrome opens Web Serial ports with both DTR and RTS asserted; on `port.close()`, the Windows serial stack drops the control lines one at a time (DTR first), transiting through the exact `DTR=0, RTS=1` reset-trigger state. Linux's cdc-acm clears both bits in a single `SET_CONTROL_LINE_STATE` transfer, so the trigger state never occurs there. Neither firmware (no `esp_restart()` outside explicit provision/MQTT-save/factory-reset commands) nor the frontend protocol (disconnect sends no command) initiates the reboot. Fix: `disconnect()` now deasserts the signals itself in a safe order — RTS first, then DTR (never passing through `DTR=0, RTS=1`) — before `port.close()`, making Windows' close-time line clearing a no-op at the device.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/lib/serial/use-serial.ts` | MODIFIED | `disconnect()` deasserts RTS then DTR via `port.setSignals()` (two ordered calls, errors swallowed) before closing the port |
+| `web/src/lib/serial/web-serial.d.ts` | MODIFIED | Added `setSignals(SerialOutputSignals)` to the hand-rolled `SerialPort` typing (verified against the WICG Serial spec); the minimal declaration predated any signal use, so IDEs flagged the new call |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this change. |
+
+### Known remaining close paths (deliberately not touched pending Windows verification)
+- `openPort()` failure path and the unmount cleanup effect in `use-serial.ts` also call `port.close()` without quiescing signals; if the fix is confirmed on Windows, the same treatment should be applied there (or factored into a shared `closePortQuietly()` helper).
+
+### Verification
+- GitNexus impact analysis on `useSerial`: LOW risk (3 direct consumers; change is internal to `disconnect()`, no signature change).
+- `yarn biome check` on the edited file: clean.
+- Runtime verification requires the Windows machine where the bug reproduces: connect hub → press "Disconnect USB" → hub must stay on its dashboard screen (no splash/reboot). Build intentionally skipped per repository instruction (separate audit flow).
+
 ## 2026-07-08 — Fix boot crash (LVGL use-after-free) on USB-only boot path (firmware)
 
 **Why:** The USB-only boot mode (`feat: allow operation via USB`) introduced a path where an already-activated hub with no Wi-Fi posts `TX_EVENT_ACTIVATED` straight from splash state `SPLASH_BOOT`, skipping the intermediate `splash_transition_to_bootstrap_wait()` / `splash_transition_to_provisioning()` transitions. Those transitions were the only places the splash "Connecting..." ellipsis `lv_timer` was deleted. `splash_exit_to_dashboard()` deleted the splash screen (including the subtitle label the timer animates) but left the timer running; on its next 400 ms tick, `splash_ellipsis_timer_cb` called `lv_label_set_text` on the freed label → Guru Meditation (Load access fault) in `lv_obj_style.c:get_prop_core`. LVGL auto-deletes an object's animations on `lv_obj_del`, but never its timers — the timer must be deleted explicitly.

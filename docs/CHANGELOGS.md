@@ -1,5 +1,217 @@
 # Changelogs
 
+## 2026-07-08 — Fix boot crash (LVGL use-after-free) on USB-only boot path (firmware)
+
+**Why:** The USB-only boot mode (`feat: allow operation via USB`) introduced a path where an already-activated hub with no Wi-Fi posts `TX_EVENT_ACTIVATED` straight from splash state `SPLASH_BOOT`, skipping the intermediate `splash_transition_to_bootstrap_wait()` / `splash_transition_to_provisioning()` transitions. Those transitions were the only places the splash "Connecting..." ellipsis `lv_timer` was deleted. `splash_exit_to_dashboard()` deleted the splash screen (including the subtitle label the timer animates) but left the timer running; on its next 400 ms tick, `splash_ellipsis_timer_cb` called `lv_label_set_text` on the freed label → Guru Meditation (Load access fault) in `lv_obj_style.c:get_prop_core`. LVGL auto-deletes an object's animations on `lv_obj_del`, but never its timers — the timer must be deleted explicitly.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `transmitter/main/display/display.c` | MODIFIED | `splash_exit_to_dashboard()` now deletes `s_splash_ellipsis_timer` (same guard-delete-null pattern as the other two splash transitions) before creating the operational screens and deleting the splash screen. The ellipsis timer is the only splash-scoped `lv_timer`; overlay/pair-countdown timers are created only after `SPLASH_DONE`, so no other timer can outlive the splash. |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this change. |
+
+### Verification
+- GitNexus impact analysis on `splash_exit_to_dashboard`: LOW risk, no external callers (invoked only from `display_event_handler` on `TX_EVENT_ACTIVATED`).
+- Firmware build intentionally skipped per repository instruction (separate audit flow).
+
+## 2026-07-08 — Redundant roster sync over USB (hub → Web Serial → dashboard → backend)
+
+**Why:** With USB-only hub operation, receivers paired while the hub has no Wi-Fi are dispatchable over USB immediately but invisible to the backend until MQTT reconnects (pending roster). This adds the redundant sync road: the Device Details page already reads the hub roster over Web Serial (`roster.list`), so the dashboard now relays that snapshot to a new backend endpoint, which applies it through the exact same logic as the MQTT roster-sync path. A client-side "union" of backend + hub device lists was deliberately **not** built — once relayed, the union materializes in the DB and `getAvailableDevices` picks the devices up naturally; when the backend is unreachable the union has no utility (ticket issuance is offline-disabled).
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../domain/device/service/RosterApplyService.kt` | NEW | Extracted the roster-apply logic previously private to `RosterSyncListener`: seq idempotency (`seq <= last_roster_seq` → `DUPLICATE` no-op), per-slot upsert with public-ID minting, deletion of hub-paired devices absent from the snapshot, `last_roster_seq` advance (now keyed by hub device id). Unconditional bean (needs only `DatabaseClient` + `DevicePublicIdMinter` + `DeviceRepository` + `StoreAccessService`), so the relay works even when MQTT infra is disabled. `relay(...)` entry point validates the target (404 `device_not_found`; 409 `not_a_transmitter_hub` / `device_not_active` / `device_store_unassigned`) and enforces store access — the admin session provides the trust the MQTT path gets from the hub's authenticated connection. |
+| `backend/.../domain/device/listener/RosterSyncListener.kt` | MODIFIED | Now delegates to `RosterApplyService.apply(...)`; keeps MQTT parsing, hub lookup, and signed-ACK publishing (ACKs both `APPLIED` and `DUPLICATE`, unchanged semantics). Removed the moved helpers/imports. |
+| `backend/.../domain/device/request/RosterRelayRequest.kt` | NEW | `{ seq ≥ 0, receivers[≤32]: { slot ≥ 1, band (≤8 chars), label? (≤100) } }`; unknown bands are skipped inside the apply (same as MQTT path). |
+| `backend/.../domain/device/controller/DeviceAdminController.kt` | MODIFIED | Added `POST /api/devices/{id}/roster/relay` → `{ "applied": boolean }` (`false` = duplicate seq, already synced). |
+| `transmitter/main/serial/serial_protocol.c` | MODIFIED | `roster.list` response now includes `seq` (the hub's roster sequence) so relayed snapshots are idempotent server-side. |
+| `web/src/lib/serial/types.ts` | MODIFIED | `RosterListResult.seq?: number` (optional — absent on older firmware). |
+| `web/src/lib/constants.ts` | MODIFIED | Added `DEVICES.ROSTER_RELAY`. |
+| `web/src/types/device.ts` | MODIFIED | Added `RosterRelayRequest` / `RosterRelayReceiver`. |
+| `web/src/features/device/api.ts` | MODIFIED | Added `relayRoster(id, {seq, receivers})`. |
+| `web/src/features/device/hub-roster-panel.tsx` | MODIFIED | New `deviceId` prop; after every successful `roster.list` read (initial load, `event.roster_changed` — i.e. immediately after pairing/unpairing over USB — and post-unpair refresh) it fire-and-forgets the relay when `seq` is present. Failures are silent: MQTT sync remains the primary road, this is the redundant one. |
+| `web/src/features/device/usb-control-panel.tsx` | MODIFIED | Passes `deviceId` to `HubRosterPanel` (only rendered when connected and not publicId-mismatched, so the relay targets the hub being viewed). |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this change. |
+
+### Notes
+- Deletion semantics are inherited deliberately: the hub roster is the source of truth, so a relayed snapshot missing a slot deletes that hub-paired device — identical to what the MQTT sync does on reconnect. The seq guard prevents a stale relay from clobbering a newer MQTT sync (and vice versa: after a relay applies seq N, the hub's later MQTT publish of seq N is re-ACKed as a duplicate, clearing the hub's `pending` flag).
+- The hub's `pending` flag is NOT cleared by the relay (it requires the signed MQTT ACK); the roster republish on MQTT reconnect resolves it as a duplicate. Harmless.
+
+### Verification
+- `yarn biome check` on all changed web files clean; full `tsc --noEmit` passes.
+- Backend/firmware builds intentionally skipped per repository instruction (separate audit flow).
+
+## 2026-07-08 — Transmitter USB-only boot mode + silent Wi-Fi retry (firmware)
+
+**Problem:** On boot, `app_main` blocked in `wait_for_station_or_recover()` before `radio_supervisor_init()`. If the station couldn't connect within 45s, the hub switched to the SoftAP recovery portal and waited **forever** — radios never initialized, so even though the serial console was up (it starts early), every USB `transmit`/`transmit_slot` failed with `tx_failed` (`radio_tx_send` → `ESP_ERR_INVALID_STATE`). An activated hub booting during a Wi-Fi outage was therefore completely inoperable, despite USB dispatch needing nothing from the network (verified: `dispatch_slot_execute` needs only NVS `op_state`, the NVS roster, and initialized radios).
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `transmitter/main/main.c` | MODIFIED | (1) `radio_supervisor_init()` moved above all Wi-Fi logic — radios have no network dependency. (2) Boot policy branch: a provisioned **and activated** hub tries the station once (same 45s window); on failure it continues in **USB-only mode** (skips identity/MQTT bring-up) instead of trapping in SoftAP recovery. Unprovisioned / not-yet-activated / force-recovery boots keep the existing recovery-portal behavior (bootstrap requires MQTT). (3) `roster_sync_init` + `roster_cluster_init` now run **unconditionally** (verified network-independent: `roster_sync_publish` no-ops and arms its retry timer while MQTT is down, and the MQTT on-connect handler already republishes pending roster state; `roster_cluster_init` only derives keys and builds its topic string) — so **ESP-NOW receiver pairing works in USB-only mode**: ESP-NOW needs the station *started*, not connected, and the receiver's pair mode scans channels 1–13 to find the hub. (4) The final idle loop is now a silent supervisor: every 30s, if the station is disconnected it re-arms via `wifi_sta_reconnect()` — **unless `espnow_pair_host_is_active()`**, since a reconnect attempt's all-channel scan would hop the radio away from an in-progress pairing exchange; after an offline boot, the first successful connect runs the deferred bring-up once (power-save, identity, `mqtt_start`) and logs "full network operation resumed". `TX_EVENT_ACTIVATED` is still posted in USB-only mode (the device *is* activated), so the display and serial `status`/`identify` report ACTIVE. |
+| `transmitter/main/network/wifi.c` | MODIFIED | Added `wifi_sta_reconnect()`: no-op when connected; otherwise clears the `WIFI_BIT_STA_FAILED` latch, resets the retry counter, and calls `esp_wifi_connect()` — the driver previously stopped retrying permanently after `CONFIG_TRANSMITTER_WIFI_MAX_RETRY`. |
+| `transmitter/main/network/wifi.h` | MODIFIED | Declared `wifi_sta_reconnect()`. |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this change. |
+
+### Design Notes
+- **No session-gating:** operation is not conditioned on a Web Serial session being present — the hub cannot know one will arrive, and the radios/roster are safe to run unconditionally. Instead the hub is always dispatch-ready once booted; Web Serial (from "Connect USB" on Device Details or the Queue page) is simply the transport that drives it. The dashboard needs **no changes**: `useDispatchMode` already flips to serial modes off `portState open + TRANSMITTER_HUB + op_state ACTIVE`, and the hub's `status` reports `wifi_connected/mqtt_connected: false` honestly. When the background retry succeeds, the firmware's existing `event.wifi_connected`/`event.mqtt_connected` serial events update the UI live.
+- The runtime supervisor also covers post-boot drops: previously a mid-operation Wi-Fi loss exhausted the driver's retry budget and never reconnected; now it re-arms every 30s regardless of how the hub booted.
+- SoftAP recovery remains reachable via the explicit recovery request path and for wrong-credential cases; credentials can also be fixed over USB (`provision` serial command from the provisioning dialog).
+
+### Accepted Limitations (USB-only mode)
+- Receiver pairing **works** offline (roster entries persist to NVS as `pending`), but the backend doesn't learn about new receivers until MQTT reconnects and the pending roster publishes — so newly paired receivers are dispatchable over USB `transmit_slot` immediately, yet absent from the dashboard's device list until then. Pairing attempted during the exact seconds of a 30s reconnect scan may glitch and retry (receiver resumes scanning); the supervisor skips reconnects while pair mode is active to minimize this.
+- No hub heartbeat → the backend elects no transmitter, which is exactly the state the dashboard's serial-fallback UI is designed for.
+- No SNTP until first connect, so `applied_at_ms` in serial acks is epoch-relative until time syncs.
+
+### Verification
+- Firmware build intentionally not run per repository instruction (separate audit flow). Boot-order reasoning verified against `radio_supervisor_init` (no network deps: RF433 GPIO + nRF24 SPI) and `dispatch_slot_execute` requirements.
+
+## 2026-07-08 — Dedupe offline serial-stop blocks in serving display
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/queue/serving-display.tsx` | MODIFIED | Extracted the triplicated offline-mode block (no-device warning → `slotFor` lookup → serial `stop` dispatch → `slot_not_found` toast) from serve/cancel/no-show into a shared `offlineDispatchCheck(ticket, tQueue, store, dispatchSerial): Promise<boolean>` — `false` means the ticket has no bound device and the caller aborts without queuing the outbox transition (preserves prior early-return semantics). Also introduced `DispatchSerialFn` (replacing three inline copies of the dispatch signature) and `QueueTranslator` (`ReturnType<typeof useTranslations<"queue">>`, next-intl's documented pattern for strict message typing). No behavior change. |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this refactor. |
+
+### Verification
+- `yarn biome check` clean; `tsc --noEmit` passes with no errors.
+- Build intentionally skipped per repository instruction (separate audit flow).
+
+## 2026-07-08 — USB-success suppression of stale dispatch errors + MQTT re-page
+
+Follow-up to the USB-fallback fixes: the error toast could still appear after a successful USB dispatch, because backend failure events for the *same* dispatch can trail it by up to the 30s ack window (`dispatch-ack-timeout-seconds: 30` → reconciliation emits `ack_timeout`; hub NACKs arrive as `transmit_rejected:<reason>`, which the frontend didn't recognize and rendered as the generic "system issue" toast). The mode-gated retry alone can't catch these late events. Also added the requested MQTT counterpart of the "Re-page over USB" button.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/lib/dispatch/dedupe.ts` | MODIFIED | Added `createAppliedRegistry(ttlMs=60s)` — records dispatches successfully delivered over USB (`mark`) and answers pure queries (`has`, never marks, unlike the dedupe). |
+| `web/src/app/[locale]/dashboard/queue/page.tsx` | MODIFIED | Wrapped `useSerialDispatch` so every successful USB dispatch (SSE retry, offline call-next, and all serving-display actions via the shared `dispatchSerial` prop) marks `ticketId:action` in the registry. The `DEVICE_DISPATCH_FAILED` handler now first checks the registry and silences the event **regardless of reason** when that dispatch already reached the pager over USB; the existing live-USB retry and dedupe remain as the second line. Unknown `transmit_rejected:*` reasons now map to the ack-timeout message instead of the generic infrastructure error. Retry passes `event.ticketId` so its own success is registered. |
+| `backend/.../domain/queue/service/QueueService.kt` | MODIFIED | New `rePageDevice(storeId, ticketId)`: 404 if ticket missing, 409 if not CALLED or not device-bound; otherwise reuses `handleCalledTicketDispatch` (busy re-bind + `DEVICE_CALL_REQUESTED`), so re-pages flow through the full election/MQTT/ack-tracking pipeline and inherit the USB fallback on failure. |
+| `backend/.../domain/queue/controller/QueueAdminController.kt` | MODIFIED | Added `POST /api/queue/admin/{storeId}/tickets/{ticketId}/re-page` with the standard store-access check. |
+| `web/src/lib/constants.ts` | MODIFIED | Added `QUEUE.RE_PAGE` route. |
+| `web/src/features/queue/api.ts` | MODIFIED | Added `rePageTicket(storeId, ticketId)`. |
+| `web/src/features/queue/serving-display.tsx` | MODIFIED | Re-page button now also shows in `ONLINE_MQTT` (label "Re-send signal" / "Gửi lại tín hiệu") and calls the new endpoint with a success toast + ApiError handling; serial modes keep the existing "Re-page over USB" behavior. `dispatchSerial` prop signature gained optional `ticketId`, passed at all four call sites (serve/cancel/no-show stops, USB re-page) so USB successes register for suppression. |
+| `web/src/messages/en.json`, `web/src/messages/vi.json` | MODIFIED | Added `queue.dispatch.rePage` and `queue.dispatch.rePageSent` (mirrored). |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this change. |
+
+### Notes
+- Registry TTL is 60s: comfortably covers the 30s ack timeout plus reconciliation lag, while keyed by `ticketId:action` so a *new* failure for a different ticket on the same device is never mis-suppressed. A genuine re-page failure more than 60s after a USB success surfaces normally.
+- Vietnamese copy for the new button ("Gửi lại tín hiệu" / "Đã gửi lại tín hiệu cho vé #{number}.") mirrors existing dispatch phrasing — flagged for native review.
+
+### Verification
+- `yarn biome check` on all changed web files: clean; both message files parse and mirror structurally.
+- Build/tests intentionally skipped per repository instruction (separate audit flow).
+
+## 2026-07-08 — Fix device stuck busy + spurious error toast on USB-fallback dispatch
+
+Two issues surfaced once USB dispatch was working with the hub's WiFi off (backend reachable, hub unreachable over MQTT — `ONLINE_SERIAL_FALLBACK`).
+
+**B — device never returned to the panel.** The device-busy lock that hides a receiver from the dispatch panel was only released by `TransmitterDispatchService` *after a successful MQTT publish* to the hub (`:204-205`, `:305`). On serve/cancel of a called device ticket, `QueueService.handleTerminalDeviceDispatch` re-bound the busy key with a 2h `TICKET_TERMINAL` TTL and emitted `DEVICE_STOP_REQUESTED`, deferring the actual release to that publish. With the hub offline the publish failed before the release ran, so the device stayed busy for the full TTL (30 min after a call, 2 h after a serve) and never came back — even though the pager was stopped fine over the USB serial fallback.
+
+**A — error toast despite a successful USB dispatch.** The `DEVICE_DISPATCH_FAILED` SSE handler only retried over serial (and suppressed the error) when the derived `mode` was exactly `ONLINE_SERIAL_FALLBACK`. That mode depends on `dispatchReady` (hub heartbeat) and `op_state`, which lag reality — so a backend failure could surface an error toast even though the pager was reachable over USB.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `backend/.../domain/queue/service/QueueService.kt` | MODIFIED | `handleTerminalDeviceDispatch` (always `RELEASE`) now deletes the device-busy key directly instead of re-binding it with `TICKET_TERMINAL` and deferring to the transmitter — the device is freed the moment its ticket is terminal, independent of hub reachability. `handleNoShowDeviceDispatch` now branches on disposition: `RELEASE` frees the device immediately; `REQUEUE` keeps it bound (`TICKET_WAITING`) since the ticket is re-queued to the same device. Both still emit `DEVICE_STOP_REQUESTED` so the pager is turned off over MQTT or the USB serial fallback. |
+| `web/src/app/[locale]/dashboard/queue/page.tsx` | MODIFIED | `DEVICE_DISPATCH_FAILED` handler now gates the serial retry on the **live USB hub connection** (`serial.portState === "open" && deviceKind === "TRANSMITTER_HUB"`) rather than the derived `mode`; wraps `serialDispatch` in try/catch so a throw counts as a failed retry; suppresses the error toast only when the USB retry actually applied, otherwise falls through to the reason-based backend error. Single `setDeviceRefreshSignal` per path (no double refresh). |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged both fixes. |
+
+### Notes
+- The redundant busy-delete in `TransmitterDispatchService` (guarded by `disposition == RELEASE`) is left in place as a harmless safety net; QueueService now frees the device first.
+- Freeing on `RELEASE` mirrors the existing offline-reconcile path (`QueueService.kt:922`, "no dispatch event emitted"), so `OFFLINE_SERIAL` and `ONLINE_SERIAL_FALLBACK` now behave consistently.
+- Fix A is strictly more permissive (retries whenever a hub is connected over USB) and does not affect the healthy `ONLINE_MQTT` path, which never emits `DEVICE_DISPATCH_FAILED`.
+
+### Verification
+- `yarn biome check` on the queue page: clean. Kotlin `when (disposition)` is exhaustive (`RELEASE`/`REQUEUE`).
+- Build/tests intentionally skipped per repository instruction (separate audit flow).
+
+## 2026-07-08 — Add USB connect / status control to the Queue page
+
+**Why:** The Queue page had no affordance to establish a Web Serial hub connection — connecting only existed on the Device Details page. So the Queue page's serial session could never be opened from there, leaving serial-fallback / offline dispatch permanently `DISABLED` with no on-screen feedback (the dispatch-mode banner renders nothing in `DISABLED` mode). This control lets an admin connect the hub directly on the Queue page and, when a hub is connected but unusable, surfaces the reason so a disabled dispatch is no longer silent.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/queue/queue-serial-control.tsx` | NEW | Hub connect/status control consuming the shared serial session. States: port closed → neutral prompt + "Connect USB" button; opening/closing → spinner; connected active hub → success box (canonical `success` alert pattern) with device name + Disconnect; connected but wrong kind or inactive hub → warning box (`notHub` / `hubInactive`) + Disconnect. Renders nothing when Web Serial is unsupported. |
+| `web/src/app/[locale]/dashboard/queue/page.tsx` | MODIFIED | Rendered `<QueueSerialControl serial={serial} />` above the dispatch-mode banner; added its import. |
+| `web/src/messages/en.json` | MODIFIED | Added `queue.dispatch.serial.{connectHint,connected,notHub,hubInactive}`. Reuses existing `devices.usb.connect` / `devices.usb.disconnect`. |
+| `web/src/messages/vi.json` | MODIFIED | Added the mirrored `queue.dispatch.serial.*` keys (Vietnamese copy approved in chat). |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this addition. |
+
+### Notes
+- The `op_state === "ACTIVE"` dispatch gate (`useDispatchMode`) is intentionally unchanged. The new warning states make it visible when a connected hub is blocked because it isn't activated (`hubInactive`) rather than failing silently.
+- Alert boxes follow the canonical patterns in `docs/walkthrough/Web Styles.md` § Status Alert Boxes (warning + success, with `dark:` overrides and `shrink-0` icons); the closed-state connect prompt is a neutral `bg-muted/40` card, not a severity box.
+
+### Verification
+- `yarn biome check` on all changed files: clean (after auto-format). Both message files parse as valid JSON and mirror structurally.
+- Build/tests intentionally skipped per repository instruction (separate audit flow).
+
+## 2026-07-08 — Fix Web Serial session lost on dashboard navigation
+
+**Bug:** A Web Serial connection established in the Devices tab was not maintained after navigating to the Queue tab, so USB dispatch (serial fallback / offline dispatch) never reached the hub. Root cause: the serial session was owned by each page's own `useSerial()` instance. Navigating away unmounted the owning page, whose `useSerial` unmount cleanup stops polling, disconnects the protocol, and **closes the port**; the Queue page then mounted a fresh, unrelated `useSerial()` instance that nothing ever calls `connect()`/`reconnectKnownPort()` on, so its `portState` stayed `"closed"`. Consequently `useDispatchMode` never saw an open `TRANSMITTER_HUB` port and `deriveDispatchMode` resolved to `DISABLED` (with the hub WiFi off: backend reachable but `dispatchReady=false` and no serial → `DISABLED`), so the serial dispatch path was never attempted.
+
+**Fix:** Lifted the serial session to a single shared provider at the dashboard layout level so one `SerialProtocol` + port survives client-side route changes. The hook's cleanup now runs only when the whole dashboard unmounts.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/lib/serial/serial-session.tsx` | NEW | `SerialSessionProvider` (calls `useSerial()` once, provides the `UseSerialReturn` via React context) + `useSerialSession()` consumer hook that throws if used outside the provider. |
+| `web/src/app/[locale]/dashboard/layout.tsx` | MODIFIED | Wrapped dashboard content in `SerialSessionProvider` (inside `AuthGuard`) so the session spans all dashboard routes. |
+| `web/src/app/[locale]/dashboard/queue/page.tsx` | MODIFIED | Swapped `useSerial()` → `useSerialSession()`; the Queue page now consumes the shared session instead of a private, always-closed one. |
+| `web/src/app/[locale]/dashboard/devices/[id]/page.tsx` | MODIFIED | Swapped `useSerial()` → `useSerialSession()`. |
+| `web/src/features/device/usb-provision-dialog.tsx` | MODIFIED | Swapped `useSerial()` → `useSerialSession()` (import order auto-sorted by Biome). Its existing close-time `disconnect()` behavior is unchanged (provisioning remains a deliberate connect/finish cycle). |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this fix. |
+
+### Notes / Rejected Alternatives
+- Rejected having the Queue page call `reconnectKnownPort()` on mount: it races the Devices page's async `port.close()` during navigation, drops/re-establishes the session (and re-triggers the hub session handshake) on every tab switch, and still allows two competing protocol instances if both consumers ever mount together.
+- `use-serial.ts` itself was not changed — its lifetime is now correctly bounded by the provider. Dialogs and panels already take `serial`/`sendCommand` as props and needed no changes.
+
+### Verification
+- `yarn biome check` on all changed files: clean (after auto-sorting imports in the provision dialog).
+- Build/tests intentionally skipped per repository instruction (separate audit flow).
+
+## 2026-07-08 — Fix USB test dispatch for hub-paired receivers + roster public-ID assignment
+
+**Bug:** "Thử phát tín hiệu (USB)" failed with `409 Conflict` (`device_missing_public_id`) when a hub-paired receiver was selected, before any serial traffic reached the transmitter. Root cause: receivers registered via roster sync (`RosterSyncListener`) are inserted with only `hub_slot`/kind/status/name — no `public_id` and no RF-code row — while `UsbDispatchDialog.handleReceiverDispatch` unconditionally used the full-payload path (`POST /api/devices/usb-dispatch-payload` → serial `transmit`), which requires both. The band correlation reported (2.4 GHz failing, 433 MHz working) was coincidental — it tracked how each device was onboarded, not the radio band. The normal MQTT dispatch path already branches to slot-based dispatch for these devices (`TransmitterDispatchService`), and the firmware already supports `transmit_slot` over USB serial; only the dialog lacked the branch.
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `web/src/features/device/usb-dispatch-dialog.tsx` | MODIFIED | `handleReceiverDispatch` now branches on the selected device: hub-paired receivers (`hubSlot != null`) dispatch via the serial `transmit_slot` command (hub resolves the RF code from its own roster, no backend payload call); enrolled receivers keep the existing `getUsbDispatchPayload` → `transmit` path. Shared applied/rejected toast handling unchanged (`transmit_slot` returns the same response shape). |
+| `backend/src/main/kotlin/com/thomas/notiguide/domain/device/listener/RosterSyncListener.kt` | MODIFIED | Roster sync now assigns a public ID (via `DevicePublicIdMinter`) to receivers that lack one: minted on first insert of a roster receiver, and backfilled on update when the existing row has `public_id IS NULL`. Existing-device lookup now selects `public_id` (new private `RosterReceiverRecord` + mapper). |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this fix and feature. |
+
+### Skipped / Notes
+- Considered returning a clearer 409 (`use_slot_dispatch`) from `UsbDispatchPayloadService` for hub-paired devices — skipped as unnecessary once the dialog routes those devices through `transmit_slot`; the endpoint is no longer reachable for them from the UI.
+- RF-code auto-issue for roster-synced receivers was intentionally NOT added — slot-based dispatch needs no backend RF code; only the public ID was requested and assigned.
+- Existing hub-paired devices get their public ID backfilled on the next roster update from the hub (no manual migration needed).
+
+### Verification
+- `yarn biome check` on the modified web file: clean.
+- Backend build/test intentionally skipped per repository instruction (separate audit flow).
+
+## 2026-07-07 — Rewrite Redis Walkthrough (full current surface + change-preparation guide)
+
+Replaced the stale `docs/walkthrough/Redis Walkthrough.md` (a two-phase implementation log with dead `file:///` links to the old `Coding/Java (Kotlin)/notiguide` path, predating rate limiting, sessions, invites, FCM, and the entire device domain) with a complete, current walkthrough of how Redis is provisioned, configured, and used across the backend. Written as thesis-review preparation: understanding first, anticipated code changes second.
+
+**Changes:**
+- §1–3: role split vs TimescaleDB (with Mermaid context diagram), Compose/`redis.conf` provisioning (why `appendonly` and `notify-keyspace-events Ex` are load-bearing), Spring wiring (`RedisConfig`, string-only serialization invariant and the Lua-ARGV quoting trap, profile-specific properties, coroutine access style).
+- §3.3: dedicated RESP2 vs RESP3 comparison — type systems, `HELLO` handshake vs `PING`/`AUTH`, push frames, Lettuce protocol discovery vs pinning, a symptom→cause debugging map for protocol-related connection failures, and the rationale for pinning RESP3 (added on user request).
+- §4: full key inventory (~40 key families grouped by domain, with type/TTL/purpose) as minted by `RedisKeyManager`; `RedisTTLPolicy` plus the catalog of domain-local TTL constants. Documented that `TICKET_TERMINAL` is now 2 h (not immediate deletion — the corresponding `CLAUDE.md` line is stale).
+- §5: expiry-as-scheduler via `RedisKeyExpirationListener` (three handled key families, retry/backoff, no-show sequence diagram, lost-event compensation and single-instance caveats).
+- §6: queue domain deep dive — data-structure rationale, ticket lifecycle state diagram with per-state TTLs, dual global/service-type queues and cross-queue cleanup, all four inline Lua scripts explained (including the ghost-ticket loop), call side-effect fan-out, `clearStoreData` as the store-scoped-key checklist.
+- §7–12: rate limiting (sliding-window Lua, tiers, fail-open), refresh-token rotation via atomic `DEL`, revocation denylist, login-abort capability token, join requests and invite links as short-lived-entity exemplars, FCM token storage and alert dedup, device-domain key flows (enrollment, activation, busy binding, election, heartbeats, dispatch ack-timeout reconciliation), analytics cache-aside.
+- §13: idiom cheat sheet (13 recurring patterns, each with its canonical exemplar file).
+- §14: change-preparation guide — 9 invariants, small-change recipes (TTL change, new key family, new/modified Lua script, expiry reaction, rate-limit tier), feature-scale recipes (new ephemeral entity, new queue discipline, new cache, streams migration, multi-instance) with scope warnings, `redis-cli` debugging toolbox, and accepted limitations that must not be "fixed" casually.
+
+**Verification:**
+- All key patterns, TTLs, script bodies, and config values were transcribed from the current source (`core/redis/*`, `domain/queue/*`, `core/ratelimit/*`, `core/jwt/*`, `domain/admin/service/*`, `core/firebase/FcmNotificationService.kt`, `domain/device/**`, `domain/analytics/service/AnalyticsQueryService.kt`, `compose.yaml`, `application*.yaml`, `redis.conf`, `build.gradle.kts`) — not from older docs.
+- RESP2/RESP3 and Lettuce handshake/discovery behavior cross-checked against current Lettuce documentation via Context7.
+- Documentation-only change; build and test commands were intentionally skipped per repository instruction.
+
 ## 2026-06-24 — Enhance ESP-NOW pairing sequence diagram
 
 Updated the first subsection diagram in `docs/spec/Thiết kế giao thức.md` to better match the pairing flow shown in the reference image while reflecting the implemented ESP-NOW handshake.

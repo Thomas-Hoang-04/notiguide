@@ -40,6 +40,83 @@ Device identity keys (EC P-256) are auto-generated on each device's first boot a
 
 ---
 
+## Key Scoping & Usage
+
+Where each key lives, what runtime operation it performs, how wide its blast radius is, and
+what an attacker gains by stealing it. Generation and file locations are in the sections
+below; the runtime *flows* that exercise these keys are in
+[MQTT Communication Walkthrough](MQTT%20Communication%20Walkthrough.md) and
+[ESP-NOW Pairing Discrimination](ESP-NOW%20Pairing%20Discrimination.md).
+
+### Trust boundaries — who holds what
+
+```mermaid
+flowchart LR
+    subgraph BE["Backend (server)"]
+        JWTpriv[JWT private RSA-4096]
+        CMDpriv[Command-signing EC P-256 PRIVATE]
+        RFenc[RF-code passphrase]
+    end
+    subgraph FW["All firmware (hub + receivers)"]
+        CMDpub[Command-signing EC P-256 PUBLIC]
+        PSK[Pairing PSK 32B]
+        CA[MQTT CA cert]
+        DEVpriv[Hub EC P-256 PRIVATE - NVS]
+    end
+    subgraph CLIENT["Admin browser / clients"]
+        JWTtok[JWT bearer token]
+    end
+    JWTpriv -->|signs| JWTtok
+    JWTtok -->|verified by| JWTpub[(JWT public)]
+    CMDpriv -->|signs commands| CMDpub
+    DEVpriv -->|signs activation| CMDACT[Backend verifies with hub public]
+    PSK -->|HMAC + CCMP| PSK2[peer firmware same PSK]
+    CA -->|verifies TLS of| Broker[(MQTT broker)]
+```
+
+The guiding principle: **private/secret material is asymmetric or one‑directional wherever
+possible.** The backend holds one signing private key for *all* outbound device commands;
+the hub holds its *own* identity private key that never leaves it. The only shared *symmetric*
+secret is the pairing PSK, and it is scoped to the local ESP‑NOW handshake — never used for
+ongoing communication and never touched by the backend.
+
+### Scoping & usage matrix
+
+| Key | Holder(s) | Runtime use | Scope / blast radius | If compromised |
+|---|---|---|---|---|
+| **JWT signing keypair** (RSA‑4096) | Private: backend only. Public: backend | Sign/verify admin auth JWTs (`SHA512withRSA`) | Deployment‑wide, admin sessions | Attacker can mint admin tokens → rotate keys, all sessions invalidated |
+| **Device command‑signing key** (EC P‑256) | Private: backend only. Public: embedded in *every* firmware | Backend signs `slot-dispatch`/`deact`/`roster-ack`; the hub verifies before acting | Deployment‑wide, all hub actuation | Attacker can forge any hub command → coordinated firmware+backend re‑key (no in‑field rotation) |
+| **Hub identity key** (EC P‑256) | Private: the hub's NVS only. Public: registered to backend | Hub signs the activation challenge (`activate-v1…`) to prove its identity over MQTT (hub‑paired receivers prove themselves with the pairing PSK instead — no MQTT) | **One hub** | Only that hub's identity is affected; re‑enroll to replace |
+| **Pairing PSK** (256‑bit) | All firmware built for the deployment (compiled in) | ESP‑NOW pairing: HMAC‑SHA256 receiver proof + split into PMK (bytes 0–15) / LMK (bytes 16–31) for CCMP | Local RF pairing only; **not** on backend, **not** used after pairing | Attacker with the PSK + physical proximity could impersonate official firmware during pairing → rebuild/reflash all firmware with new PSK |
+| **RF‑code encryption passphrase** (pgcrypto) | Backend only (env var) | Encrypt/decrypt RF codes at rest in Postgres (`pgp_sym_*`); decrypted only to build a signed dispatch | Backend data‑at‑rest | Attacker with DB + passphrase reads RF codes; re‑encrypt all rows to rotate |
+| **MQTT CA certificate** (X.509) | All firmware (embedded) | Verify the broker's TLS cert on connect | Transport, per broker | Not secret; only changes if broker CA changes |
+| **MQTT broker username/password** | Firmware (provisioned) + backend | Authenticate to the broker | Deployment‑wide **channel** auth — explicitly **not** device identity | Attacker can connect to the broker but still cannot forge signed commands or pass activation |
+
+### The two EC P‑256 keys are easy to confuse — they are opposites
+
+- **Command‑signing key:** *one* keypair for the whole deployment. **Backend holds the
+  private half**; firmware holds the public half and *verifies*. Direction: backend → device.
+- **Hub identity key:** *one keypair per hub*. **The hub holds the private half**; the
+  backend holds the public half and *verifies*. Direction: hub → backend.
+
+Same curve, opposite ownership and opposite direction. See the MQTT provisioning flow for
+how the hub identity key proves possession at activation, and how the command‑signing key
+authenticates every subsequent command.
+
+### PSK split detail (ESP‑NOW)
+
+The 32‑byte pairing PSK is not used whole for encryption. In both host and receiver:
+
+- **Bytes 0–15 → PMK** (`esp_now_set_pmk`) — encrypts the LMK during peer add.
+- **Bytes 16–31 → LMK** (per‑peer key) — CCMP‑encrypts unicast pairing traffic.
+- The **whole 32 bytes** are the HMAC‑SHA256 key the receiver uses to answer the challenge.
+
+This is why the same PSK value must be built into the transmitter and the receivers — they
+must derive the identical PMK/LMK and compute the identical HMAC. See
+[ESP-NOW Pairing Discrimination](ESP-NOW%20Pairing%20Discrimination.md) §4.
+
+---
+
 ## 1. JWT Signing Keypair (RSA 4096)
 
 Used by the backend to sign and verify admin auth JWTs (`SHA512withRSA`).

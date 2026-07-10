@@ -1,5 +1,94 @@
 # Changelogs
 
+## 2026-07-10 — MQTT Bootstrap Re-Key & Transmitter Signing
+
+**Why:** Implemented `docs/planned/MQTT Bootstrap Re-Key & Transmitter Signing Plan.md` in its entirety (16 tasks across backend + transmitter firmware). Two security-model changes, deployed as a hard cutover (no dual path, no version bumps — `schema_version` stays `1`, canonical tags stay `-v1`): (1) the bootstrap/provisioning session is now keyed by the **device-generated `registration_nonce`** (base64url, backend floor ≥16 bytes decoded) instead of the backend-issued `challenge_id` — topics, Redis activation records, envelopes, and all services/listeners re-keyed atomically; (2) **every device→backend MQTT message is now signed** with the hub's EC P-256 key and verified before any side effect — new canonicals `roster-update-v1`, `ack-v1`, `heartbeat-v1` (plus `activate-v1` now binding the nonce), with a 120s heartbeat freshness window binding `issued_at` as the raw wire string. Firmware gained `nonce_in_use` auto-retry (fresh nonce, immediate-retry cap, then paced 30s re-arm keeping the enrollment token).
+
+### Files Changed — backend (base `7bf7f36`)
+| File | Action | Summary |
+|---|---|---|
+| `core/device/DeviceSignatureVerifier.kt` | NEW | Shared EC P-256 (SHA256withECDSA) signature verification over canonical strings; used by all device→backend listeners |
+| `core/device/DeviceCanonical.kt` | MODIFIED | `activate` re-keyed to bind `registration_nonce`; new device→backend canonical builders `rosterUpdate`, `ack`, `heartbeat` (byte-identical to firmware format strings) |
+| `core/device/DeviceMqttPublisher.kt` | MODIFIED | Bootstrap response topics keyed by nonce; envelopes trimmed of `challenge_id` |
+| `core/redis/RedisKeyManager.kt` | MODIFIED | Activation key renamed to nonce-keyed form |
+| `domain/device/redis/DeviceActivationByDeviceRecord.kt` | MODIFIED | Record fields re-keyed `challengeId` → `registrationNonce` |
+| `domain/device/service/DeviceRegistrationService.kt` | MODIFIED | `nonce_in_use` guard + ≥16-byte-decoded nonce floor + key-by-nonce Redis writes; **post-audit fix:** same-key duplicate registration (QoS-1 redelivery) is now idempotent — re-publishes the stored `pending` without re-consuming the single-use token; different-key collision still rejected. Also cached `isValidRegistrationNonce` result (cosmetic) |
+| `domain/device/service/DeviceApprovalService.kt` | MODIFIED | Approval/challenge session chain carried by `registration_nonce` |
+| `domain/device/service/DeviceActivationService.kt` | MODIFIED | `onResponse` keyed by nonce; challenge-response verification delegated to `DeviceSignatureVerifier` |
+| `domain/device/listener/TransmitterBootstrapListener.kt` | MODIFIED | Routes `response` by nonce extracted from topic |
+| `domain/device/listener/DeviceBootstrapListener.kt` | MODIFIED | Mirrored nonce routing (unused receiver path, kept consistent) |
+| `domain/device/listener/RosterSyncListener.kt` | MODIFIED | Verifies `roster-update-v1` signature against stored hub key before applying roster; **post-audit fix:** `HubRecord` `data class` → plain class (ByteArray equals/hashCode warning) |
+| `domain/device/listener/TransmitterOperationalListener.kt` | MODIFIED | Verifies `ack-v1` (transmit/deact, with new `command_id` field) and `heartbeat-v1` signatures before routing; heartbeat gated by 120s freshness window on raw `issued_at`; unrecognized `ack_for` now warn+drop |
+| `test/...core/device/DeviceSignatureVerifierTest.kt` | NEW | Real P-256 keypair round-trip + tamper/garbage rejection |
+| `test/...core/device/DeviceCanonicalTest.kt` | MODIFIED | Golden canonical bytes for all four `-v1` tags; nonce-sensitivity tests rewritten for new `activate` signature |
+| `test/...core/device/DeviceMqttPublisherTest.kt` | NEW | Topic + envelope body assertions for nonce-keyed publishes |
+| `test/...domain/device/service/DeviceRegistrationServiceTest.kt` | NEW | `nonce_in_use` rejection path; **post-audit:** same-key duplicate → pending re-published, zero token consumes, zero device saves; different-key → rejected. **2026-07-11 amendment:** + short-nonce (<16 bytes decoded) dropped with zero side effects, + fresh registration writes both nonce-keyed and device-id-keyed activation records (15-min TTL) and publishes `pending` |
+| `test/...domain/device/service/DeviceApprovalServiceTest.kt` | NEW | Nonce session-chain behavior |
+| `test/...domain/device/service/DeviceActivationServiceTest.kt` | NEW | Activation verify paths with real keys |
+| `test/...domain/device/listener/HeartbeatFreshnessTest.kt` | NEW | Freshness window: ±60s accepted, ±600s rejected, unparseable rejected |
+| `test/...domain/device/controller/DeviceAdminControllerTest.kt` | MODIFIED | Fixed pre-existing failures (missing `@MockkBean RosterApplyService`) |
+
+### Files Changed — transmitter firmware (base `8d5b723`)
+| File | Action | Summary |
+|---|---|---|
+| `main/network/mqtt.c` | MODIFIED | Bootstrap re-key: nonce-keyed topics, signed `activate-v1`, `nonce_in_use` auto-retry with fresh nonce + immediate-retry cap, stale challenge-topic unsubscribe on cap hit |
+| `main/network/mqtt.h` | MODIFIED | `ESP_ERR_NOT_FINISHED` retryable-bootstrap contract documented |
+| `main/main.c` | MODIFIED | Paced 30s bootstrap re-arm on retryable result, enrollment token preserved |
+| `main/dispatch/dispatch.c` | MODIFIED | Signs `ack-v1` for transmit/deact acks (`signature_b64`, `command_id` on deact); **2026-07-11 amendment:** `publish_transmit_ack` caches the applied/unchanged check in `status_accepted` instead of repeating the double `strcmp` (cosmetic, behavior-preserving) |
+| `main/pair/roster_sync.c` | MODIFIED | Signs `roster-update-v1`; **post-audit fix:** canonical buffer resized from `canonical[512]` to `ROSTER_CANONICAL_MAX` (compile-time from `CONFIG_TRANSMITTER_PAIR_MAX_RECEIVERS` × name budget, heap-allocated, freed on all paths) and truncation now fail-fasts (skip publish) instead of publishing a doomed payload |
+| `main/network/heartbeat.c` | MODIFIED | Signs `heartbeat-v1`; same `issued_at` buffer bound in JSON and canonical (raw-wire-string rule) |
+
+### Files Changed — docs
+| File | Action | Summary |
+|---|---|---|
+| `docs/walkthrough/MQTT Communication Walkthrough.md` | MODIFIED | Updated end-to-end for the re-key + signing: nonce-keyed topics, signed envelope formats, new canonicals, freshness window, retry/idempotency semantics, revised trust model |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this change |
+
+### Audit
+Final whole-implementation review (after all 16 per-task reviews passed): verdict **With fixes** → all fixed → re-review **Ready to merge: Yes**.
+- **Critical (fixed):** roster canonical `canonical[512]` undersized for realistic rosters (up to 64 receivers × 96-char names ≈ 7 KB) and published-anyway on truncation → deterministic permanent roster-sync failure. Plan defect; fixed with compile-time-sized heap buffer + fail-fast.
+- **Important (fixed):** `nonce_in_use` guard treated a QoS-1 redelivery of the hub's own `register` as a foreign collision → firmware retried with the same single-use token → terminal `invalid_token` cleared a still-valid token. Fixed with same-key idempotent `pending` re-publish.
+- Cross-verified clean: byte contract on all four canonicals (firmware format strings vs `DeviceCanonical`), topic/Redis-key symmetry, zero stale `challenge_id` references in either repo, retry loop free of livelock, `public_key_der` present in `schema.sql` (no schema change needed), wire band label `2_4G` consistent by construction (both sides bind the wire string).
+
+### Skipped / Deferred
+| Item | Status | Reason |
+|---|---|---|
+| Firmware build + manual flash verification (plan manual steps) | DEFERRED | No ESP-IDF toolchain on this machine; all firmware identifiers/macros verified against sources, canonical bytes cross-checked via backend golden tests. Requires user flash: live heartbeat/roster/ack acceptance + corrupted-canonical rejection check |
+| ≥16-byte nonce floor + key-by-nonce Redis write path unit tests | FIXED 2026-07-11 | Amended post-close-out: two tests added to `DeviceRegistrationServiceTest` — short-nonce registration is dropped with zero side effects; fresh registration writes activation records under both `device:activation:{nonce}` and the by-device key (15-min TTL) and publishes `pending`. 4/4 tests green |
+| Listener-level signature-glue regression tests (roster/ack/heartbeat drop paths) | SKIPPED | Per plan's explicit delegation to `DeviceSignatureVerifierTest` + golden canonical bytes + manual flash verification |
+| `dispatch.c` wire_status double-`strcmp` caching | FIXED 2026-07-11 | Amended post-close-out: `status_accepted` bool cached in `publish_transmit_ack` (behavior-preserving) |
+| `mqtt.c` `payload_len` from `snprintf` unchecked | SKIPPED | Pre-existing pattern; buffer sizes verified unreachable for truncation |
+| Ack canonical id via `UUID.toString()` re-serialization | ACCEPTED | Backend-issued lowercase UUIDs round-trip byte-identically; noted for awareness |
+
+### Verification
+- Backend: `./gradlew compileKotlin compileTestKotlin` clean; `./gradlew test --tests "com.thomas.notiguide.domain.device.*" --tests "com.thomas.notiguide.core.device.*"` — all green (36 tests in final fix-wave run); TDD RED→GREEN evidence recorded per task. No production build attempted per repository instruction (separate audit flow).
+- Firmware: source/header verification only (see Skipped table).
+
+---
+
+## 2026-07-09 — MQTT & ESP-NOW communication reference docs
+
+**Why:** Consolidated, ground-truth documentation of the two device-communication layers was requested: the full MQTT flow (topics, packet formats, provisioning vs. normal ops, key usage, anti-spoofing) and the ESP-NOW pairing behaviour (dispatch-vs-pairing concurrency, and how multiple receivers/transmitters are discriminated). All content was derived by reading the backend (`core/mqtt`, `core/device`, `domain/device`), the transmitter firmware (`network/mqtt.c`, `dispatch/`, `pair/espnow_pair_host.c`), and the ESP32-C3 receiver firmware (`pair/espnow_pair.c`). ESP8266 was intentionally excluded per request (protocol is identical to ESP32-C3 anyway).
+
+### Files Changed
+| File | Action | Summary |
+|---|---|---|
+| `docs/walkthrough/MQTT Communication Walkthrough.md` | ADDED | Full MQTT reference: transport/TLS/auth, complete topic namespace, JSON packet + canonical signing formats, key usage on the wire, bootstrap/activation provisioning flow (with concurrent-registration disambiguation and spoofer controls), normal-ops flows (dispatch/roster/heartbeat/lifecycle), and an MQTT-vs-Web-Serial provisioning comparison (Mermaid diagrams). |
+| `docs/walkthrough/ESP-NOW Pairing & Dispatch Concurrency.md` | ADDED | Answers "dispatch during pairing": two independent radio planes (Wi-Fi/ESP-NOW vs 433/nRF24), no software interlock, `radio_supervisor` mutex only arbitrates the two RF bands, Wi-Fi channel-pin caveat, 2.4 GHz airtime-sharing nuance. |
+| `docs/walkthrough/ESP-NOW Pairing Discrimination.md` | ADDED | Answers receiver/transmitter discrimination: 6-message handshake reference, MAC-locked one-at-a-time host state machine, per-peer CCMP + nonce tag + physical confirm, "first-responder-wins" hub selection on the receiver, honest race edge-cases, operational guidance. |
+| `docs/walkthrough/Key Generation Walkthrough.md` | MODIFIED | Enriched (rather than duplicated) with a new "Key Scoping & Usage" section: trust-boundary Mermaid graph, scoping/blast-radius matrix, the "two opposite EC P-256 keys" clarification, and the PSK PMK/LMK split detail. |
+| `docs/CHANGELOGS.md` | MODIFIED | Logged this change. |
+
+### Verification
+- Documentation only; no source changes, no build. Every topic string, envelope field, canonical-signing string, TTL, and handshake message was cross-checked against the cited source files.
+
+### Revision (same day)
+- Scoped the MQTT doc to **hub-only**: this deployment uses hub-paired receivers exclusively, so MQTT-registered-receiver content was removed — `receiver/bootstrap/*` and `receiver/device/*` topics (register/rf_code/deact/ack), the full-payload `transmit-v1` dispatch and `rf-code-v1` canonical strings, and the receiver activation branch. The provisioning flow, key scoping (in `Key Generation Walkthrough.md`), and dispatch section now describe only the transmitter hub over MQTT; receivers reach the system via ESP-NOW pairing + RF.
+- Added `MQTT Communication Walkthrough.md` §7 "What the challenge-response proves (and what gates forgery)": clarifies that the self-generated hub keypair means the activation signature proves only key-possession (anti-hijack/anti-replay/stable identity), not genuine hardware; the real anti-forgery gate is the one-time enrollment token + admin approval (+ TLS, per-store hub cap); notes the no-attestation gap and the bounded (DoS-only) impact of a forged hub. Renumbered former §7–§9 → §8–§10 and softened the §6 "trust anchor" wording to point at §7.
+- Added `MQTT Communication Walkthrough.md` §11 "Pub/sub flow & per-topic packet formats (reference)": phase-by-phase pub/sub matrices for provisioning (bootstrap) and operational phases (actor / SUB vs PUB / topic / wildcard / QoS / retain), the JSON packet format of every topic (register, pending, challenge, response, result, rejected, cmd/transmit, cmd/deact, cmd/label, cmd/unpair, roster/ack, roster/update, heartbeat, ack, cluster/roster), and a "wildcard strategy" subsection documenting every `+` subscription and explaining that `#` is deliberately unused (per-topic QoS + subscribe-only-what-you-handle + bootstrap narrowing). All QoS/retain flags verified against `mqtt.c` and the backend listeners/publishers. Added a forward-pointer from §2; appended as §11 to avoid renumbering the §4–§10 cross-references.
+- Added a **purpose disclaimer** to `MQTT Communication Walkthrough.md` §7 (blockquote at the top of the section): states the challenge's sole purpose is to prove **continuity + liveness of the key‑holder** across the register→confirm gap — not the authorization credential (the enrollment token is), not proof of genuine hardware (self‑generated keypair), and, since admin approval is the human gate, best read as a defense‑in‑depth identity anchor that only earns its keep if the device's cryptographic identity is ever used post‑activation (it currently is not). Consolidates the conclusion reached in a Q&A thread about whether the challenge/admin phases can be removed.
+- Added `ESP-NOW Pairing Discrimination.md` §3 "Why the receiver sweeps channels (and whether ESP-NOW can be pinned)": explains ESP-NOW rides the 2.4 GHz Wi-Fi PHY (same-channel requirement), the hub's ESP-NOW channel is forced to the store AP's channel (STA + ESP-NOW share one radio), and the receiver is unassociated so it must sweep 1–13; covers whether the channel can be pinned (two approaches + trade-offs), why sweep was chosen, optimizations, and a region note. Renumbered former §3/§4 → §4/§5 and updated the `Key Generation Walkthrough.md` cross-link (§3 → §4).
+
 ## 2026-07-08 — Fix hub reboot on "Disconnect USB" (Windows-only)
 
 **Why:** Pressing "Disconnect USB" on the dashboard rebooted the hub — but only when the browser ran on Windows, not Linux. Root cause is hardware-level, not application code: the transmitter enumerates via the ESP32-C3's native USB-Serial-JTAG peripheral (VID `0x303A`), which implements the classic esptool auto-reset circuit in silicon — it pulls chip reset (EN) whenever the host asserts RTS while DTR is deasserted. Chrome opens Web Serial ports with both DTR and RTS asserted; on `port.close()`, the Windows serial stack drops the control lines one at a time (DTR first), transiting through the exact `DTR=0, RTS=1` reset-trigger state. Linux's cdc-acm clears both bits in a single `SET_CONTROL_LINE_STATE` transfer, so the trigger state never occurs there. Neither firmware (no `esp_restart()` outside explicit provision/MQTT-save/factory-reset commands) nor the frontend protocol (disconnect sends no command) initiates the reboot. Fix: `disconnect()` now deasserts the signals itself in a safe order — RTS first, then DTR (never passing through `DTR=0, RTS=1`) — before `port.close()`, making Windows' close-time line clearing a no-op at the device.

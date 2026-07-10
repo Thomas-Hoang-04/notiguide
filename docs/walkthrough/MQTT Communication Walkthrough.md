@@ -48,18 +48,22 @@ device/MQTT layer silently degrades and the app still boots.
 
 All topics are prefixed by `mqtt.topicPrefix` (default `notiguide`). Only the
 `transmitter` family is used in this deployment — receivers are hub‑paired and are not MQTT
-devices. Below, `{cid}` = challenge UUID, `{pid}` = hub `public_id`, `{store}` = store UUID.
+devices. Below, `{nonce}` = the hub‑generated `registration_nonce` (base64url, 16 random
+bytes, MQTT‑topic‑safe), `{pid}` = hub `public_id`, `{store}` = store UUID.
 
 ### Provisioning (bootstrap) topics
 
 | Topic | Dir | Retained | Purpose |
 |---|---|---|---|
 | `…/transmitter/bootstrap/register` | hub → backend | no | Hub announces itself (shared inbox) |
-| `…/transmitter/bootstrap/{cid}` | both | no | Per‑registration channel: `pending`/`challenge`/`result`/`rejected` (backend) and `response` (hub) |
+| `…/transmitter/bootstrap/{nonce}` | both | no | Per‑registration channel: `pending`/`challenge`/`result`/`rejected` (backend) and `response` (hub) |
 
-Backend subscribes to the wildcard `…/transmitter/bootstrap/+`
-(`TransmitterBootstrapListener`). The hub subscribes to the same wildcard, then narrows to
-its own `{cid}` once it learns it.
+The per‑registration channel is keyed by the **device‑generated `registration_nonce`**, not
+by any backend‑minted identifier. Backend subscribes to the wildcard
+`…/transmitter/bootstrap/+` (`TransmitterBootstrapListener`) so a single subscription matches
+both `…/bootstrap/register` and every `…/bootstrap/{nonce}`. The hub, from the very start,
+subscribes to **only its own** `…/bootstrap/{nonce}` (no wildcard) — it never hears other
+hubs' bootstrap traffic.
 
 ### Command topics (backend → device)
 
@@ -98,12 +102,19 @@ retained topics by publishing a zero‑length retained message (`DeviceMqttPubli
 
 Every application message is **UTF‑8 JSON**, one object per publish. Common conventions:
 
-- `schema_version` (int, currently `1`) — receivers reject anything else.
+- `schema_version` (int, currently `1`, no version bumps) — receivers reject anything else.
 - `type` — discriminator on the bootstrap channel (`pending`, `challenge`, `response`,
   `result`, `rejected`).
 - `issued_at` / `expires_at` — ISO‑8601 instants (`…toInstant().toString()`).
-- `signature_b64` — Base64 ECDSA (`SHA256withECDSA`) over a **canonical string** (§4).
+- `signature_b64` — Base64 ECDSA (`SHA256withECDSA`) over a **canonical string** (§4). Present
+  on **both** directions: backend‑signed commands *and* device‑signed telemetry.
 - Field names are `snake_case` on the wire (Jackson `@JsonProperty`).
+
+> **Every device→backend message is signed (hard cutover).** The activation `response`,
+> `roster/update`, `ack`, and `heartbeat` all carry a `signature_b64` produced by the hub's
+> private key. The backend verifies each against the hub's registered public key **before any
+> side effect** and silently drops anything unsigned or mis‑signed. Legacy/unsigned device
+> messages are not accepted — firmware and backend deploy in lockstep.
 
 Example dispatch (`cmd/transmit`, slot form — the only dispatch form used):
 
@@ -118,18 +129,40 @@ slot's RF code locally and transmits it over RF.
 ### 4. Canonical signing strings
 
 Signatures never sign the JSON; they sign a fixed, order‑stable canonical string so both
-sides compute the identical bytes. From `core/device/DeviceCanonical.kt`:
+sides compute the identical bytes (field order, `|` and `:` separators, null handling all
+byte‑identical between firmware and `core/device/DeviceCanonical.kt`). Timestamps that the
+*device* generates (`heartbeat.issued_at`) are bound as the **raw wire string**, never
+re‑serialized.
+
+**Backend‑signed (device verifies against embedded backend key):**
 
 | Command | Canonical string |
 |---|---|
-| Activation response | `activate-v1\|{cid}\|{nonce}\|{issuedAt}\|{expiresAt}` |
 | Deact | `deact-v1\|{pid}\|{commandId}\|{action}\|{issuedAt}` |
 | Slot dispatch | `dispatch-v1\|{hubPid}\|{dispatchId}\|{slot}\|{action}\|{issuedAt}` |
 | Roster ACK | `roster-ack-v1\|{hubPid}\|{seq}\|{issuedAt}` |
 
-The **activation** signature is produced by the *hub* (proving it owns its private key).
-Every other signature is produced by the *backend* (proving the command is authentic) and
-verified in firmware against the embedded backend public key.
+**Hub‑signed (backend verifies against the hub's registered public key):**
+
+| Message | Canonical string |
+|---|---|
+| Activation response | `activate-v1\|{registrationNonce}\|{nonce}\|{issuedAt}\|{expiresAt}` |
+| Roster update | `roster-update-v1\|{hubPid}\|{seq}` then `\|{slot}:{band}:{label}` per receiver, slot‑ascending (head‑only when empty) |
+| ACK (transmit/deact) | `ack-v1\|{hubPid}\|{ackFor}\|{id}\|{status}` (`id` = `dispatchId` for transmit, `commandId` for deact) |
+| Heartbeat | `heartbeat-v1\|{hubPid}\|{issuedAtRaw}\|{heapPct}\|{rssi}\|{uptimeMs}\|{dispD}\|{dispT}\|{ip}` |
+
+The **activation `response`** signature proves the hub owns the private key of the public key
+it registered. The three operational canonicals (`roster-update-v1`, `ack-v1`,
+`heartbeat-v1`) authenticate ongoing device→backend telemetry with that same key. All
+backend‑signed commands are verified in firmware against the embedded backend public key.
+
+> Notes on the hub‑signed canonicals: the wire **band label is `2_4G`** (and `433M`) — both
+> sides bind the literal wire string, so agreement is by construction. Roster **entry names
+> are unconstrained** (they may contain `|` or `:`) — this is safe because both sides *build*
+> the canonical from structured fields rather than parsing it back. `rssi`/`ip` collapse to
+> the empty string when absent. Firmware builds the roster canonical in a heap buffer sized
+> from Kconfig (`ROSTER_CANONICAL_MAX`) and **fail‑fasts (skips the publish) on truncation**,
+> so a signed roster is never sent over a truncated canonical.
 
 > `DeviceCanonical` also defines `rf-code-v1` and a full‑payload `transmit-v1` string for
 > MQTT‑enrolled receivers. That path is **not used in this deployment** (receivers are
@@ -143,7 +176,7 @@ verified in firmware against the embedded backend public key.
 |---|---|---|---|
 | MQTT CA cert (ISRG Root X1) | firmware (embedded) | Verify the broker's TLS cert | Transport, per broker |
 | Broker username/password | firmware (provisioned) + backend | Authenticate to the broker | Deployment‑wide, **not** device identity |
-| **Hub EC P‑256 keypair** | private in hub NVS; public registered to backend | Hub **signs the activation challenge** → proves identity | Per hub |
+| **Hub EC P‑256 keypair** | private in hub NVS; public registered to backend | Hub **signs the activation response** (proves identity) **and every device→backend telemetry message** (`roster/update`, `ack`, `heartbeat`); backend verifies each | Per hub |
 | **Backend command‑signing EC P‑256** | private on backend; public embedded in all firmware | Backend **signs every command** (slot‑dispatch/deact/roster‑ack); firmware verifies | Deployment‑wide |
 
 Full generation/rotation details live in
@@ -165,64 +198,84 @@ sequenceDiagram
     participant S as Backend
     participant A as Admin (dashboard)
 
-    Note over D: has enroll token + Wi-Fi + MQTT creds<br/>generates EC P-256 keypair on first boot (NVS)
+    Note over D: has enroll token + Wi-Fi + MQTT creds<br/>generates EC P-256 keypair on first boot (NVS)<br/>generates 16-byte registration_nonce<br/>subscribes ONLY to …/bootstrap/{nonce}
     D->>B: register {enroll_token, public_key_b64, registration_nonce, fw}
     B->>S: …/transmitter/bootstrap/register
-    Note over S: consume enroll token (one-time, store-scoped)<br/>decode & validate P-256 key<br/>upsert Device(status=PENDING)<br/>mint random challengeId
-    S->>B: pending {challenge_id, registration_nonce}  (…/bootstrap/{cid})
-    B->>D: (hub on wildcard) matches its own registration_nonce
-    Note over D: narrows subscription to …/bootstrap/{cid}
+    Note over S: nonce_in_use guard on device:activation:{nonce}<br/>consume enroll token (one-time, store-scoped)<br/>decode & validate P-256 key<br/>upsert Device(status=PENDING)<br/>store activation keyed by registration_nonce
+    S->>B: pending {issued_at}  (…/bootstrap/{nonce})
+    B->>D: …/bootstrap/{nonce}
 
     A->>S: approve(hub, store, name)
     Note over S: generate 16-byte challenge nonce, status=ISSUED
-    S->>B: challenge {challenge_id, nonce, issued_at, expires_at}
-    B->>D: …/bootstrap/{cid}
-    Note over D: sign  activate-v1|cid|nonce|issued|expires  with hub private key
-    D->>B: response {challenge_id, signature_b64}
-    B->>S: …/bootstrap/{cid}
+    S->>B: challenge {nonce, issued_at, expires_at, purpose}
+    B->>D: …/bootstrap/{nonce}
+    Note over D: sign  activate-v1|registration_nonce|nonce|issued|expires  with hub private key
+    D->>B: response {signature_b64}
+    B->>S: …/bootstrap/{nonce}  (backend reads nonce from topic)
     Note over S: verify ECDSA vs registered public key<br/>mint public_id, status=ACTIVE
     S->>B: result {public_id, assigned_device_name, store_id}
-    B->>D: …/bootstrap/{cid}
+    B->>D: …/bootstrap/{nonce}
     Note over D: persist public_id, subscribe cmd topics
 ```
 
 Step detail (from `DeviceRegistrationService`, `DeviceApprovalService`,
 `DeviceActivationService`, and firmware `mqtt.c`):
 
-1. **register** — the hub publishes to the shared `…/transmitter/bootstrap/register`.
-   Payload carries the one‑time `enrollment_token`, the hub's `public_key_b64` (X.509 DER,
-   P‑256), a random `registration_nonce`, firmware version, and declared kind.
-2. Backend `onRegister`: consumes the enroll token (invalid → `rejected: invalid_token`),
-   validates it's a genuine P‑256 key, enforces the per‑store hub cap for transmitters,
-   upserts a `Device` row at `PENDING` keyed by the **public‑key DER** (its stable
-   identity), mints a **random `challengeId`**, stores an activation record in Redis
-   (15 min TTL), and publishes `pending`.
+1. **register** — the hub generates a random 16‑byte `registration_nonce` (base64url),
+   subscribes to **only** `…/transmitter/bootstrap/{nonce}`, then publishes to the shared
+   `…/transmitter/bootstrap/register`. Payload carries the one‑time `enrollment_token`, the
+   hub's `public_key_b64` (X.509 DER, P‑256), the `registration_nonce`, firmware version,
+   and declared kind.
+2. Backend `onRegister`: **first** runs the `nonce_in_use` guard on
+   `device:activation:{registration_nonce}` (before consuming the token); then consumes the
+   enroll token (invalid → `rejected: invalid_token`), validates it's a genuine P‑256 key
+   (nonce floor enforced ≥16 decoded bytes), enforces the per‑store hub cap for
+   transmitters, upserts a `Device` row at `PENDING` keyed by the **public‑key DER** (its
+   stable identity), stores an activation record in Redis **keyed by `registration_nonce`**
+   (15 min TTL), and publishes `pending` (`issued_at` only — no identifier echo, the topic
+   *is* the nonce).
 3. **Admin approval** — an admin picks the pending device, assigns a name + store.
-   Backend generates a 16‑byte `nonce`, marks the activation `ISSUED` (5 min lifetime),
-   and publishes `challenge`.
-4. **response** — the hub signs the canonical `activate-v1|…` string with its private
-   key and publishes `response` with the Base64 signature.
-5. Backend `onResponse`: reloads the activation record, checks it's `ISSUED` and unexpired,
-   verifies the ECDSA signature **against the public key registered in step 2**, mints the
+   Backend generates a 16‑byte challenge `nonce`, marks the activation `ISSUED` (5 min
+   lifetime), and publishes `challenge` on `…/bootstrap/{registration_nonce}`.
+4. **response** — the hub signs the canonical
+   `activate-v1|{registration_nonce}|{nonce}|{issued}|{expires}` with its private key and
+   publishes `response` (just `signature_b64`) back on its `{nonce}` topic.
+5. Backend `onResponse`: derives the `registration_nonce` **from the topic**, reloads the
+   activation record, checks it's `ISSUED` and unexpired, verifies the ECDSA signature
+   (`DeviceSignatureVerifier`) **against the public key registered in step 2**, mints the
    `public_id`, flips status to `ACTIVE`, and publishes `result`.
+
+### `nonce_in_use` collision handling
+
+Because the session is now keyed by a *device‑chosen* nonce, the backend guards the
+activation key before consuming the token:
+
+- **Idempotent duplicate.** If `device:activation:{nonce}` already exists **and its stored
+  public‑key fingerprint matches the incoming key** (e.g. a QoS‑1 `register` redelivered
+  across a reconnect), the backend re‑publishes the same `pending` — **no second token
+  consume, no record overwrite** (`handleExistingNonce`).
+- **Genuine collision.** If the key exists but the stored key differs, the backend publishes
+  `rejected: nonce_in_use`. Firmware then **auto‑retries with a fresh nonce**: it
+  re‑subscribes to the new `{nonce}` topic and re‑publishes `register`, keeping the same
+  (unconsumed) enrollment token, up to an immediate‑retry cap
+  (`BOOTSTRAP_MAX_IMMEDIATE_RETRIES`). Past the cap it resets the session but **keeps the
+  token** and signals the provisioning loop to re‑arm bootstrap on a paced 30 s cadence
+  (`main.c`).
 
 ### How concurrent registrations stay separated
 
 Multiple hubs (several stores, or a multi‑hub store) can hit the shared
-`…/transmitter/bootstrap/register` and the shared `…/transmitter/bootstrap/+` wildcard at
-once. Three mechanisms keep them from crossing wires:
+`…/transmitter/bootstrap/register` at once, and the backend watches every session through
+one `…/transmitter/bootstrap/+` wildcard. What keeps them from crossing wires:
 
+- **The `registration_nonce` *is* the channel.** Each hub subscribes to **only** its own
+  high‑entropy `…/bootstrap/{nonce}` from the very first moment — it never receives another
+  hub's `pending`/`challenge`/`result`, so there is no cross‑hearing to filter out.
+- **`nonce_in_use` enforces one session per nonce.** Two hubs cannot share a session even on
+  a nonce collision — the second is rejected and re‑rolls (above).
 - **Stable identity = the hub's EC public key.** `onRegister` upserts by
   `findByPublicKeyDer`, so re‑registration of the same physical hub updates one row rather
   than creating duplicates.
-- **Per‑registration `challengeId`.** Every registration gets a fresh random UUID that
-  scopes its own `…/bootstrap/{cid}` topic. All `challenge`/`result` traffic for that hub
-  flows only there.
-- **`registration_nonce` self‑selection.** Because the hub is subscribed to the *wildcard*
-  until it learns its `{cid}`, it receives every hub's `pending`/`challenge`. Firmware
-  compares `registration_nonce` to its own and ignores non‑matching messages
-  (`mqtt.c` `handle_bootstrap_pending` / `handle_bootstrap_challenge`), then re‑subscribes
-  to just its `{cid}` topic.
 
 ### How the backend knows it's a real device, not a spoofer
 
@@ -230,32 +283,35 @@ once. Three mechanisms keep them from crossing wires:
 |---|---|
 | Random client registers | Must present a valid **one‑time, store‑scoped enrollment token** (admin‑issued, hashed + TTL'd in Redis, consumed on first use). |
 | Attacker replays a captured public key | Registration alone grants nothing; activation requires **signing a fresh server nonce** with the matching **private key**, which never leaves the device's NVS. |
-| Attacker guesses/reuses a nonce | Nonce is 16 random bytes, single‑use, `ISSUED`‑gated, 5 min lifetime; a stale/duplicate response is dropped. |
+| Attacker guesses/reuses a nonce | The challenge `nonce` is 16 random bytes, single‑use, `ISSUED`‑gated, 5 min lifetime; a stale/duplicate response is dropped. A hijacked `registration_nonce` cannot open a parallel session — the `nonce_in_use` guard rejects a second registration under a differing key. |
 | Attacker forges commands to a device | Every actuation command is **ECDSA‑signed by the backend**; firmware rejects bad signatures (`signature_failed`). |
+| Attacker forges device telemetry | Every `roster/update`, `ack`, and `heartbeat` is **ECDSA‑signed by the hub**; the backend verifies against the registered public key **before any side effect** and drops mis‑signed messages. Heartbeats additionally must fall inside a 120 s freshness window on the raw `issued_at`. |
 | Attacker MITMs the broker | TLS with a **pinned CA** in firmware. |
 | Attacker floods the shared inbox | Malformed/oversized payloads are parsed defensively and dropped; a bad token yields only a `rejected`. |
 
 The trust anchor is the **one‑time enrollment token plus admin approval**; the private‑key
-signature adds anti‑hijack/anti‑replay and a stable identity, but — since the keypair is
-self‑generated — it does **not** by itself prove a genuine device. Broker credentials and
-TLS protect the channel but are explicitly *not* treated as identity. **See §7** for the
-full breakdown of what the challenge‑response proves and what actually gates forgery.
+signature adds anti‑hijack/anti‑replay, a stable identity, and — now — authentication of all
+ongoing device→backend telemetry. Since the keypair is self‑generated it does **not** by
+itself prove a genuine device. Broker credentials and TLS protect the channel but are
+explicitly *not* treated as identity. **See §7** for the full breakdown of what the
+challenge‑response proves and what actually gates forgery.
 
 ---
 
 ## 7. What the challenge-response proves (and what gates forgery)
 
-> **Disclaimer — the challenge's purpose in one line.** The challenge exists only to prove
+> **Disclaimer — the challenge's purpose in one line.** The challenge exists to prove
 > **continuity and liveness of the key‑holder** across the register→confirm gap: that whoever
 > answers *now* holds the private key of the public key registered *earlier*, and is doing so
-> live (fresh, single‑use nonce), not replaying an old confirmation. That is its **entire**
-> job. It is **not** the authorization credential — the **enrollment token** is (§6); it does
-> **not** prove genuine hardware — the keypair is self‑generated; and because **admin
-> approval** is the actual human gate, the challenge is best understood as a
-> **defense‑in‑depth identity anchor**, not a load‑bearing forgery control. It earns its keep
-> only if the device's cryptographic identity is ever *used* (e.g. future device‑signed
-> telemetry or re‑auth); today that identity is established here but referenced nowhere after
-> activation. Everything below expands on this.
+> live (fresh, single‑use nonce), not replaying an old confirmation. That is its job at
+> activation. It is **not** the authorization credential — the **enrollment token** is (§6);
+> it does **not** prove genuine hardware — the keypair is self‑generated; and **admin
+> approval** is the actual human gate. What has changed: the device's cryptographic identity
+> is **no longer referenced nowhere after activation** — the same keypair now signs **every**
+> `roster/update`, `ack`, and `heartbeat`, and the backend verifies each before acting. So the
+> challenge is no longer a dormant identity anchor: it bootstraps a key that is *load‑bearing*
+> for the authenticity of all ongoing device→backend telemetry. Everything below expands on
+> this.
 
 A natural objection to §6: the hub signs the activation challenge with its own EC private
 key — but the hub **generates that keypair itself on first boot**. So a forger could
@@ -272,9 +328,11 @@ firmware. Concretely it buys three things:
 - **Anti‑hijack.** An attacker who merely *sniffs* the `register` message (which carries the
   public key) cannot finish activation — they don't hold the private key. Without the
   challenge step, an eavesdropper could complete someone else's registration.
-- **Anti‑replay.** The nonce is fresh, single‑use, `ISSUED`‑gated, 5‑min TTL; a captured old
-  response is worthless.
-- **A stable cryptographic identity** to bind the DB row, roster, and later correlation to.
+- **Anti‑replay.** The challenge nonce is fresh, single‑use, `ISSUED`‑gated, 5‑min TTL; a
+  captured old response is worthless.
+- **A stable cryptographic identity** that binds the DB row and roster **and now
+  authenticates every subsequent device→backend message** — `roster/update`, `ack`, and
+  `heartbeat` are all verified against this key, so activation is where that trust is minted.
 
 It proves *"the same key‑holder throughout,"* **not** *"a genuine device."*
 
@@ -330,10 +388,10 @@ sequenceDiagram
     Note over S: elect active hub for store<br/>slot dispatch to the hub-paired receiver<br/>sign dispatch-v1
     S->>B: cmd/transmit {…, signature_b64}
     B->>H: cmd/transmit
-    Note over H: verify signature, dedupe by dispatch_id<br/>radio_tx_send() on 433M / 2.4G
-    H->>B: ack {ack_for:transmit, dispatch_id, status:applied|unchanged|rejected}
+    Note over H: verify signature, dedupe by dispatch_id<br/>radio_tx_send() on 433M / 2.4G<br/>sign ack-v1|pid|transmit|dispatch_id|status
+    H->>B: ack {ack_for:transmit, dispatch_id, status:applied|unchanged|rejected, signature_b64}
     B->>S: …/hub/{pid}/ack
-    Note over S: completeDispatch / failDispatch (reconciliation)
+    Note over S: verify ack signature vs hub public key<br/>then completeDispatch / failDispatch (reconciliation)
 ```
 
 The backend arms an ack‑timeout timer (Redis) for **call** dispatches so a lost ACK
@@ -342,8 +400,10 @@ immediately, independent of the hub's ACK.
 
 ### 8b. Roster sync (hub → backend, backend ACK)
 
-The hub owns its slot roster (it assigns slots during ESP‑NOW pairing). It pushes the
-roster up; the backend applies it idempotently by `seq` and returns a **signed** ACK.
+The hub owns its slot roster (it assigns slots during ESP‑NOW pairing). It **signs** and
+pushes the roster up; the backend **verifies the signature first**, applies it idempotently
+by `seq`, and returns a **signed** ACK. The hub verifies the ACK signature before marking the
+roster synced.
 
 ```mermaid
 sequenceDiagram
@@ -351,24 +411,30 @@ sequenceDiagram
     participant H as Hub
     participant B as Broker
     participant S as Backend (RosterSyncListener)
-    H->>B: roster/update {schema_version, seq, receivers[]}
+    H->>B: roster/update {schema_version, seq, receivers[], signature_b64}
     B->>S: …/hub/{pid}/roster/update
-    Note over S: RosterApplyService.apply (idempotent on seq)
-    S->>B: roster/ack {seq, signature_b64 = sign(roster-ack-v1|pid|seq|issued)}
+    Note over S: verify sig vs hub public key (roster-update-v1|pid|seq|…)<br/>drop if invalid, else RosterApplyService.apply (idempotent on seq)
+    S->>B: roster/ack {seq, issued_at, signature_b64 = sign(roster-ack-v1|pid|seq|issued)}
     B->>H: roster/ack
+    Note over H: verify ACK sig before roster_mark_synced
 ```
 
 ### 8c. Heartbeat & diagnostics
 
-The hub emits `heartbeat` (QoS 0) carrying `diag` (heap %, RSSI, uptime, daily/total
-dispatch counts, IP). `TransmitterOperationalListener` touches `last_seen_at`, refreshes a
-Redis liveness key, lazily triggers **transmitter election** if the store has no active
-hub, and records diagnostics.
+The hub emits a **signed** `heartbeat` (QoS 0) carrying `diag` (heap %, RSSI, uptime,
+daily/total dispatch counts, IP). Before any side effect `TransmitterOperationalListener`
+(a) requires a stored public key, (b) enforces a **120 s freshness window** on the raw
+`issued_at` wire string (`HEARTBEAT_FRESHNESS_SECONDS`), and (c) **verifies the signature**
+over `heartbeat-v1|…`; only then does it touch `last_seen_at`, refresh a Redis liveness key,
+lazily trigger **transmitter election** if the store has no active hub, and record
+diagnostics. A stale, future, or mis‑signed heartbeat is dropped.
 
 ### 8d. Lifecycle commands
 
-`cmd/deact` (retained), `cmd/label`, `cmd/unpair` — all backend‑signed; the hub verifies
-and, where relevant, ACKs on `…/ack`.
+`cmd/deact` (retained), `cmd/label`, `cmd/unpair` — `cmd/deact` is backend‑signed and the hub
+ACKs it on `…/ack`; that **deact ACK is now hub‑signed and carries `command_id`**, verified by
+the backend (`ack-v1|pid|deact|{commandId}|{status}`) before reconciliation. `cmd/label` and
+`cmd/unpair` remain **cosmetic and unsigned** in both directions.
 
 ---
 
@@ -434,8 +500,16 @@ adds is *auto‑approval*, which is safe precisely because it is gated by physic
 - **Authenticity of commands:** every actuation is ECDSA‑signed by the backend and verified
   in firmware against an embedded public key; canonical strings prevent field‑reordering
   ambiguity; `dispatch_id`/`command_id` give idempotency and replay resistance.
+- **Authenticity of device telemetry:** every device→backend message (`activation response`,
+  `roster/update`, `ack`, `heartbeat`) is ECDSA‑signed by the hub and verified against its
+  registered public key **before any side effect**; unsigned/legacy messages are dropped (hard
+  cutover). Heartbeats add a 120 s freshness window on the raw `issued_at` to bound replay.
 - **Device identity:** proven once at activation by signing a fresh server nonce with a
-  private key that never leaves NVS, and bound to an admin‑approved public key.
+  private key that never leaves NVS, bound to an admin‑approved public key, and thereafter
+  reused to authenticate all telemetry.
+- **Session keying:** the bootstrap channel is keyed by a high‑entropy, device‑generated
+  `registration_nonce` (the topic itself); a `nonce_in_use` guard prevents two devices from
+  sharing a session, and firmware re‑rolls on a genuine collision.
 - **Enrollment gating:** one‑time, store‑scoped, TTL'd tokens (hashed in Redis) required to
   even reach `PENDING`.
 - **Non‑identity by design:** broker username/password are shared and explicitly not used
@@ -449,58 +523,66 @@ adds is *auto‑approval*, which is safe precisely because it is gated by physic
 A consolidated view of exactly what the hub and backend **subscribe** to and **publish** in
 each phase, the wildcards involved, the QoS/retain flags, and the JSON body of every topic.
 Everything is verified against `transmitter/main/network/mqtt.c` and the backend device
-listeners/publishers. Notation: `…/` = `mqtt.topicPrefix` (default `notiguide`), `{cid}` =
-challenge UUID, `{pid}` = hub `public_id`, `{store}` = store UUID.
+listeners/publishers. Notation: `…/` = `mqtt.topicPrefix` (default `notiguide`), `{nonce}` =
+the hub‑generated `registration_nonce` (base64url), `{pid}` = hub `public_id`, `{store}` =
+store UUID.
 
 ### 11a. During provisioning (bootstrap phase)
 
 | Actor | Op | Topic | Wildcard | QoS | Retain |
 |---|---|---|---|---|---|
+| Hub | SUB | `…/transmitter/bootstrap/{nonce}` | — | 1 | — |
 | Hub | PUB | `…/transmitter/bootstrap/register` | — | 1 | no |
-| Hub | SUB | `…/transmitter/bootstrap/+` | **`+`** | 1 | — |
-| Hub | *(on `pending`)* UNSUB `…/transmitter/bootstrap/+`, then SUB | `…/transmitter/bootstrap/{cid}` | — | 1 | — |
-| Hub | PUB | `…/transmitter/bootstrap/{cid}` → `response` | — | 1 | no |
+| Hub | PUB | `…/transmitter/bootstrap/{nonce}` → `response` | — | 1 | no |
+| Hub | *(on `nonce_in_use`)* UNSUB old, SUB new | `…/transmitter/bootstrap/{nonce}` (fresh) | — | 1 | — |
 | Backend | SUB | `…/transmitter/bootstrap/+` | **`+`** | 1 | — |
-| Backend | PUB | `…/transmitter/bootstrap/{cid}` → `pending` / `challenge` / `result` / `rejected` | — | 1 | no |
+| Backend | PUB | `…/transmitter/bootstrap/{nonce}` → `pending` / `challenge` / `result` / `rejected` | — | 1 | no |
 
-Key wildcard behavior: the backend's single `…/transmitter/bootstrap/+` subscription matches
-**both** `…/bootstrap/register` *and* every `…/bootstrap/{cid}` (a `+` matches one level, and
-`register`/`{cid}` are both one level). The hub starts on the same `+`, then **narrows** to
-its own `{cid}` (matched by `registration_nonce`, see §6) and drops the wildcard to stop
-hearing other devices.
+Key wildcard behavior: only the **backend** uses a wildcard here. Its single
+`…/transmitter/bootstrap/+` subscription matches **both** `…/bootstrap/register` *and* every
+`…/bootstrap/{nonce}` (a `+` matches one level, and `register`/`{nonce}` are both one level).
+The **hub uses no wildcard at all** — it subscribes to exactly its own `…/bootstrap/{nonce}`
+from the first moment, so it never hears another device's bootstrap traffic. (On a
+`nonce_in_use` rejection it unsubscribes the old nonce topic and subscribes a freshly
+generated one — still exact, never a wildcard.)
 
 **Packet formats (bootstrap):**
+
+The channel is keyed by `registration_nonce` (the topic), so **no bootstrap envelope carries
+any backend‑minted session id**, and `pending`/`challenge` no longer echo
+`registration_nonce` — the topic already identifies the session. `register` is the only
+message that carries `registration_nonce` in its body (that is how the backend learns which
+topic to answer on).
 
 ```json
 // register        hub → backend   …/transmitter/bootstrap/register
 { "schema_version": 1, "hardware_model": "ESP32-C3", "kind": "TRANSMITTER_HUB",
   "firmware_version": "1.4.0", "public_key_b64": "<X.509 DER, EC P-256>",
-  "enrollment_token": "<one-time token>", "registration_nonce": "<base64url random>" }
+  "enrollment_token": "<one-time token>", "registration_nonce": "<base64url, 16 random bytes>" }
 ```
 ```json
-// pending         backend → hub   …/transmitter/bootstrap/{cid}
-{ "schema_version": 1, "type": "pending", "challenge_id": "<uuid>",
-  "registration_nonce": "<echoed from register>", "issued_at": "2026-07-09T09:00:00Z" }
+// pending         backend → hub   …/transmitter/bootstrap/{nonce}
+{ "schema_version": 1, "type": "pending", "issued_at": "2026-07-09T09:00:00Z" }
 ```
 ```json
-// challenge       backend → hub   …/transmitter/bootstrap/{cid}   (after admin approval)
-{ "schema_version": 1, "type": "challenge", "challenge_id": "<uuid>",
-  "registration_nonce": "<echo>", "nonce": "<base64url 16B>",
+// challenge       backend → hub   …/transmitter/bootstrap/{nonce}   (after admin approval)
+{ "schema_version": 1, "type": "challenge", "nonce": "<base64url 16B>",
   "issued_at": "…", "expires_at": "…", "purpose": "activate-v1" }
 ```
 ```json
-// response        hub → backend   …/transmitter/bootstrap/{cid}
-{ "schema_version": 1, "type": "response", "challenge_id": "<uuid>",
-  "signature_b64": "<ECDSA over  activate-v1|{cid}|{nonce}|{issued}|{expires}>" }
+// response        hub → backend   …/transmitter/bootstrap/{nonce}
+{ "schema_version": 1, "type": "response",
+  "signature_b64": "<ECDSA over  activate-v1|{registration_nonce}|{nonce}|{issued}|{expires}>" }
 ```
 ```json
-// result          backend → hub   …/transmitter/bootstrap/{cid}
-{ "schema_version": 1, "type": "result", "challenge_id": "<uuid>", "status": "active",
+// result          backend → hub   …/transmitter/bootstrap/{nonce}
+{ "schema_version": 1, "type": "result", "status": "active",
   "public_id": "<minted id>", "assigned_device_name": "<name>", "store_id": "<uuid>" }
 ```
 ```json
-// rejected        backend → hub   …/transmitter/bootstrap/{cid}
-{ "schema_version": 1, "type": "rejected", "challenge_id": "<uuid>", "reason": "invalid_token" }
+// rejected        backend → hub   …/transmitter/bootstrap/{nonce}
+{ "schema_version": 1, "type": "rejected", "reason": "invalid_token" }
+// reason ∈ invalid_token | nonce_in_use | hub_cap_reached | model_radio_mismatch | admin_rejected
 ```
 
 ### 11b. After provisioning (operational phase)
@@ -558,22 +640,34 @@ expiry) so a hub joining the cluster gets the current roster immediately.
   "signature_b64": "<ECDSA roster-ack-v1|{pid}|{seq}|{issued}>" }
 ```
 ```json
-// roster/update   hub → backend
+// roster/update   hub → backend   (hub-SIGNED; backend verifies before applying)
 { "schema_version": 1, "seq": 7,
-  "receivers": [ { "slot": 1, "band": "433M", "label": "Table 1" } ] }
+  "receivers": [ { "slot": 1, "band": "433M", "label": "Table 1", "paired_at": "…" } ],
+  "signature_b64": "<ECDSA roster-update-v1|{pid}|{seq}|1:433M:Table 1|…>" }
+// band wire label: "433M" or "2_4G".  paired_at is informational (backend ignores it;
+// it is NOT part of the canonical).
 ```
 ```json
-// heartbeat       hub → backend   (QoS 0)
+// heartbeat       hub → backend   (QoS 0, hub-SIGNED; backend verifies sig + 120s freshness)
 { "schema_version": 1, "issued_at": "…",
   "diag": { "heap_pct": 42, "rssi": -58, "uptime_ms": 123456,
-            "disp_d": 12, "disp_t": 340, "ip": "192.168.1.50" } }
+            "disp_d": 12, "disp_t": 340, "ip": "192.168.1.50" },
+  "signature_b64": "<ECDSA heartbeat-v1|{pid}|{issued_at}|{heap_pct}|{rssi}|{uptime_ms}|{disp_d}|{disp_t}|{ip}>" }
+// rssi and ip fields are omitted from diag when unavailable; in the canonical they collapse to "".
 ```
 ```json
-// ack             hub → backend   (dual purpose, discriminated by ack_for)
+// ack             hub → backend   (dual purpose, discriminated by ack_for; hub-SIGNED)
+// transmit applied/unchanged:
 { "schema_version": 1, "ack_for": "transmit", "dispatch_id": "<uuid>",
-  "status": "applied", "reason": null, "applied_at": "…" }              // status: applied | unchanged | rejected
-{ "schema_version": 1, "ack_for": "deact", "command_id": "<uuid>",
-  "action": "suspend", "status": "applied", "applied_at": "…" }
+  "status": "applied", "applied_at": "…",
+  "signature_b64": "<ECDSA ack-v1|{pid}|transmit|{dispatch_id}|{status}>" } // status: applied | unchanged
+// transmit rejected:
+{ "schema_version": 1, "ack_for": "transmit", "dispatch_id": "<uuid>",
+  "status": "rejected", "reason": "<why>",
+  "signature_b64": "<ECDSA ack-v1|{pid}|transmit|{dispatch_id}|rejected>" }
+// deact:
+{ "schema_version": 1, "ack_for": "deact", "command_id": "<uuid>", "action": "suspend",
+  "status": "applied", "signature_b64": "<ECDSA ack-v1|{pid}|deact|{command_id}|{status}>" }
 ```
 ```json
 // cluster/roster  hub ↔ hub (via broker, retained)   band: 0 = 433M, 1 = 2.4G
@@ -589,8 +683,7 @@ expiry) so a hub joining the cluster gets the current roster immediately.
 
 | Subscriber | Topic filter | What `+` matches |
 |---|---|---|
-| Hub (bootstrap) | `…/transmitter/bootstrap/+` | any `{cid}` — then narrowed to its own |
-| Backend (bootstrap) | `…/transmitter/bootstrap/+` | every hub's `register` **and** every `{cid}` |
+| Backend (bootstrap) | `…/transmitter/bootstrap/+` | every hub's `register` **and** every `{nonce}` |
 | Backend (operational) | `…/transmitter/hub/+/heartbeat` | the `{pid}` of every hub |
 | Backend (operational) | `…/transmitter/hub/+/ack` | the `{pid}` of every hub |
 | Backend (operational) | `…/transmitter/hub/+/roster/update` | the `{pid}` of every hub |
@@ -605,9 +698,11 @@ avoided:
 - It's avoided on purpose: (1) **subscribe only to what you handle** — a `#` would also
   deliver any future/unknown subtopic into a single handler; (2) **per-topic QoS** — the
   backend subscribes `heartbeat` at **QoS 0** but `ack`/`roster/update` at **QoS 1**, which a
-  single `#` cannot express; (3) the bootstrap flow deliberately **narrows** `+` → exact
-  `{cid}` to *reduce* exposure, the opposite of broadening to `#`.
+  single `#` cannot express; (3) the hub subscribes to its **exact** `…/bootstrap/{nonce}`
+  (and its exact `{pid}` command topics) rather than any wildcard, deliberately *minimizing*
+  exposure — the opposite of broadening to `#`.
 
-So the design is: broad `+` only where a client legitimately must see many peers (the backend
-watching all hubs; a device discovering its `{cid}`), exact topics everywhere else, and never
-`#`.
+So the design is: a broad `+` only on the **backend**, where it legitimately must watch many
+peers (every hub's bootstrap and telemetry); the **hub uses no wildcard at all** — exact
+`{nonce}` during bootstrap and exact `{pid}` topics when operational — and `#` is used
+nowhere.
